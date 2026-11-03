@@ -155,10 +155,10 @@ pub(super) mod parallel {
             let res = (|| -> Result<()> {
                 for (i, w) in weights.iter().enumerate() {
                     if started == 0 {
-                        // No thread at all: compress here, one entry after the other.
-                        let entry = slots.get(i).and_then(|s| lock(s).take());
-                        let bytes = compress(entry.ok_or_else(|| FormatError::Invalid("project entry missing".into()))?)?;
-                        copy_entry(zip, bytes)?;
+                        // No thread at all: stream the entry into the file like the serial writer does.
+                        let entry = slots.get(i).and_then(|s| lock(s).take()).ok_or_else(|| FormatError::Invalid("project entry missing".into()))?;
+                        zip.start_file(entry.name, entry.options).map_err(zip_err)?;
+                        (entry.body)(zip)?;
                         continue;
                     }
                     let done = {

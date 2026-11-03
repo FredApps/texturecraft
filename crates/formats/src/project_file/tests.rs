@@ -269,7 +269,7 @@ fn parallel_save_writes_the_same_entries_as_serial() {
     let serial = serial_bytes(&pf);
     let want = payloads(&serial);
     assert!(want.len() > 10);
-    for (workers, budget) in [(2, u64::MAX), (4, u64::MAX), (8, 1), (3, 100_000)] {
+    for (workers, budget) in [(0, 1), (2, u64::MAX), (4, u64::MAX), (8, 1), (3, 100_000)] {
         let got = parallel_bytes(&pf, workers, budget);
         assert!(payloads(&got) == want, "{workers} workers, budget {budget}");
         assert_same(&pf, &load_project_bytes(&got).unwrap());
