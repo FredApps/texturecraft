@@ -219,7 +219,15 @@ fn load_size_matches_what_load_counts() {
     tiled.project.texture_sets[0].uv_tiles = vec![1001, 1002];
     tiled.pixels = PixelStore::default();
     tiled.baked = [(0, BakedMaps { resolution: 32, maps: [(BakedMap::AmbientOcclusion, Arc::new(vec![0.25; 32 * 16]))].into() })].into();
-    for pf in [&s.pf, &tiled] {
+    // The branches where the count could drift: pixels of a layer in no stack, a baked map of a
+    // set that does not exist, and a baked map whose size does not match (not written).
+    let mut odd = sample().pf;
+    odd.pixels.layer_mut(LayerId(999), Channel::BaseColor, (128, 128)).set(1, 1, &[1, 2, 3, 4]);
+    odd.pixels.mask_mut(LayerId(998), (64, 64)).set(1, 1, &[1, 2]);
+    odd.baked.insert(7, BakedMaps { resolution: 16, maps: [(BakedMap::AmbientOcclusion, Arc::new(vec![0.5; 256]))].into() });
+    odd.baked.entry(1).or_default().resolution = 8;
+    odd.baked.get_mut(&1).unwrap().maps.insert(BakedMap::Curvature, Arc::new(vec![0.5; 13]));
+    for pf in [&s.pf, &tiled, &odd] {
         let bytes = save_project_bytes(pf).unwrap();
         let (_, counted) = load_counted(Cursor::new(bytes)).unwrap();
         assert!(counted > 1000);
@@ -234,7 +242,7 @@ fn a_project_too_big_to_reopen_is_not_saved() {
     assert!(check_loadable(&s.pf, size).is_ok());
     let err = check_loadable(&s.pf, size - 1).unwrap_err();
     assert!(matches!(err, FormatError::TooLarge(_)));
-    assert!(err.to_string().contains("not saved"), "{err}");
+    assert!(err.to_string().contains("nothing was saved"), "{err}");
 }
 
 #[cfg(not(target_arch = "wasm32"))]

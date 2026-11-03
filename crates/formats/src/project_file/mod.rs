@@ -139,7 +139,8 @@ fn load_size(pf: &ProjectFile) -> Result<u64> {
     let tiles = |img: &TileImage| (img.allocated_count() as u64) * (TILE_AREA * img.comps() * 2) as u64;
     n += pf.pixels.layers.iter().filter(|((id, _), _)| texture_set_of(&pf.project, *id).is_some()).map(|(_, img)| tiles(img)).sum::<u64>();
     n += pf.pixels.masks.iter().filter(|(id, _)| texture_set_of(&pf.project, **id).is_some()).map(|(_, img)| tiles(img)).sum::<u64>();
-    for maps in pf.baked.values() {
+    // `load` skips the baked maps of a texture set that no longer exists.
+    for maps in pf.baked.iter().filter(|(ts, _)| **ts < pf.project.texture_sets.len()).map(|(_, m)| m) {
         for (m, data) in &maps.maps {
             let h = maps.height(*m);
             if h != 0 && data.len() == (maps.resolution as usize) * (h as usize) * m.components() {
@@ -156,8 +157,8 @@ fn check_loadable(pf: &ProjectFile, limit: u64) -> Result<()> {
     if size > limit {
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         return Err(FormatError::TooLarge(format!(
-            "the project holds {:.1} GiB of data once unpacked, but TextureCraft opens project files only up to {:.1} GiB, so it was not saved and the file on disk is unchanged. \
-             Remove paint layers or baked maps, or lower the texture resolution",
+            "the project holds {:.2} GiB of data once unpacked, but TextureCraft opens project files only up to {:.2} GiB, so nothing was saved and an existing file is unchanged. \
+             Remove paint layers or baked maps to make it smaller",
             gib(size),
             gib(limit)
         )));
