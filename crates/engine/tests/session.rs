@@ -55,6 +55,32 @@ fn layers_masks_materials_and_bake() {
 }
 
 #[test]
+fn generator_offset_is_settable_and_clamped() {
+    let mut s = session();
+    execute(&mut s, "layer.add.fill", &json!({})).unwrap();
+    execute(&mut s, "mask.add.black", &Value::Null).unwrap();
+    let r = execute(&mut s, "effect.add.generator", &json!({"generator": "position", "offset": 0.25})).unwrap();
+    let eff = r["effect"].as_u64().unwrap();
+    let offset = |s: &Session| {
+        let layer = s.doc.project.layers.values().find(|l| l.mask.is_some()).unwrap();
+        layer
+            .mask
+            .as_ref()
+            .unwrap()
+            .effects
+            .iter()
+            .find_map(|e| match &e.kind {
+                texturecraft_engine::core::EffectKind::Generator(g) => Some(g.offset),
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(offset(&s), 0.25);
+    execute(&mut s, "effect.set", &json!({"effect": eff, "offset": 5.0})).unwrap();
+    assert_eq!(offset(&s), 1.0, "clamped to 1");
+}
+
+#[test]
 fn layer_rename_and_undo() {
     let mut s = session();
     let layer_id = s.selected_layer().unwrap();

@@ -49,7 +49,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add generator",
             ["Layers", "Effects"],
             None,
-            "{layer?, name?, generator?: edgeWear|dirt|thinAreas|curvature|ambientOcclusion|position|direction, level?, softness?, noise?, invert?}",
+            "{layer?, name?, generator?: edgeWear|dirt|thinAreas|curvature|ambientOcclusion|position|direction, level?, softness?, noise?, offset?: -1..1 added to the result, invert?}",
             has_layer,
             add_generator
         ),
@@ -94,7 +94,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit effect",
             [],
             None,
-            "{effect, visible?, blend?, opacity?, name?, level?, softness?, noise?, noiseScale?, invert?, value?, anchor?, anchorChannel?, inLow?, inHigh?, gamma?, outLow?, outHigh?, tolerance?, filter parameters (see effect.add.filter)}",
+            "{effect, visible?, blend?, opacity?, name?, level?, softness?, noise?, noiseScale?, offset?, invert?, value?, anchor?, anchorChannel?, inLow?, inHigh?, gamma?, outLow?, outHigh?, tolerance?, filter parameters (see effect.add.filter)}",
             has_layer,
             set
         ),
@@ -323,6 +323,9 @@ fn generator_from(p: &Value, g: &mut Generator) {
     }
     if let Some(v) = f32p(p, "noise") {
         g.noise_amount = v.clamp(0.0, 2.0);
+    }
+    if let Some(v) = f32p(p, "offset") {
+        g.offset = v.clamp(-1.0, 1.0);
     }
     if let Some(v) = f32p(p, "noiseScale") {
         g.noise_scale = v.clamp(0.01, 1000.0);

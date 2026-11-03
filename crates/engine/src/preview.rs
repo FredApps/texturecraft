@@ -63,10 +63,7 @@ fn generator(g: &Generator, c: &Coords) -> f32 {
     };
     // Same thresholding as the compositor.
     let s = if g.noise_amount > 0.0 { s + (world_noise(c.pos, g.noise_scale, g.seed) - 0.5) * g.noise_amount } else { s };
-    let soft = g.softness.max(1e-3);
-    let t = ((s - (1.0 - g.level.clamp(0.0, 1.0) - soft)) / (2.0 * soft)).clamp(0.0, 1.0);
-    let v = t * t * (3.0 - 2.0 * t);
-    if g.invert { 1.0 - v } else { v }
+    g.shape(s)
 }
 
 fn mask(m: &Mask, c: &Coords) -> f32 {

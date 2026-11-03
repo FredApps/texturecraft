@@ -38,7 +38,7 @@ fn effect_json(s: &Session, e: &Effect, content: bool) -> Value {
     let mut ej = json!({ "id": e.id.0, "name": e.name, "kind": e.kind.name(), "visible": e.visible, "blend": e.blend.label(), "opacity": e.opacity });
     match &e.kind {
         EffectKind::Generator(g) => {
-            ej["generator"] = json!({ "type": format!("{:?}", g.kind), "level": g.level, "softness": g.softness, "noise": g.noise_amount, "invert": g.invert })
+            ej["generator"] = json!({ "type": format!("{:?}", g.kind), "level": g.level, "softness": g.softness, "noise": g.noise_amount, "offset": g.offset, "invert": g.invert })
         }
         EffectKind::Levels(lv) => ej["levels"] = json!([lv.in_low, lv.in_high, lv.gamma, lv.out_low, lv.out_high]),
         EffectKind::Path(paths) => {

@@ -1875,15 +1875,19 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, eid:
                     }
                 }
             });
-            let (mut level, mut soft, mut noise, mut ns) = (g.level, g.softness, g.noise_amount, g.noise_scale);
+            let (mut level, mut soft, mut noise, mut ns, mut off) = (g.level, g.softness, g.noise_amount, g.noise_scale, g.offset);
             let r1 = slider_edit(ui, tr("Level"), &mut level, 0.0..=1.0, 2);
             let r2 = slider_edit(ui, tr("Softness"), &mut soft, 0.0..=1.0, 2);
             let r3 = slider_edit(ui, tr("Noise amount"), &mut noise, 0.0..=2.0, 2);
             let r4 = slider_edit(ui, tr("Noise scale"), &mut ns, 0.1..=64.0, 1);
+            let r6 = slider_edit(ui, tr("Offset"), &mut off, -1.0..=1.0, 2);
             let mut inv = g.invert;
             let r5 = ui.checkbox(&mut inv, tr("Invert"));
-            if let Some(merge) = r1.or(r2).or(r3).or(r4).or(r5.changed().then_some(false)) {
-                app.run("effect.set", json!({"effect": id, "level": level, "softness": soft, "noise": noise, "noiseScale": ns, "invert": inv, "merge": merge}));
+            if let Some(merge) = r1.or(r2).or(r3).or(r4).or(r6).or(r5.changed().then_some(false)) {
+                app.run(
+                    "effect.set",
+                    json!({"effect": id, "level": level, "softness": soft, "noise": noise, "noiseScale": ns, "offset": off, "invert": inv, "merge": merge}),
+                );
             }
             if !app.session.doc.baked.contains_key(&app.session.ts()) {
                 ui.label(

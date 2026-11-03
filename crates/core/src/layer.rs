@@ -537,6 +537,9 @@ pub struct Generator {
     pub noise_amount: f32,
     pub noise_scale: f32,
     pub seed: u32,
+    /// Added to the finished mask value and clamped to 0..1 (−1..1; 0 = unchanged).
+    #[serde(default)]
+    pub offset: f32,
     /// Direction for `Position` / `Direction` generators (world space).
     pub direction: [f32; 3],
     pub invert: bool,
@@ -550,7 +553,18 @@ impl Generator {
             GeneratorKind::ThinAreas => (0.3, 0.2, 0.0),
             _ => (0.5, 0.25, 0.0),
         };
-        Generator { kind, level, softness, noise_amount, noise_scale: 8.0, seed: 7, direction: [0.0, 1.0, 0.0], invert: false }
+        Generator { kind, level, softness, noise_amount, noise_scale: 8.0, seed: 7, offset: 0.0, direction: [0.0, 1.0, 0.0], invert: false }
+    }
+
+    /// The mask value for a (noise-broken) signal `s`: the smooth threshold at `level` over
+    /// `softness`, inverted if asked, then shifted by `offset`.
+    pub fn shape(&self, s: f32) -> f32 {
+        let th = 1.0 - self.level.clamp(0.0, 1.0);
+        let soft = self.softness.max(1e-3);
+        let t = ((s - (th - soft)) / (2.0 * soft)).clamp(0.0, 1.0);
+        let v = t * t * (3.0 - 2.0 * t);
+        let v = if self.invert { 1.0 - v } else { v };
+        (v + self.offset).clamp(0.0, 1.0)
     }
 }
 
@@ -1049,6 +1063,19 @@ impl Effect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generator_offset_shifts_the_mask_value() {
+        let mut g = Generator::new(GeneratorKind::Position);
+        let base = g.shape(0.2);
+        assert!(base < 0.5);
+        g.offset = 0.3;
+        assert!((g.shape(0.2) - (base + 0.3)).abs() < 1e-6, "the offset is added");
+        g.offset = 1.0;
+        assert_eq!(g.shape(0.2), 1.0, "and the result is clamped");
+        g.offset = -1.0;
+        assert_eq!(g.shape(0.9), 0.0);
+    }
 
     #[test]
     fn levels_map_range_and_gamma() {
