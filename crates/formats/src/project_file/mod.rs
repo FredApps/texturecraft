@@ -88,6 +88,7 @@ pub fn sanitize_resource_name(name: &str) -> String {
 // Save.
 
 pub fn save_project_bytes(pf: &ProjectFile) -> Result<Vec<u8>> {
+    check_loadable(pf, MAX_TOTAL)?;
     let mut out = Cursor::new(Vec::new());
     write_project(&mut out, pf)?;
     Ok(out.into_inner())
@@ -96,6 +97,14 @@ pub fn save_project_bytes(pf: &ProjectFile) -> Result<Vec<u8>> {
 /// Save atomically: `<path>.tmp` first, then rename over `path`.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn save_project(path: &std::path::Path, pf: &ProjectFile) -> Result<()> {
+    save_project_limited(path, pf, MAX_TOTAL)
+}
+
+/// [`save_project`] with the size [`load`] would accept as a parameter (tests lower it).
+#[cfg(not(target_arch = "wasm32"))]
+fn save_project_limited(path: &std::path::Path, pf: &ProjectFile, limit: u64) -> Result<()> {
+    // Before the temp file exists, so a refusal leaves the file on disk as it was.
+    check_loadable(pf, limit)?;
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = std::path::PathBuf::from(tmp);
@@ -110,6 +119,50 @@ pub fn save_project(path: &std::path::Path, pf: &ProjectFile) -> Result<()> {
         let _ = std::fs::remove_file(&tmp);
     }
     res
+}
+
+/// Decompressed bytes that [`load`] counts against [`MAX_TOTAL`] when it reads `pf` back: the
+/// payload of every entry it reads, without the `.bin` headers. Keep in step with `load`
+/// (`load_size_matches_what_load_counts` checks it). Pixels of layers that are in no stack are
+/// dropped by `load` without counting, so they are not counted here either.
+fn load_size(pf: &ProjectFile) -> Result<u64> {
+    let json = serde_json::to_vec_pretty(&pf.project).map_err(|e| FormatError::Invalid(e.to_string()))?;
+    let mut n = json.len() as u64;
+    n += pf.mesh.iter().map(|(_, b)| b.len() as u64).sum::<u64>();
+    n += pf.high_poly.iter().map(|(_, b)| b.len() as u64).sum::<u64>();
+    n += pf.cage.iter().map(|(_, b)| b.len() as u64).sum::<u64>();
+    n += pf.thumbnail.iter().map(|b| b.len() as u64).sum::<u64>();
+    n += pf.resources.values().map(|b| b.len() as u64).sum::<u64>();
+    if let Some(k) = pf.skew.as_ref().filter(|k| k.width > 0 && k.height > 0 && k.values.len() as u64 == u64::from(k.width) * u64::from(k.height)) {
+        n += k.values.len() as u64 * 4;
+    }
+    let tiles = |img: &TileImage| (img.allocated_count() as u64) * (TILE_AREA * img.comps() * 2) as u64;
+    n += pf.pixels.layers.iter().filter(|((id, _), _)| texture_set_of(&pf.project, *id).is_some()).map(|(_, img)| tiles(img)).sum::<u64>();
+    n += pf.pixels.masks.iter().filter(|(id, _)| texture_set_of(&pf.project, **id).is_some()).map(|(_, img)| tiles(img)).sum::<u64>();
+    for maps in pf.baked.values() {
+        for (m, data) in &maps.maps {
+            let h = maps.height(*m);
+            if h != 0 && data.len() == (maps.resolution as usize) * (h as usize) * m.components() {
+                n += data.len() as u64 * 4;
+            }
+        }
+    }
+    Ok(n)
+}
+
+/// Refuse to save a project that [`load`] would reject as too large, before anything is written.
+fn check_loadable(pf: &ProjectFile, limit: u64) -> Result<()> {
+    let size = load_size(pf)?;
+    if size > limit {
+        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+        return Err(FormatError::TooLarge(format!(
+            "the project holds {:.1} GiB of data once unpacked, but TextureCraft opens project files only up to {:.1} GiB, so it was not saved and the file on disk is unchanged. \
+             Remove paint layers or baked maps, or lower the texture resolution",
+            gib(size),
+            gib(limit)
+        )));
+    }
+    Ok(())
 }
 
 fn zip_err(e: zip::result::ZipError) -> FormatError {
@@ -375,6 +428,11 @@ fn texture_set_of(project: &Project, id: LayerId) -> Option<usize> {
 }
 
 fn load<R: Read + Seek>(reader: R) -> Result<ProjectFile> {
+    load_counted(reader).map(|(pf, _)| pf)
+}
+
+/// [`load`], also returning the decompressed bytes it counted against [`MAX_TOTAL`].
+fn load_counted<R: Read + Seek>(reader: R) -> Result<(ProjectFile, u64)> {
     let mut zip = ZipArchive::new(reader).map_err(zip_err)?;
     if zip.len() > MAX_ENTRIES {
         return Err(FormatError::TooLarge(format!("project file has more than {MAX_ENTRIES} entries")));
@@ -464,7 +522,7 @@ fn load<R: Read + Seek>(reader: R) -> Result<ProjectFile> {
         }
         // Other entries (from newer minor revisions) are ignored.
     }
-    Ok(pf)
+    Ok((pf, budget.0))
 }
 
 #[cfg(test)]

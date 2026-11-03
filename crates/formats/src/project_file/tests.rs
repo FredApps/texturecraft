@@ -211,3 +211,49 @@ fn duplicate_entry_names_are_made_unique_on_save() {
     res.sort();
     assert_eq!(res, vec![vec![3], vec![4]]);
 }
+
+#[test]
+fn load_size_matches_what_load_counts() {
+    let s = sample();
+    let mut tiled = sample().pf;
+    tiled.project.texture_sets[0].uv_tiles = vec![1001, 1002];
+    tiled.pixels = PixelStore::default();
+    tiled.baked = [(0, BakedMaps { resolution: 32, maps: [(BakedMap::AmbientOcclusion, Arc::new(vec![0.25; 32 * 16]))].into() })].into();
+    for pf in [&s.pf, &tiled] {
+        let bytes = save_project_bytes(pf).unwrap();
+        let (_, counted) = load_counted(Cursor::new(bytes)).unwrap();
+        assert!(counted > 1000);
+        assert_eq!(load_size(pf).unwrap(), counted);
+    }
+}
+
+#[test]
+fn a_project_too_big_to_reopen_is_not_saved() {
+    let s = sample();
+    let size = load_size(&s.pf).unwrap();
+    assert!(check_loadable(&s.pf, size).is_ok());
+    let err = check_loadable(&s.pf, size - 1).unwrap_err();
+    assert!(matches!(err, FormatError::TooLarge(_)));
+    assert!(err.to_string().contains("not saved"), "{err}");
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_refused_save_leaves_the_existing_file_alone() {
+    let s = sample();
+    let dir = std::env::temp_dir().join(format!("tc-formats-toobig-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("demo.tcraft");
+    save_project(&path, &s.pf).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let mut changed = s.pf.clone();
+    changed.project.name = "Changed".into();
+    assert!(matches!(save_project_limited(&path, &changed, 10), Err(FormatError::TooLarge(_))));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(!dir.join("demo.tcraft.tmp").exists());
+    // A path that does not exist yet stays absent.
+    let fresh = dir.join("new.tcraft");
+    assert!(save_project_limited(&fresh, &changed, 10).is_err());
+    assert!(!fresh.exists() && !dir.join("new.tcraft.tmp").exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
