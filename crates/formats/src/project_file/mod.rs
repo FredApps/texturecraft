@@ -28,7 +28,10 @@ use texturecraft_texel::{TILE_AREA, TileImage};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+use self::entries::{Body, Entry};
 use crate::{FormatError, MAX_IMAGE_SIZE, Result, malformed};
+
+mod entries;
 
 const KIND: &str = "project file";
 const MAGIC: &[u8; 4] = b"TCTX";
@@ -164,47 +167,75 @@ fn unique_entry_name(dir: &str, name: &str, used: &mut HashSet<String>) -> Strin
     entry
 }
 
-fn write_project<W: Write + Seek>(out: W, pf: &ProjectFile) -> Result<()> {
-    let mut zip = ZipWriter::new(out);
+/// Floats converted to bytes at a time when a baked map streams into the compressor.
+const BAKED_CHUNK: usize = 1 << 16;
+
+fn write_baked(w: &mut dyn Write, res: u32, h: u32, comps: usize, data: &[f32]) -> std::io::Result<()> {
+    w.write_all(&header(res, h, comps, 0))?;
+    let mut buf = Vec::with_capacity(BAKED_CHUNK * 4);
+    for chunk in data.chunks(BAKED_CHUNK) {
+        buf.clear();
+        buf.extend(chunk.iter().flat_map(|v| v.to_le_bytes()));
+        w.write_all(&buf)?;
+    }
+    Ok(())
+}
+
+/// The zip entries of a project file, in file order. Bodies run later, possibly on other threads.
+fn entries(pf: &ProjectFile) -> Result<Vec<Entry<'_>>> {
     let deflate = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated).large_file(true);
     let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     let json = serde_json::to_vec_pretty(&pf.project).map_err(|e| FormatError::Invalid(e.to_string()))?;
-    zip.start_file("project.json", deflate).map_err(zip_err)?;
-    zip.write_all(&json)?;
+    let mut out = vec![Entry { name: "project.json".into(), options: deflate, weight: json.len() as u64, body: Box::new(move |w| w.write_all(&json)) }];
     if let Some((ext, bytes)) = &pf.mesh {
-        zip.start_file(format!("mesh.{}", sanitize_ext(ext)), deflate).map_err(zip_err)?;
-        zip.write_all(bytes)?;
+        out.push(Entry {
+            name: format!("mesh.{}", sanitize_ext(ext)),
+            options: deflate,
+            weight: bytes.len() as u64,
+            body: Box::new(move |w| w.write_all(bytes)),
+        });
     }
     let mut used = HashSet::new();
     for (dir, (name, bytes)) in pf.high_poly.iter().map(|m| ("highpoly", m)).chain(pf.cage.iter().map(|m| ("cage", m))) {
-        zip.start_file(unique_entry_name(dir, name, &mut used), deflate).map_err(zip_err)?;
-        zip.write_all(bytes)?;
+        out.push(Entry {
+            name: unique_entry_name(dir, name, &mut used),
+            options: deflate,
+            weight: bytes.len() as u64,
+            body: Box::new(move |w| w.write_all(bytes)),
+        });
     }
     if let Some(k) = pf.skew.as_ref().filter(|k| k.width > 0 && k.height > 0 && k.values.len() as u64 == u64::from(k.width) * u64::from(k.height)) {
-        zip.start_file("skew.bin", deflate).map_err(zip_err)?;
-        let mut b = SKEW_MAGIC.to_vec();
-        b.extend_from_slice(&BIN_VERSION.to_le_bytes());
-        for v in [k.width, k.height] {
-            b.extend_from_slice(&v.to_le_bytes());
-        }
-        for v in [k.edge_distance, k.edge_contrast] {
-            b.extend_from_slice(&v.to_le_bytes());
-        }
-        b.push(u8::from(k.per_triangle));
-        b.extend(k.values.iter().flat_map(|v| v.to_le_bytes()));
-        zip.write_all(&b)?;
+        let body: Body<'_> = Box::new(move |w| {
+            let mut b = SKEW_MAGIC.to_vec();
+            b.extend_from_slice(&BIN_VERSION.to_le_bytes());
+            for v in [k.width, k.height] {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            for v in [k.edge_distance, k.edge_contrast] {
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            b.push(u8::from(k.per_triangle));
+            b.extend(k.values.iter().flat_map(|v| v.to_le_bytes()));
+            w.write_all(&b)
+        });
+        out.push(Entry { name: "skew.bin".into(), options: deflate, weight: k.values.len() as u64 * 4, body });
     }
     let mut layers: Vec<_> = pf.pixels.layers.iter().collect();
     layers.sort_by_key(|(k, _)| **k);
     for ((id, c), img) in layers {
-        zip.start_file(format!("pixels/layer_{}_{}.bin", id.0, c.id()), deflate).map_err(zip_err)?;
-        write_tiles(&mut zip, img)?;
+        let weight = (img.allocated_count() * (TILE_AREA * img.comps() * 2 + 8)) as u64;
+        out.push(Entry {
+            name: format!("pixels/layer_{}_{}.bin", id.0, c.id()),
+            options: deflate,
+            weight,
+            body: Box::new(move |mut w| write_tiles(&mut w, img)),
+        });
     }
     let mut masks: Vec<_> = pf.pixels.masks.iter().collect();
     masks.sort_by_key(|(k, _)| **k);
     for (id, img) in masks {
-        zip.start_file(format!("pixels/mask_{}.bin", id.0), deflate).map_err(zip_err)?;
-        write_tiles(&mut zip, img)?;
+        let weight = (img.allocated_count() * (TILE_AREA * img.comps() * 2 + 8)) as u64;
+        out.push(Entry { name: format!("pixels/mask_{}.bin", id.0), options: deflate, weight, body: Box::new(move |mut w| write_tiles(&mut w, img)) });
     }
     for (ts, maps) in &pf.baked {
         let r = maps.resolution;
@@ -214,21 +245,33 @@ fn write_project<W: Write + Seek>(out: W, pf: &ProjectFile) -> Result<()> {
             if h == 0 || data.len() != (r as usize) * (h as usize) * m.components() {
                 continue;
             }
-            zip.start_file(format!("baked/{ts}_{}.bin", m.id()), deflate).map_err(zip_err)?;
-            zip.write_all(&header(r, h, m.components(), 0))?;
-            let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-            zip.write_all(&bytes)?;
+            let comps = m.components();
+            out.push(Entry {
+                name: format!("baked/{ts}_{}.bin", m.id()),
+                options: deflate,
+                weight: data.len() as u64 * 4,
+                body: Box::new(move |w| write_baked(w, r, h, comps, data)),
+            });
         }
     }
     if let Some(png) = &pf.thumbnail {
-        zip.start_file("thumbnail.png", stored).map_err(zip_err)?;
-        zip.write_all(png)?;
+        out.push(Entry { name: "thumbnail.png".into(), options: stored, weight: png.len() as u64, body: Box::new(move |w| w.write_all(png)) });
     }
     used.clear();
     for (name, bytes) in &pf.resources {
-        zip.start_file(unique_entry_name("resources", name, &mut used), stored).map_err(zip_err)?;
-        zip.write_all(bytes)?;
+        out.push(Entry {
+            name: unique_entry_name("resources", name, &mut used),
+            options: stored,
+            weight: bytes.len() as u64,
+            body: Box::new(move |w| w.write_all(bytes)),
+        });
     }
+    Ok(out)
+}
+
+fn write_project<W: Write + Seek>(out: W, pf: &ProjectFile) -> Result<()> {
+    let mut zip = ZipWriter::new(out);
+    entries::write_entries(&mut zip, entries(pf)?)?;
     zip.finish().map_err(zip_err)?;
     Ok(())
 }

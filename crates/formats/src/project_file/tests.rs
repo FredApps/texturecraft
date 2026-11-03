@@ -211,3 +211,129 @@ fn duplicate_entry_names_are_made_unique_on_save() {
     res.sort();
     assert_eq!(res, vec![vec![3], vec![4]]);
 }
+
+/// Every entry of a zip in file order: (name, method, crc, sizes, the compressed bytes as stored).
+/// The zip headers around them (version fields, zip64 size placeholders) are not part of this:
+/// copying an entry between zips rewrites them.
+#[allow(clippy::type_complexity)]
+fn payloads(zip: &[u8]) -> Vec<(String, CompressionMethod, u32, u64, u64, Vec<u8>)> {
+    let mut a = ZipArchive::new(Cursor::new(zip)).unwrap();
+    (0..a.len())
+        .map(|i| {
+            let mut f = a.by_index_raw(i).unwrap();
+            let mut raw = Vec::new();
+            f.read_to_end(&mut raw).unwrap();
+            (f.name().unwrap().into_owned(), f.compression(), f.crc32(), f.size(), f.compressed_size(), raw)
+        })
+        .collect()
+}
+
+/// A project with several baked maps and pixel layers, big enough that entries stream in chunks.
+fn big_sample() -> ProjectFile {
+    let mut s = sample();
+    let mut x = 12345u32;
+    let mut noise = |n: usize| -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                (i as f32 * 0.001).sin() * 0.5 + 0.5 + (x >> 24) as f32 * 1e-4
+            })
+            .collect()
+    };
+    let r = 300usize;
+    let maps = [BakedMap::AmbientOcclusion, BakedMap::Normal, BakedMap::Curvature, BakedMap::Position]
+        .into_iter()
+        .map(|m| (m, Arc::new(noise(r * r * m.components()))))
+        .collect();
+    s.pf.baked.insert(1, BakedMaps { resolution: r as u32, maps });
+    s.pf.mesh = Some(("obj".into(), noise(5000).iter().map(|v| (v * 200.0) as u8).collect()));
+    s.pf
+}
+
+fn serial_bytes(pf: &ProjectFile) -> Vec<u8> {
+    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+    entries::write_serial(&mut zip, entries(pf).unwrap()).unwrap();
+    zip.finish().unwrap().into_inner()
+}
+
+fn parallel_bytes(pf: &ProjectFile, workers: usize, budget: u64) -> Vec<u8> {
+    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+    entries::parallel::write(&mut zip, entries(pf).unwrap(), workers, budget).unwrap();
+    zip.finish().unwrap().into_inner()
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn parallel_save_writes_the_same_entries_as_serial() {
+    let pf = big_sample();
+    let serial = serial_bytes(&pf);
+    let want = payloads(&serial);
+    assert!(want.len() > 10);
+    for (workers, budget) in [(2, u64::MAX), (4, u64::MAX), (8, 1), (3, 100_000)] {
+        let got = parallel_bytes(&pf, workers, budget);
+        assert!(payloads(&got) == want, "{workers} workers, budget {budget}");
+        assert_same(&pf, &load_project_bytes(&got).unwrap());
+    }
+    // The public entry point (threads chosen by the machine) agrees too, and loads back.
+    assert!(payloads(&save_project_bytes(&pf).unwrap()) == want);
+    assert_same(&pf, &load_project_bytes(&serial).unwrap());
+}
+
+/// The files written before entries were compressed in parallel: each entry written in one go.
+fn reference_one_shot(pf: &ProjectFile) -> Vec<u8> {
+    let deflate = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated).large_file(true);
+    let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+    zip.start_file("project.json", deflate).unwrap();
+    zip.write_all(&serde_json::to_vec_pretty(&pf.project).unwrap()).unwrap();
+    for (ts, maps) in &pf.baked {
+        for (m, data) in &maps.maps {
+            zip.start_file(format!("baked/{ts}_{}.bin", m.id()), deflate).unwrap();
+            zip.write_all(&header(maps.resolution, maps.height(*m), m.components(), 0)).unwrap();
+            let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+            zip.write_all(&bytes).unwrap();
+        }
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+/// Streaming a baked map into the compressor in chunks may place deflate block boundaries a few
+/// bytes differently than one big write, so the stored bytes can differ slightly; what the entry
+/// holds (name, method, CRC, size) must not, and the compressed size stays within 0.01%.
+#[test]
+fn baked_entries_hold_what_the_one_shot_writer_wrote() {
+    let mut pf = big_sample();
+    (pf.mesh, pf.high_poly, pf.cage, pf.skew, pf.thumbnail, pf.resources) = (None, vec![], None, None, None, BTreeMap::new());
+    pf.pixels = PixelStore::default();
+    let (new, old) = (payloads(&save_project_bytes(&pf).unwrap()), payloads(&reference_one_shot(&pf)));
+    assert_eq!(new.len(), old.len());
+    for (n, o) in new.iter().zip(&old) {
+        assert_eq!((&n.0, n.1, n.2, n.3), (&o.0, o.1, o.2, o.3));
+        assert!(n.4.abs_diff(o.4) <= 64 + o.4 / 10_000, "{}: {} vs {}", n.0, n.4, o.4);
+    }
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_failing_entry_is_an_error_not_a_hang() {
+    let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    for fail_at in [0usize, 3, 9] {
+        let list: Vec<Entry<'_>> = (0..10)
+            .map(|i| Entry {
+                name: format!("e{i}"),
+                options: opts,
+                weight: 10,
+                body: Box::new(move |w| {
+                    if i == fail_at {
+                        return Err(std::io::Error::other("boom"));
+                    }
+                    if i == 5 && fail_at == 9 {
+                        panic!("worker panic");
+                    }
+                    w.write_all(&[i as u8; 100])
+                }),
+            })
+            .collect();
+        let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+        assert!(entries::parallel::write(&mut zip, list, 4, 25).is_err(), "fail at {fail_at}");
+    }
+}
