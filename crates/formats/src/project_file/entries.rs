@@ -26,6 +26,7 @@ pub(super) struct Entry<'a> {
     pub name: String,
     pub options: SimpleFileOptions,
     /// Upper bound of the compressed size in bytes (the uncompressed size is a safe choice).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub weight: u64,
     pub body: Body<'a>,
 }
@@ -144,23 +145,39 @@ pub(super) mod parallel {
         let state = Mutex::new(State { next: 0, in_flight: 0, ready: BTreeMap::new(), stop: false });
         let cv = Condvar::new();
         std::thread::scope(|s| {
+            let mut started = 0;
             for _ in 0..workers {
-                s.spawn(|| worker(&slots, &weights, budget, &state, &cv));
+                // Thread creation can fail (process limits); the workers that did start drain the queue.
+                if std::thread::Builder::new().spawn_scoped(s, || worker(&slots, &weights, budget, &state, &cv)).is_ok() {
+                    started += 1;
+                }
             }
             let res = (|| -> Result<()> {
                 for (i, w) in weights.iter().enumerate() {
+                    if started == 0 {
+                        // No thread at all: compress here, one entry after the other.
+                        let entry = slots.get(i).and_then(|s| lock(s).take());
+                        let bytes = compress(entry.ok_or_else(|| FormatError::Invalid("project entry missing".into()))?)?;
+                        copy_entry(zip, bytes)?;
+                        continue;
+                    }
                     let done = {
                         let mut st = lock(&state);
                         loop {
                             if let Some(r) = st.ready.remove(&i) {
-                                st.in_flight = st.in_flight.saturating_sub(*w);
-                                cv.notify_all();
                                 break r;
                             }
                             st = wait(&cv, st);
                         }
                     };
-                    copy_entry(zip, done?)?;
+                    let copied = done.and_then(|bytes| copy_entry(zip, bytes));
+                    // Release the entry's share only once its bytes are gone.
+                    {
+                        let mut st = lock(&state);
+                        st.in_flight = st.in_flight.saturating_sub(*w);
+                    }
+                    cv.notify_all();
+                    copied?;
                 }
                 Ok(())
             })();
