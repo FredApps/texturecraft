@@ -18,12 +18,18 @@ set -euo pipefail
 HERE="$ROOT/packaging/linux"
 APP_ID=ai.storyteller.texturecraft
 FLATHUB=https://dl.flathub.org/repo/flathub.flatpakrepo
+# The OCI repository serves only the latest stable release, so a prerelease bundle gets no update
+# source: Flatpak would otherwise replace it with that older stable build.
+OCI_REPO=oci+https://getartcraft.com
+if [[ "$VERSION" == *-* ]]; then OCI_REPO=""; fi
 
 TEST=1
+OCI=0
 TARBALL=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --no-test) TEST=0; shift ;;
+    --oci) OCI=1; shift ;;
     -h | --help) sed -n '2,14p' "$0"; exit 0 ;;
     -*) echo "unknown argument: $1" >&2; exit 2 ;;
     *) TARBALL="$1"; shift ;;
@@ -58,9 +64,24 @@ flatpak-builder --user --install-deps-from=flathub --disable-rofiles-fuse --forc
   --default-branch=stable --repo="$WORK/repo" --state-dir="$WORK/state" "$WORK/build" "$WORK/$APP_ID.yml"
 
 OUT="$DIST/$BASENAME.flatpak"
+# A release build (the shared release workflow sets SIGNING_FPR, SIGNING_PUBKEY and GNUPGHOME)
+# signs the commit and embeds the public key, so Flatpak verifies the bundle when installing it.
+GPG_KEYS=()
+if [[ -n "${SIGNING_FPR:-}" ]]; then
+  flatpak build-sign "$WORK/repo" "$APP_ID" stable --gpg-sign="$SIGNING_FPR" --gpg-homedir="${GNUPGHOME:?}"
+  GPG_KEYS=(--gpg-keys="${SIGNING_PUBKEY:?}")
+  if [[ "${OCI_SIGNATURES_READY:-}" != 1 ]]; then OCI_REPO=""; fi
+fi
 # --runtime-repo lets `flatpak install` fetch the freedesktop runtime from Flathub if missing.
-flatpak build-bundle --runtime-repo="$FLATHUB" "$WORK/repo" "$OUT" "$APP_ID" stable
+# --repo-url makes the installed origin update from the ArtCraft OCI repository.
+flatpak build-bundle --runtime-repo="$FLATHUB" ${OCI_REPO:+--repo-url="$OCI_REPO"} "${GPG_KEYS[@]}" "$WORK/repo" "$OUT" "$APP_ID" stable
 echo "wrote $OUT"
+if [[ "$OCI" = 1 ]]; then
+  OUT_OCI="$DIST/$BASENAME-oci"
+  rm -rf "$OUT_OCI"
+  flatpak build-bundle --oci "$WORK/repo" "$OUT_OCI" "$APP_ID" stable
+  echo "wrote OCI layout to $OUT_OCI"
+fi
 
 if [ "$TEST" = 1 ]; then
   flatpak install --user -y --noninteractive --reinstall "$OUT"

@@ -21,7 +21,7 @@ workspace_version() {
   ' "$ROOT/Cargo.toml"
 }
 
-VERSION="${TEXTURECRAFT_VERSION:-$(workspace_version)}"
+VERSION="${TEXTURECRAFT_VERSION:-${RELEASE_VERSION:-$(workspace_version)}}"
 if [ -z "$VERSION" ]; then
   echo "error: could not read [workspace.package] version from $ROOT/Cargo.toml" >&2
   exit 1

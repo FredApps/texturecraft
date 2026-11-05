@@ -142,7 +142,7 @@ fn mesh_maps_from_images_take_one_image_per_tile() {
         image::RgbaImage::from_pixel(4, 4, image::Rgba([v, v, v, 255])).write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).unwrap();
         out
     };
-    let set = |s: &mut Session, image: &str| execute(s, "textureSet.meshMap.set", &json!({"map": "ambient_occlusion", "image": image}));
+    let set = |s: &mut Session, image: &str| execute(s, "textureSet.meshMap.set", &json!({"map": "ambientOcclusion", "image": image}));
     let left = s.import_resource_bytes("ao.1001.png", png(255)).unwrap();
     assert!(set(&mut s, &left).unwrap_err().to_string().contains("ao.1002.png"), "tile 1002 has no image yet");
     let plain = s.import_resource_bytes("ao.png", png(255)).unwrap();

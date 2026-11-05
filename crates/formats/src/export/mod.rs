@@ -596,7 +596,7 @@ impl Sampler<'_> {
 
     fn baked(&self, m: BakedMap, at: At) -> [f32; 3] {
         match at {
-            At::Texel(x, y) if self.set.baked.contains(&m) => self.baked.sample(m, x, y, self.res).unwrap_or(m.neutral()),
+            At::Texel(x, y) if self.set.baked.contains(&m) => self.baked.sample(m, x, y, (self.res, self.comp.height)).unwrap_or(m.neutral()),
             _ => m.neutral(),
         }
     }

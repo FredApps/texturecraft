@@ -28,68 +28,64 @@ pub fn tool_icon(t: Tool) -> &'static str {
     }
 }
 
-pub fn top_bar(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
-    let tk = Tokens::get(ui.ctx());
-    egui::Panel::top("tool_bar").exact_size(40.0).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| {
-        card(ui, &tk, egui::Margin { left: GUTTER, right: GUTTER, top: GUTTER, bottom: 0 }, egui::Margin::symmetric(8, 0), |ui| {
+pub fn paint_bar(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
+    let tokens = Tokens::get(ui.ctx());
+    egui::Panel::top("paint_bar").exact_size(40.0).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| {
+        card(ui, &tokens, egui::Margin { bottom: GUTTER, ..Default::default() }, egui::Margin::symmetric(8, 0), |ui| {
             ui.horizontal_centered(|ui| {
                 ui.spacing_mut().item_spacing.x = 10.0;
-                if app.ui.mode == Mode::Baking {
-                    ui.label(RichText::new(tr("Bake Mesh Maps")).color(tk.text_strong));
-                    return;
-                }
                 let tool = app.session.tool.tool;
-                ui.label(RichText::new(tool_icon(tool)).size(15.0).color(tk.text_strong)).on_hover_text(tool.label());
-                let b = &mut app.session.tool.brush;
+                ui.label(RichText::new(tool_icon(tool)).size(15.0).color(tokens.text_strong)).on_hover_text(tool.label());
+                let brush = &mut app.session.tool.brush;
                 match tool {
                     Tool::Paint | Tool::Eraser | Tool::Projection | Tool::Smudge | Tool::Clone | Tool::Path => {
-                        let mut size = b.size / 0.25 * 100.0;
+                        let mut size = brush.size / 0.25 * 100.0;
                         if bar_slider(ui, tr("Size"), &mut size, 0.05..=100.0, 110.0).changed() {
-                            b.size = (size / 100.0 * 0.25).clamp(0.0005, 0.25);
+                            brush.size = (size / 100.0 * 0.25).clamp(0.0005, 0.25);
                         }
-                        let mut flow = b.flow * 100.0;
+                        let mut flow = brush.flow * 100.0;
                         if bar_slider(ui, tr("Flow"), &mut flow, 0.0..=100.0, 100.0).changed() {
-                            b.flow = flow / 100.0;
+                            brush.flow = flow / 100.0;
                         }
-                        let mut op = b.opacity * 100.0;
-                        if bar_slider(ui, tr("Stroke opacity"), &mut op, 0.0..=100.0, 110.0).changed() {
-                            b.opacity = op / 100.0;
+                        let mut opacity = brush.opacity * 100.0;
+                        if bar_slider(ui, tr("Stroke opacity"), &mut opacity, 0.0..=100.0, 110.0).changed() {
+                            brush.opacity = opacity / 100.0;
                         }
-                        let mut sp = b.spacing * 100.0;
-                        if bar_slider(ui, tr("Spacing"), &mut sp, 1.0..=200.0, 100.0).changed() {
-                            b.spacing = sp / 100.0;
+                        let mut spacing = brush.spacing * 100.0;
+                        if bar_slider(ui, tr("Spacing"), &mut spacing, 1.0..=200.0, 100.0).changed() {
+                            brush.spacing = spacing / 100.0;
                         }
                         ui.separator();
-                        let lazy_on = b.lazy > 0.0;
+                        let lazy_on = brush.lazy > 0.0;
                         if icon_button(ui, ic::SCRIBBLE, tr("Lazy mouse"), lazy_on, 24.0).clicked() {
-                            b.lazy = if lazy_on { 0.0 } else { 20.0 };
+                            brush.lazy = if lazy_on { 0.0 } else { 20.0 };
                         }
                         if lazy_on {
-                            let mut d = b.lazy;
-                            if bar_slider(ui, tr("Distance"), &mut d, 1.0..=200.0, 90.0).changed() {
-                                b.lazy = d;
+                            let mut distance = brush.lazy;
+                            if bar_slider(ui, tr("Distance"), &mut distance, 1.0..=200.0, 90.0).changed() {
+                                brush.lazy = distance;
                             }
                         }
                         ui.separator();
-                        if icon_button(ui, ic::FLIP_HORIZONTAL, tr("Symmetry (X)"), b.symmetry.x, 24.0).clicked() {
-                            b.symmetry.x = !b.symmetry.x;
+                        if icon_button(ui, ic::FLIP_HORIZONTAL, tr("Symmetry (X)"), brush.symmetry.x, 24.0).clicked() {
+                            brush.symmetry.x = !brush.symmetry.x;
                         }
-                        if icon_button(ui, ic::FLIP_VERTICAL, tr("Symmetry (Y)"), b.symmetry.y, 24.0).clicked() {
-                            b.symmetry.y = !b.symmetry.y;
+                        if icon_button(ui, ic::FLIP_VERTICAL, tr("Symmetry (Y)"), brush.symmetry.y, 24.0).clicked() {
+                            brush.symmetry.y = !brush.symmetry.y;
                         }
-                        if icon_button(ui, ic::CLOUD_RAIN, tr("Particle brush: particles slide down the surface"), b.particles.enabled, 24.0).clicked() {
-                            b.particles.enabled = !b.particles.enabled;
+                        if icon_button(ui, ic::CLOUD_RAIN, tr("Particle brush: particles slide down the surface"), brush.particles.enabled, 24.0).clicked() {
+                            brush.particles.enabled = !brush.particles.enabled;
                         }
                         if tool == Tool::Smudge {
                             ui.separator();
-                            let mut st = app.session.tool.smudge_strength * 100.0;
-                            if bar_slider(ui, tr("Strength"), &mut st, 0.0..=100.0, 100.0).changed() {
-                                app.session.tool.smudge_strength = (st / 100.0).clamp(0.0, 1.0);
+                            let mut strength = app.session.tool.smudge_strength * 100.0;
+                            if bar_slider(ui, tr("Strength"), &mut strength, 0.0..=100.0, 100.0).changed() {
+                                app.session.tool.smudge_strength = (strength / 100.0).clamp(0.0, 1.0);
                             }
                         }
                         if tool == Tool::Clone && app.session.tool.clone_source.is_none() {
                             ui.separator();
-                            ui.label(RichText::new(tr("Hold V and click the mesh to set the clone source")).color(tk.text_dim));
+                            ui.label(RichText::new(tr("Hold V and click the mesh to set the clone source")).color(tokens.text_dim));
                         }
                         if tool == Tool::Path {
                             ui.separator();
@@ -98,21 +94,21 @@ pub fn top_bar(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
                     }
                     Tool::PolygonFill => {
                         use texturecraft_engine::FillMode;
-                        for (m, icon, tip) in [
+                        for (fill_mode, icon, tip) in [
                             (FillMode::Triangle, ic::POLYGON, tr("Triangle fill")),
                             (FillMode::UvIsland, ic::SHAPES, tr("UV island fill")),
                             (FillMode::Mesh, ic::CUBE, tr("Mesh fill")),
                         ] {
-                            if icon_button(ui, icon, tip, app.session.tool.fill_mode == m, 24.0).clicked() {
-                                app.session.tool.fill_mode = m;
+                            if icon_button(ui, icon, tip, app.session.tool.fill_mode == fill_mode, 24.0).clicked() {
+                                app.session.tool.fill_mode = fill_mode;
                             }
                         }
                     }
                     Tool::ColorPicker => {
-                        ui.label(RichText::new(tr("Click the mesh to pick its material into the brush")).color(tk.text_dim));
+                        ui.label(RichText::new(tr("Click the mesh to pick its material into the brush")).color(tokens.text_dim));
                     }
                     Tool::GeometryMask => {
-                        ui.label(RichText::new(tr("Click a mesh part to show or hide the selected layer on it.")).color(tk.text_dim));
+                        ui.label(RichText::new(tr("Click a mesh part to show or hide the selected layer on it.")).color(tokens.text_dim));
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -120,13 +116,13 @@ pub fn top_bar(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
                         app.toast(tr("Use the control channel or `texturecraft-cli render` for screenshots"), false);
                     }
                     ui.separator();
-                    for (l, icon, label, id) in [
+                    for (layout, icon, label, id) in [
                         (ViewLayout::Only2D, ic::SQUARE, "2D view only", "ui.layout.2d"),
                         (ViewLayout::Only3D, ic::CUBE, "3D view only", "ui.layout.3d"),
                         (ViewLayout::Split, ic::COLUMNS, "3D/2D views", "ui.layout.split"),
                     ] {
-                        if icon_button(ui, icon, &tip(&app.ui.keymap, label, id), app.ui.layout == l, 24.0).clicked() {
-                            app.ui.layout = l;
+                        if icon_button(ui, icon, &tip(&app.ui.keymap, label, id), app.ui.layout == layout, 24.0).clicked() {
+                            app.ui.layout = layout;
                         }
                     }
                     ui.separator();
@@ -165,46 +161,53 @@ pub fn path_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
 }
 
 pub fn tool_shelf(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
-    let tk = Tokens::get(ui.ctx());
+    let tokens = Tokens::get(ui.ctx());
     egui::Panel::left("tool_shelf").resizable(false).exact_size(40.0).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| {
-        card(ui, &tk, egui::Margin { left: GUTTER, right: 0, top: GUTTER, bottom: GUTTER }, egui::Margin::symmetric(3, 6), |ui| {
+        card(ui, &tokens, egui::Margin { left: GUTTER, right: 0, top: GUTTER, bottom: GUTTER }, egui::Margin::symmetric(3, 6), |ui| {
             ui.spacing_mut().item_spacing.y = 3.0;
-            let painting = app.ui.mode == Mode::Painting;
-            for t in Tool::ALL {
-                let selected = painting && app.session.tool.tool == t;
-                let hint = tip(&app.ui.keymap, tr(t.label()), &format!("tool.{}", t.id()));
-                if icon_button(ui, tool_icon(t), &hint, selected, 28.0).clicked() {
-                    app.ui.mode = Mode::Painting;
-                    app.run("tool.select", json!({"tool": t.id()}));
-                }
-            }
-            ui.add_space(6.0);
-            ui.separator();
-            ui.add_space(6.0);
-            let q = &app.session.quick_mask;
-            for (id, icon, label, on) in [
-                ("viewport.quickMask", ic::SELECTION_BACKGROUND, tr("Quick mask"), q.enabled),
-                ("viewport.quickMask.edit", ic::SELECTION, tr("Edit quick mask"), q.editing),
-                ("viewport.quickMask.invert", ic::SELECTION_INVERSE, tr("Invert quick mask"), q.inverted),
+            for (mode, icon, label, command) in [
+                (Mode::Painting, ic::PALETTE, tr("Painting"), "ui.mode.paint"),
+                (Mode::Baking, ic::ATOM, tr("Bake Mesh Maps"), "ui.mode.bake"),
+                (Mode::Rendering, ic::APERTURE, tr("Rendering (path traced)"), "ui.mode.render"),
             ] {
-                if icon_button(ui, icon, &tip(&app.ui.keymap, label, id), on, 28.0).clicked() {
-                    app.run(id, json!({}));
+                if icon_button(ui, icon, &tip(&app.ui.keymap, label, command), app.ui.mode == mode, 28.0).clicked() {
+                    crate::menus::invoke(app, &ui.ctx().clone(), command);
                 }
             }
+
             ui.add_space(6.0);
             ui.separator();
             ui.add_space(6.0);
-            if icon_button(ui, ic::ATOM, &tip(&app.ui.keymap, tr("Bake mesh maps"), "ui.mode.bake"), app.ui.mode == Mode::Baking, 28.0).clicked() {
-                app.ui.mode = if app.ui.mode == Mode::Baking { Mode::Painting } else { Mode::Baking };
-            }
-            if icon_button(ui, ic::APERTURE, &tip(&app.ui.keymap, tr("Rendering, path traced"), "ui.mode.render"), app.ui.mode == Mode::Rendering, 28.0)
-                .clicked()
-            {
-                app.ui.mode = if app.ui.mode == Mode::Rendering { Mode::Painting } else { Mode::Rendering };
-            }
-            if icon_button(ui, ic::SPHERE, tr("Add smart material from the shelf"), false, 28.0).clicked() {
-                app.ui.dock.focus(Panel::Assets);
-            }
+            ui.add_enabled_ui(app.ui.mode == Mode::Painting, |ui| {
+                for tool in Tool::ALL {
+                    let selected = app.ui.mode == Mode::Painting && app.session.tool.tool == tool;
+                    let hint = tip(&app.ui.keymap, tr(tool.label()), &format!("tool.{}", tool.id()));
+                    if icon_button(ui, tool_icon(tool), &hint, selected, 28.0).clicked() {
+                        app.run("tool.select", json!({"tool": tool.id()}));
+                    }
+                }
+
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+                let quick_mask = &app.session.quick_mask;
+                for (command, icon, label, selected) in [
+                    ("viewport.quickMask", ic::SELECTION_BACKGROUND, tr("Quick mask"), quick_mask.enabled),
+                    ("viewport.quickMask.edit", ic::SELECTION, tr("Edit quick mask"), quick_mask.editing),
+                    ("viewport.quickMask.invert", ic::SELECTION_INVERSE, tr("Invert quick mask"), quick_mask.inverted),
+                ] {
+                    if icon_button(ui, icon, &tip(&app.ui.keymap, label, command), selected, 28.0).clicked() {
+                        app.run(command, json!({}));
+                    }
+                }
+
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+                if icon_button(ui, ic::SPHERE, tr("Add smart material from the shelf"), false, 28.0).clicked() {
+                    app.ui.dock.focus(Panel::Assets);
+                }
+            });
         });
     });
 }

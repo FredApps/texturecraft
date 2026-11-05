@@ -58,6 +58,13 @@ replace it without touching the engine.
 
 ## 3. Golden rules
 
+### Never name the reference product (absolutely essential)
+
+- The repository never names the commercial product TextureCraft is modeled on, nor its vendor,
+  in code, comments, docs, commit messages, test names, file names or UI text. Say "the reference
+  app", "the professional model-painter workflow" or describe the feature itself.
+- Notes that name it may live only in the gitignored `plan/` folder or in this `AGENTS.md` file
+
 ### Assets, icons and images (absolutely essential)
 
 - **Never use any icon, image, logo, texture, material, brush, environment, font or other asset
@@ -126,7 +133,7 @@ panic. The shared standard is `../craftrules/standards/never-crash.md`.
    Benchmark heavy paths (bake, composite, export) in release and record numbers in the dev log.
 8. **Cross-app formats are shared conventions.** MaterialCraft's `.mcmat` portable materials are
    read here with our own code (`formats::mcmat`): keep the manifest fields, usage ids and
-   mesh-map identifiers (`BakedMap::interop_id`) in step with MaterialCraft's
+   mesh-map identifiers (`BakedMap::id`) in step with MaterialCraft's
    `docs/control-protocol.md`, and never depend on MaterialCraft's crates; talk to it through
    `materialcraft-cli`.
 9. **Verify UI changes visually.** Launch with `--control <port>` and call `ui.screenshot` (whole

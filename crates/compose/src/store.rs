@@ -57,8 +57,7 @@ pub fn decode(kind: ChannelKind, v: u16) -> f32 {
 }
 
 /// Baked mesh maps of one texture set (dense, row-major, `components()` floats per texel). The
-/// maps cover the texture set's texels at another density: `resolution` wide, and as tall as
-/// the set's aspect makes them (square for classic sets, the UV tile grid's aspect otherwise).
+/// width is `resolution`; height follows the output size and UV tile grid
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BakedMaps {
     /// Width in texels.
@@ -72,20 +71,21 @@ impl BakedMaps {
         self.maps.get(&m).map_or(0, |d| (d.len() / (self.resolution.max(1) as usize * m.components())) as u32)
     }
 
-    /// Sample map `m` at texel (x, y) of an image `res` wide with the same aspect (nearest texel
-    /// of the bake).
-    pub fn sample(&self, m: BakedMap, x: u32, y: u32, res: u32) -> Option<[f32; 3]> {
-        let data = self.maps.get(&m)?;
-        let r = self.resolution.max(1) as u64;
-        let (bx, by) = ((x as u64 * r / res.max(1) as u64).min(r - 1), (y as u64 * r / res.max(1) as u64).min(self.height(m).max(1) as u64 - 1));
-        let comps = m.components();
-        let i = ((by * r + bx) as usize) * comps;
-        let s = data.get(i..i + comps)?;
-        Some(if comps == 3 { [s[0], s[1], s[2]] } else { [s[0]; 3] })
+    /// Sample the corresponding texel of an image with the supplied output size
+    pub fn sample(&self, map: BakedMap, x: u32, y: u32, output_size: (u32, u32)) -> Option<[f32; 3]> {
+        let data = self.maps.get(&map)?;
+        let width = u64::from(self.resolution.max(1));
+        let height = u64::from(self.height(map).max(1));
+        let sample_x = (u64::from(x) * width / u64::from(output_size.0.max(1))).min(width - 1);
+        let sample_y = (u64::from(y) * height / u64::from(output_size.1.max(1))).min(height - 1);
+        let component_count = map.components();
+        let offset = ((sample_y * width + sample_x) as usize).checked_mul(component_count)?;
+        let texel = data.get(offset..offset.checked_add(component_count)?)?;
+        Some(if component_count == 3 { [texel[0], texel[1], texel[2]] } else { [texel[0]; 3] })
     }
 
-    pub fn scalar(&self, m: BakedMap, x: u32, y: u32, res: u32) -> Option<f32> {
-        self.sample(m, x, y, res).map(|v| v[0])
+    pub fn scalar(&self, m: BakedMap, x: u32, y: u32, size: (u32, u32)) -> Option<f32> {
+        self.sample(m, x, y, size).map(|v| v[0])
     }
 }
 

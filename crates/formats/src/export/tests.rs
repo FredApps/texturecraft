@@ -200,7 +200,7 @@ fn ao_mixes_baked_and_channel() {
     let mesh_maps = fx.render_preset("Mesh maps");
     assert_eq!(mesh_maps.len(), 1, "only baked maps are exported");
     let ao = decode(&mesh_maps[0]);
-    assert_eq!(mesh_maps[0].name, "sphere_Body_Set_ambient_occlusion.png");
+    assert_eq!(mesh_maps[0].name, "sphere_Body_Set_ambientOcclusion.png");
     assert_eq!(ao.color(), image::ColorType::L16);
 }
 

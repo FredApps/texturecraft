@@ -35,30 +35,40 @@ pub fn set_focus_picking(ctx: &egui::Context, on: bool) {
 }
 
 pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
-    let tk = Tokens::get(ui.ctx());
+    let mode = app.ui.mode;
+    let bake_painting = mode == crate::state::Mode::Baking
+        && app.ui.bake_paint_brush.on
+        && !app.session.bake_meshes.high.is_empty()
+        && app.session.doc.project.texture_sets.get(app.session.ts()).is_some_and(|texture_set| {
+            !texture_set.bake.high_poly.use_low_as_high && texture_set.bake.cage.kind == texturecraft_engine::core::CageType::DistanceBased
+        });
+    app.ui.bake_paint_brush.on = bake_painting;
+    if mode == crate::state::Mode::Painting && !app.ui.hide_ui {
+        crate::toolbar::paint_bar(app, ui);
+    }
+
+    let tokens = Tokens::get(ui.ctx());
     let aux = match app.session.view {
-        _ if app.session.quick_mask.editing => Some(crate::gpu::AuxView::QuickMask),
+        _ if mode == crate::state::Mode::Painting && app.session.quick_mask.editing => Some(crate::gpu::AuxView::QuickMask),
         ViewMode::MeshMap(m) => Some(crate::gpu::AuxView::MeshMap(m)),
         ViewMode::Mask(id) => Some(crate::gpu::AuxView::Mask(id)),
         _ => None,
     };
     let mut sync = PendingSync(Some(aux));
-    let full = ui.max_rect();
-    let mode = app.ui.mode;
+    let full = ui.available_rect_before_wrap();
     path_keys(app, ui);
-    // Bake mode shows the 3D view alone, except while the skew brush needs the 2D view to paint in.
-    let skew_painting = mode == crate::state::Mode::Baking && app.ui.skew_brush.on;
-    let layout = if mode == crate::state::Mode::Painting || skew_painting { app.ui.layout } else { ViewLayout::Only3D };
+    // Skew painting needs the 2D view alongside the 3D Bake preview
+    let layout = if mode == crate::state::Mode::Painting || bake_painting { app.ui.layout } else { ViewLayout::Only3D };
     match layout {
         ViewLayout::Only3D => view_3d(app, ui, full, &mut sync),
         ViewLayout::Only2D => view_2d(app, ui, full, &mut sync),
         ViewLayout::Split => {
-            let mid = full.center().x;
-            let left = Rect::from_min_max(full.min, pos2(mid - 1.0, full.max.y));
-            let right = Rect::from_min_max(pos2(mid + 1.0, full.min.y), full.max);
+            let midpoint = full.center().x;
+            let left = Rect::from_min_max(full.min, pos2(midpoint - 1.0, full.max.y));
+            let right = Rect::from_min_max(pos2(midpoint + 1.0, full.min.y), full.max);
             view_3d(app, ui, left, &mut sync);
             view_2d(app, ui, right, &mut sync);
-            ui.painter().line_segment([pos2(mid, full.top()), pos2(mid, full.bottom())], Stroke::new(2.0, tk.chrome));
+            ui.painter().line_segment([pos2(midpoint, full.top()), pos2(midpoint, full.bottom())], Stroke::new(2.0, tokens.chrome));
         }
     }
     if mode == crate::state::Mode::Rendering {
@@ -66,7 +76,10 @@ pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
     } else if app.render.is_active() {
         crate::render_mode::stop(app);
     }
-    // Keep drawing while the 3D view accumulates anti-aliasing samples (it stops on its own).
+    if mode == crate::state::Mode::Baking {
+        crate::bake_mode::bake_bar(app, ui.ctx(), full);
+    }
+    // Keep drawing until the 3D view finishes accumulating anti-aliasing samples
     let accumulating = layout != ViewLayout::Only2D
         && app
             .render_state
@@ -79,16 +92,16 @@ pub fn central(app: &mut TextureCraftApp, ui: &mut Ui) {
 
 fn shade(app: &TextureCraftApp) -> Shade {
     let (view_mode, channel) = match app.session.view {
-        _ if app.session.quick_mask.editing => (2, 0),
+        _ if app.ui.mode == crate::state::Mode::Painting && app.session.quick_mask.editing => (2, 0),
         ViewMode::Material => (0, 0),
-        ViewMode::Channel(c) => (1, c.index() as u32),
+        ViewMode::Channel(selected_channel) => (1, selected_channel.index() as u32),
         ViewMode::MeshMap(_) | ViewMode::Mask(_) => (2, 0),
         ViewMode::UvChecker => (3, 0),
     };
-    let ts = app.session.ts();
-    let hs = app.session.doc.project.texture_sets.get(ts).map(|t| t.atlas_height_strength()).unwrap_or(1.0);
+    let set_index = app.session.ts();
+    let height_strength = app.session.doc.project.texture_sets.get(set_index).map(|texture_set| texture_set.atlas_height_strength()).unwrap_or(1.0);
     Shade {
-        height_strength: hs,
+        height_strength,
         view_mode,
         channel,
         wireframe: app.ui.uv_wireframe,
@@ -200,7 +213,10 @@ fn view_header(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, id: &str) {
             app.run("camera.add", json!({}));
         }
     });
-    let label = app.session.view.label();
+    let label = match app.session.view {
+        ViewMode::MeshMap(map) => crate::i18n::baked_map_label(map).to_owned(),
+        _ => app.session.view.label(),
+    };
     let channels = app.session.doc.project.texture_set(app.session.ts()).map(|t| t.channel_list()).unwrap_or_default();
     egui::ComboBox::from_id_salt(format!("{id}_mode")).width(130.0).selected_text(tr(&label)).show_ui(&mut child, |ui| {
         if ui.selectable_label(app.session.view == ViewMode::Material, tr("Material")).clicked() {
@@ -214,7 +230,8 @@ fn view_header(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, id: &str) {
         }
         ui.separator();
         for m in BakedMap::ALL {
-            if ui.selectable_label(app.session.view == ViewMode::MeshMap(m), trf("Mesh map: {map}", &[("map", &tr(m.label()))])).clicked() {
+            if ui.selectable_label(app.session.view == ViewMode::MeshMap(m), trf("Mesh map: {map}", &[("map", &tr(crate::i18n::baked_map_label(m)))])).clicked()
+            {
                 app.run("viewport.view", json!({"mode": format!("map:{}", m.id())}));
             }
         }
@@ -261,7 +278,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
 
     // Navigation (S + drag manipulates the projection stencil instead, below).
     let delta = ui.input(|i| i.pointer.delta());
-    let s_held = ui.input(|i| i.key_down(egui::Key::S)) && !ui.ctx().egui_wants_keyboard_input();
+    let s_held = app.ui.mode == crate::state::Mode::Painting && ui.input(|i| i.key_down(egui::Key::S)) && !ui.ctx().egui_wants_keyboard_input();
     let stencil_drag = s_held && app.session.tool.stencil.is_some();
     if stencil_drag || adjusting {
         // The stencil moves, turns and scales instead of the camera (handled below), or the
@@ -284,9 +301,9 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     if resp.hovered() {
         let scroll = ui.input(|i| i.smooth_scroll_delta.y);
         if scroll != 0.0 {
-            if shift {
-                let b = &mut app.session.tool.brush;
-                b.size = (b.size * (1.0 + scroll * 0.002)).clamp(0.0005, 0.25);
+            if shift && app.ui.mode == crate::state::Mode::Painting {
+                let brush = &mut app.session.tool.brush;
+                brush.size = (brush.size * (1.0 + scroll * 0.002)).clamp(0.0005, 0.25);
             } else {
                 app.session.camera.zoom(scroll * 0.0025);
             }
@@ -606,6 +623,10 @@ fn decal_input(app: &mut TextureCraftApp, ui: &Ui, resp: &egui::Response, rect: 
 /// The frame of the selected decal layer over the 3D view with its handles (and a hint while
 /// placing it): outline, corner handles, the rotation handle and the projection direction.
 fn decal_overlay(app: &mut TextureCraftApp, ui: &Ui, rect: Rect) {
+    if app.ui.mode != crate::state::Mode::Painting {
+        return;
+    }
+
     let tk = Tokens::get(ui.ctx());
     use texturecraft_engine::core::{Fill, LayerKind, Projection};
     let p = &app.session.doc.project;
@@ -654,32 +675,33 @@ fn decal_overlay(app: &mut TextureCraftApp, ui: &Ui, rect: Rect) {
     }
 }
 
-/// Draw the projection stencil over the 3D view.
+/// Draw the projection stencil in Paint Mode
 fn stencil_overlay(app: &mut TextureCraftApp, ui: &Ui, rect: Rect) {
-    if app.session.tool.tool != Tool::Projection {
+    if app.ui.mode != crate::state::Mode::Painting || app.session.tool.tool != Tool::Projection {
         return;
     }
-    let Some(st) = app.session.tool.stencil.clone() else { return };
-    let Some(img) = app.session.images.get(&st.image).cloned() else { return };
-    let tex = app.thumbs.stencil(ui.ctx(), &st.image, &img);
+    let Some(stencil) = app.session.tool.stencil.clone() else { return };
+    let Some(image) = app.session.images.get(&stencil.image).cloned() else { return };
+
+    let texture = app.thumbs.stencil(ui.ctx(), &stencil.image, &image);
     let aspect = rect.width() / rect.height().max(1.0);
-    let (center, half, rot) = st.placement(img.width as f32 / img.height.max(1) as f32, aspect);
-    let to_screen = |nx: f32, ny: f32| pos2(rect.left() + (nx * 0.5 + 0.5) * rect.width(), rect.top() + (0.5 - ny * 0.5) * rect.height());
-    let (sn, cs) = rot.sin_cos();
-    let corner = |lx: f32, ly: f32| {
-        let (x, y) = (lx * half[0], ly * half[1]);
-        to_screen(center[0] + x * cs - y * sn, center[1] + x * sn + y * cs)
+    let (center, half_size, rotation) = stencil.placement(image.width as f32 / image.height.max(1) as f32, aspect);
+    let to_screen = |x: f32, y: f32| pos2(rect.left() + (x * 0.5 + 0.5) * rect.width(), rect.top() + (0.5 - y * 0.5) * rect.height());
+    let (sine, cosine) = rotation.sin_cos();
+    let corner = |x: f32, y: f32| {
+        let (x, y) = (x * half_size[0], y * half_size[1]);
+        to_screen(center[0] + x * cosine - y * sine, center[1] + x * sine + y * cosine)
     };
-    let tint = Color32::from_white_alpha((st.opacity * 255.0) as u8);
-    let mut mesh = egui::Mesh::with_texture(tex.id());
-    for (lx, ly, u, v) in [(-1.0, 1.0, 0.0, 0.0), (1.0, 1.0, 1.0, 0.0), (1.0, -1.0, 1.0, 1.0), (-1.0, -1.0, 0.0, 1.0)] {
-        mesh.vertices.push(egui::epaint::Vertex { pos: corner(lx, ly), uv: pos2(u, v), color: tint });
+    let tint = Color32::from_white_alpha((stencil.opacity * 255.0) as u8);
+    let mut mesh = egui::Mesh::with_texture(texture.id());
+    for (x, y, u, v) in [(-1.0, 1.0, 0.0, 0.0), (1.0, 1.0, 1.0, 0.0), (1.0, -1.0, 1.0, 1.0), (-1.0, -1.0, 0.0, 1.0)] {
+        mesh.vertices.push(egui::epaint::Vertex { pos: corner(x, y), uv: pos2(u, v), color: tint });
     }
     mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
-    let p = ui.painter_at(rect);
-    p.add(egui::Shape::mesh(mesh));
+    let painter = ui.painter_at(rect);
+    painter.add(egui::Shape::mesh(mesh));
     let outline = vec![corner(-1.0, 1.0), corner(1.0, 1.0), corner(1.0, -1.0), corner(-1.0, -1.0), corner(-1.0, 1.0)];
-    p.add(egui::Shape::dashed_line(&outline, Stroke::new(1.0, Color32::from_white_alpha(120)), 5.0, 4.0));
+    painter.add(egui::Shape::dashed_line(&outline, Stroke::new(1.0, Color32::from_white_alpha(120)), 5.0, 4.0));
 }
 
 /// A world point on screen in the 3D view `rect` (None behind the camera).
@@ -982,9 +1004,9 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         let uv = to_uv(p);
         app.run("tool.cloneSource", json!({"uv": [uv.x, uv.y]}));
     }
-    let skew_on = app.ui.mode == crate::state::Mode::Baking && app.ui.skew_brush.on && !alt;
-    if skew_on {
-        skew_input(app, ui, &resp, &to_uv);
+    let bake_paint_on = app.ui.mode == crate::state::Mode::Baking && app.ui.bake_paint_brush.on && !alt;
+    if bake_paint_on {
+        bake_paint_input(app, ui, &resp, &to_uv);
     }
     let painting = app.ui.mode == crate::state::Mode::Painting && !alt && !adjusting && !v_held;
     if painting && path_tool {
@@ -1050,9 +1072,9 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         path_overlay(app, ui, rect, &resp, true, show);
     }
     if app.ui.mode == crate::state::Mode::Baking {
-        skew_overlay(app, ui, &painter, to(0.0, 1.0), to(1.0, 0.0));
-        if skew_on && let Some(hover) = resp.hover_pos() {
-            let r = (to(app.ui.skew_brush.radius, 0.0).x - to(0.0, 0.0).x).abs().max(2.0);
+        bake_paint_overlay(app, ui, &painter, to(0.0, 1.0), to(1.0, 0.0));
+        if bake_paint_on && let Some(hover) = resp.hover_pos() {
+            let r = (to(app.ui.bake_paint_brush.radius, 0.0).x - to(0.0, 0.0).x).abs().max(2.0);
             painter.circle_stroke(hover, r, Stroke::new(1.0, Color32::from_white_alpha(200)));
         }
     }
@@ -1065,9 +1087,9 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
 }
 
 /// Paint the skew map under the pointer in the 2D view (a click is one dab, a drag a stroke).
-fn skew_input(app: &mut TextureCraftApp, ui: &Ui, resp: &egui::Response, to_uv: &dyn Fn(egui::Pos2) -> Vec2) {
-    let last = ui.scope_id().with("skew_last");
-    let brush = app.ui.skew_brush;
+fn bake_paint_input(app: &mut TextureCraftApp, ui: &Ui, resp: &egui::Response, to_uv: &dyn Fn(egui::Pos2) -> Vec2) {
+    let last = ui.scope_id().with(("bake_paint_last", app.session.ts(), app.ui.bake_paint_brush.target as u8));
+    let brush = app.ui.bake_paint_brush;
     let started = resp.drag_started_by(PointerButton::Primary) || resp.clicked_by(PointerButton::Primary);
     if !(started || resp.dragged_by(PointerButton::Primary)) {
         return;
@@ -1076,16 +1098,20 @@ fn skew_input(app: &mut TextureCraftApp, ui: &Ui, resp: &egui::Response, to_uv: 
     let uv = to_uv(p);
     let previous: Option<[f32; 2]> = if started { None } else { ui.data(|d| d.get_temp(last)) };
     let points: Vec<[f32; 2]> = previous.into_iter().chain([[uv.x, uv.y]]).collect();
-    if app.run("bake.skew.paint", json!({"points": points, "radius": brush.radius, "value": brush.value, "hardness": brush.hardness})).is_some() {
+    let command = match brush.target {
+        texturecraft_engine::core::BakePaintTarget::Skew => "bake.skew.paint",
+        texturecraft_engine::core::BakePaintTarget::Cage => "bake.cage.paint",
+    };
+    if app.run(command, json!({"points": points, "radius": brush.radius, "value": brush.value, "hardness": brush.hardness, "continue": !started})).is_some() {
         ui.data_mut(|d| d.insert_temp(last, [uv.x, uv.y]));
     }
 }
 
 /// The skew map as a translucent orange layer over the UV square from `top_left` to `bottom_right`.
-fn skew_overlay(app: &TextureCraftApp, ui: &Ui, painter: &egui::Painter, top_left: egui::Pos2, bottom_right: egui::Pos2) {
-    let Some(k) = app.session.bake_meshes.skew.as_ref().filter(|k| k.values.len() > 1) else { return };
-    let key = (app.session.bake_meshes.skew_rev, std::sync::Arc::as_ptr(k) as usize);
-    let id = ui.scope_id().with("skew_overlay_texture");
+fn bake_paint_overlay(app: &TextureCraftApp, ui: &Ui, painter: &egui::Painter, top_left: egui::Pos2, bottom_right: egui::Pos2) {
+    let Some(k) = app.session.doc.bake_paint.get(&(app.session.ts(), app.ui.bake_paint_brush.target)).filter(|k| k.values.len() > 1) else { return };
+    let key = (app.session.revision, std::sync::Arc::as_ptr(k) as usize);
+    let id = ui.scope_id().with("bake_paint_overlay_texture");
     let cached: Option<((u64, usize), egui::TextureHandle)> = ui.data(|d| d.get_temp(id));
     let tex = match cached {
         Some((c, t)) if c == key => t,
@@ -1097,10 +1123,14 @@ fn skew_overlay(app: &TextureCraftApp, ui: &Ui, painter: &egui::Painter, top_lef
             for y in 0..oh {
                 for x in 0..ow {
                     let v = k.values.get((y * h / oh) * w + x * w / ow).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+                    let v = match app.ui.bake_paint_brush.target {
+                        texturecraft_engine::core::BakePaintTarget::Skew => v,
+                        texturecraft_engine::core::BakePaintTarget::Cage => 1.0 - v,
+                    };
                     rgba.extend_from_slice(&[255, 140, 40, (v * 170.0) as u8]);
                 }
             }
-            let tex = ui.ctx().load_texture("skew_overlay", egui::ColorImage::from_rgba_unmultiplied([ow, oh], &rgba), egui::TextureOptions::NEAREST);
+            let tex = ui.ctx().load_texture("bake_paint_overlay", egui::ColorImage::from_rgba_unmultiplied([ow, oh], &rgba), egui::TextureOptions::NEAREST);
             ui.data_mut(|d| d.insert_temp(id, (key, tex.clone())));
             tex
         }

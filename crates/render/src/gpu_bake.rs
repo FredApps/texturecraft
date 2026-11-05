@@ -10,7 +10,8 @@ use std::sync::{Arc, OnceLock};
 use bytemuck::{Pod, Zeroable};
 use rayon::prelude::*;
 use texturecraft_bake::BakeError;
-use texturecraft_bake::rays::{ANY, Hemisphere, Query, Ray, RayKind, RayScene, TraceMesh, Tracer};
+use texturecraft_bake::tracing::{ANY, Hemisphere, Query, Ray, RayKind, RayScene, TraceMesh, Tracer};
+use texturecraft_core::{AmbientOcclusionAttenuation, BackfaceMode};
 use texturecraft_geom::Hit;
 use texturecraft_geom::glam::Vec3;
 
@@ -42,6 +43,10 @@ struct Params {
     lanes: u32,
     /// First result row of the pass.
     out: u32,
+    min_distance: f32,
+    attenuation: u32,
+    ground_height: f32,
+    backface_mode: u32,
 }
 
 struct Gpu {
@@ -152,7 +157,9 @@ impl Tracer for GpuBaker {
             }
             let base = ((nodes.len() / 2) as u32, (tris.len() / 4) as u32);
             roots.push(base.0);
-            let (n, t) = bvh_rows(m.bvh, base, |o| ([m.keys.get(o).copied().unwrap_or(ANY), 0, 0], [0, 0, 0, o as u32]));
+            let (n, t) = bvh_rows(m.bvh, base, |o| {
+                ([m.keys.get(o).copied().unwrap_or(ANY), u32::from(m.backface_culling.get(o).copied().unwrap_or(false)), 0], [0, 0, 0, o as u32])
+            });
             nodes.extend(n);
             tris.extend(t);
         }
@@ -232,10 +239,17 @@ impl GpuScene<'_> {
     }
 
     /// Run `pipeline` over `n` items (`items`: their rows) once per pass in one submission, and
-    /// read back one result row per item and pass (pass after pass).
-    fn run(&mut self, pipeline: &wgpu::ComputePipeline, items: &[[u32; 4]], n: usize, passes: &[Pass]) -> Result<Vec<[u32; 4]>, BakeError> {
+    /// hand `read` one result row per item and pass (pass after pass).
+    fn run<R: Default>(
+        &mut self,
+        pipeline: &wgpu::ComputePipeline,
+        items: &[u8],
+        n: usize,
+        passes: &[Pass],
+        read: impl FnOnce(&[[u32; 4]]) -> R,
+    ) -> Result<R, BakeError> {
         if n == 0 || passes.is_empty() {
-            return Ok(Vec::new());
+            return Ok(R::default());
         }
         let g = self.gpu;
         let max_groups = g.device.limits().max_compute_workgroups_per_dimension as usize;
@@ -250,14 +264,14 @@ impl GpuScene<'_> {
                 blocks.resize(blocks.len().next_multiple_of(g.stride), 0);
             }
         }
-        let (in_bytes, out_bytes) = (items.len() as u64 * 16, (n * passes.len()) as u64 * 16);
+        let (in_bytes, out_bytes) = (items.len() as u64, (n * passes.len()) as u64 * 16);
         if in_bytes.max(out_bytes) > g.max_buffer() {
             return Err(err("a batch exceeds this GPU's buffer limit"));
         }
         let io = self.io(in_bytes, out_bytes, blocks.len() as u64)?;
         let dev = &g.device;
         scoped(dev, "GPU baking: dispatch", || {
-            g.queue.write_buffer(&io.items, 0, bytemuck::cast_slice(items));
+            g.queue.write_buffer(&io.items, 0, items);
             g.queue.write_buffer(&io.params, 0, &blocks);
             let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("tc_bake") });
             {
@@ -280,7 +294,7 @@ impl GpuScene<'_> {
         dev.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).map_err(err)?;
         rx.recv().map_err(err)?.map_err(err)?;
         let data = slice.get_mapped_range().map_err(err)?;
-        let out = bytemuck::try_cast_slice::<u8, [u32; 4]>(&data).map(<[_]>::to_vec).map_err(err);
+        let out = bytemuck::try_cast_slice::<u8, [u32; 4]>(&data).map(read).map_err(err);
         drop(data);
         io.staging.unmap();
         out
@@ -293,12 +307,16 @@ fn row(v: Vec3, w: u32) -> [u32; 4] {
 }
 
 impl RayScene for GpuScene<'_> {
-    fn closest(&mut self, mesh: usize, rays: &[Ray]) -> Result<Vec<Option<Hit>>, BakeError> {
-        let items: Vec<[u32; 4]> = rays.par_iter().flat_map_iter(|r| [row(r.origin, r.tmax.to_bits()), row(r.dir, r.key)]).collect();
-        let pass = Pass { params: Params { root: self.root(mesh)?, ..Params::default() }, per_dispatch: RAYS_PER_DISPATCH, per_group: WORKGROUP as usize };
+    fn closest(&mut self, mesh: usize, rays: &[Ray], ignore_backface: bool) -> Result<Vec<Option<Hit>>, BakeError> {
+        let pass = Pass {
+            params: Params { root: self.root(mesh)?, flags: u32::from(ignore_backface) * IGNORE_BACKFACE, ..Params::default() },
+            per_dispatch: RAYS_PER_DISPATCH,
+            per_group: WORKGROUP as usize,
+        };
         let gpu = self.gpu;
-        let out = self.run(&gpu.transfer, &items, rays.len(), &[pass])?;
-        Ok(out.into_iter().map(|[t, u, v, tri]| (tri != NONE).then(|| Hit { t: f32::from_bits(t), tri, u: f32::from_bits(u), v: f32::from_bits(v) })).collect())
+        self.run(&gpu.transfer, bytemuck::cast_slice(rays), rays.len(), &[pass], |out| {
+            out.par_iter().map(|&[t, u, v, tri]| (tri != NONE).then(|| Hit { t: f32::from_bits(t), tri, u: f32::from_bits(u), v: f32::from_bits(v) })).collect()
+        })
     }
 
     fn hemispheres(&mut self, passes: &[Hemisphere], queries: &[Query]) -> Result<Vec<Vec<[f32; 4]>>, BakeError> {
@@ -316,14 +334,24 @@ impl RayScene for GpuScene<'_> {
             .map(|h| {
                 // A sample's rays spread over `lanes` threads of a workgroup (a power of two).
                 let lanes = h.rays.clamp(1, WORKGROUP).next_power_of_two();
-                let flags = [(h.uniform, UNIFORM), (h.ignore_backface, IGNORE_BACKFACE), (h.same_key, SAME_KEY)]
-                    .iter()
-                    .filter(|(on, _)| *on)
-                    .fold(0, |f, (_, b)| f | b);
+                let flags =
+                    [(h.uniform, UNIFORM), (h.ground_height.is_some(), 8), (h.same_key, SAME_KEY)].iter().filter(|(on, _)| *on).fold(0, |f, (_, b)| f | b);
                 let params = Params {
                     kind: u32::from(h.kind == RayKind::Thickness),
                     rays: h.rays,
                     dmax: h.dmax,
+                    min_distance: h.min_distance,
+                    attenuation: match h.attenuation {
+                        AmbientOcclusionAttenuation::None => 0,
+                        AmbientOcclusionAttenuation::Linear => 1,
+                        AmbientOcclusionAttenuation::Smooth => 2,
+                    },
+                    ground_height: h.ground_height.unwrap_or(0.0),
+                    backface_mode: match h.ignore_backface {
+                        BackfaceMode::Never => 0,
+                        BackfaceMode::Always => 1,
+                        BackfaceMode::ByMeshName => 2,
+                    },
                     eps: h.eps,
                     cos_max: h.cos_max,
                     sin_max: h.sin_max,
@@ -335,17 +363,22 @@ impl RayScene for GpuScene<'_> {
             })
             .collect();
         let gpu = self.gpu;
-        let out = self.run(&gpu.hemisphere, &items, queries.len(), &passes)?;
-        Ok(out.chunks(queries.len().max(1)).map(|c| c.iter().map(|v| v.map(f32::from_bits)).collect()).collect())
+        self.run(&gpu.hemisphere, bytemuck::cast_slice(&items), queries.len(), &passes, |out| {
+            out.chunks(queries.len().max(1)).map(|c| c.iter().map(|v| v.map(f32::from_bits)).collect()).collect()
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::Instant;
+    use texturecraft_core::{
+        AmbientOcclusionSettings, BakeAntialiasing, BakeResolution, BentNormalSettings, CageSettings, CommonBakeSettings, CurvatureSettings, HighPolySettings,
+        ThicknessSettings,
+    };
 
     use texturecraft_bake::{BakeOutput, BakeRequest, HighPoly, Progress, bake, bake_on};
-    use texturecraft_core::{BakeMatch, BakeSettings, BakedMap, RayDistribution, RaySettings, SelfOcclusion};
+    use texturecraft_core::{BackfaceMode, BakeSettings, BakedMap, CurvatureMethod, RayDistribution, RaySettings, SelfOcclusion};
     use texturecraft_geom::{Bvh, Mesh, primitives};
 
     use super::*;
@@ -364,8 +397,9 @@ mod tests {
 
     fn run(low: &Mesh, high: Option<&Mesh>, s: &BakeSettings, tracer: Option<&GpuBaker>) -> BakeOutput {
         let (lb, hb) = (Bvh::new(low), high.map(Bvh::new));
-        let high = high.zip(hb.as_ref()).map(|(mesh, bvh)| HighPoly { mesh, bvh, base_color: &[] });
-        let req = BakeRequest { mesh: low, bvh: &lb, material: 0, settings: s, high, cage: None, skew: None, tiles: (1, 1) };
+        let high = high.zip(hb.as_ref()).map(|(mesh, bvh)| HighPoly { file_ids: &[], mesh, bvh, base_color: &[] });
+        let req =
+            BakeRequest { low_base_color: &[], mesh: low, bvh: &lb, material: 0, settings: s, high, cage: None, skew: None, cage_paint: None, tiles: (1, 1) };
         match tracer {
             Some(t) => bake_on(&req, &Progress::new(), t).unwrap(),
             None => bake(&req, &Progress::new()).unwrap(),
@@ -388,24 +422,60 @@ mod tests {
     }
 
     #[test]
+    fn gpu_respects_secondary_ray_filters_and_ground_plane() {
+        let Some(gpu) = gpu() else { return };
+
+        let mut mesh = primitives::material_ball();
+        for part in &mut mesh.submeshes {
+            part.name.push_str("_ignorebf");
+        }
+        let mut settings = BakeSettings::default();
+        settings.common.resolution = BakeResolution::R64;
+        settings.common.apply_diffusion = false;
+        settings.maps.select([BakedMap::AmbientOcclusion, BakedMap::BentNormal, BakedMap::Thickness]);
+        settings.high_poly.ignore_backface_suffix = "_ignorebf".into();
+        settings.maps.ao.parameters.rays.min_distance = 0.02;
+        settings.maps.ao.parameters.ignore_backface = BackfaceMode::ByMeshName;
+        settings.maps.ao.parameters.self_occlusion = SelfOcclusion::SameMeshName;
+        settings.maps.ao.parameters.ground_plane.enabled = true;
+        settings.maps.ao.parameters.ground_plane.offset = 0.1;
+        settings.maps.bent_normal.parameters.rays.min_distance = 0.02;
+        settings.maps.bent_normal.parameters.ignore_backface = BackfaceMode::ByMeshName;
+        settings.maps.thickness.parameters.rays.min_distance = 0.02;
+        settings.maps.thickness.parameters.self_occlusion = SelfOcclusion::SameMeshName;
+        for attenuation in [AmbientOcclusionAttenuation::None, AmbientOcclusionAttenuation::Smooth] {
+            settings.maps.ao.parameters.attenuation = attenuation;
+            assert_agree(&run(&mesh, None, &settings, None), &run(&mesh, None, &settings, Some(&gpu)));
+        }
+    }
+
+    #[test]
     fn gpu_bake_matches_the_cpu() {
-        let Some(g) = gpu() else { return };
-        // Low poly: the material ball (self-occluding); every ray map with its own settings.
+        let Some(gpu) = gpu() else { return };
+
+        // Low poly: the material ball (self-occluding); every ray map with its own settings
         let ball = primitives::material_ball();
         let maps = [BakedMap::AmbientOcclusion, BakedMap::BentNormal, BakedMap::Thickness, BakedMap::Position, BakedMap::Curvature];
-        let s = BakeSettings {
-            resolution: 128,
-            antialiasing: 2,
-            dilation: 0,
-            maps: maps.into_iter().collect(),
-            ao: RaySettings { rays: 24, max_distance: 0.3, spread: 150.0, distribution: RayDistribution::Uniform },
-            ao_ignore_backface: true,
-            bent_normal: RaySettings { rays: 16, ..RaySettings::default() },
-            thickness: RaySettings { rays: 20, spread: 90.0, ..RaySettings::default() },
-            ..BakeSettings::default()
+        let settings = {
+            let mut base = BakeSettings::default();
+            base.common = CommonBakeSettings { resolution: BakeResolution::R128, antialiasing: BakeAntialiasing::Subsampling2x2, dilation: 0, ..base.common };
+            base.maps.select(maps);
+            base.maps.ao.parameters = AmbientOcclusionSettings {
+                rays: RaySettings { rays: 24, max_distance: 0.3, spread: 150.0, distribution: RayDistribution::Uniform, ..RaySettings::default() },
+                ignore_backface: BackfaceMode::Always,
+                ..base.maps.ao.parameters
+            };
+            base.maps.curvature.parameters = CurvatureSettings { method: CurvatureMethod::Mesh, ..base.maps.curvature.parameters };
+            base.maps.bent_normal.parameters =
+                BentNormalSettings { rays: RaySettings { rays: 16, ..RaySettings::default() }, ..base.maps.bent_normal.parameters };
+            base.maps.thickness.parameters =
+                ThicknessSettings { rays: RaySettings { rays: 20, spread: 90.0, ..RaySettings::default() }, ..base.maps.thickness.parameters };
+            base
         };
-        assert_agree(&run(&ball, None, &s, None), &run(&ball, None, &s, Some(&g)));
-        // A bumpy high poly over a sphere, matched by name: the transfer maps and AO on it.
+
+        assert_agree(&run(&ball, None, &settings, None), &run(&ball, None, &settings, Some(&gpu)));
+
+        // A bumpy high poly over a sphere, matched by name: the transfer maps and AO on it
         let low = primitives::sphere(1.0, 32, 16);
         let mut high = primitives::sphere(1.0, 128, 64);
         for p in &mut high.positions {
@@ -414,22 +484,35 @@ mod tests {
         high.compute_normals();
         high.compute_tangents();
         high.submeshes[0].name = format!("{}_high", low.submeshes[0].name);
-        let s = BakeSettings {
-            resolution: 128,
-            dilation: 0,
-            maps: [BakedMap::Normal, BakedMap::Height, BakedMap::Id, BakedMap::Opacity, BakedMap::AmbientOcclusion, BakedMap::WorldNormal]
-                .into_iter()
-                .collect(),
-            max_frontal: 0.02,
-            max_rear: 0.02,
-            matching: BakeMatch::ByMeshName,
-            low_suffix: String::new(),
-            ao: RaySettings { rays: 16, ..RaySettings::default() },
-            ao_self_occlusion: SelfOcclusion::SameMeshName,
-            use_low_as_high: false,
-            ..BakeSettings::default()
+        let settings = {
+            let mut base = BakeSettings::default();
+            base.common = CommonBakeSettings { resolution: BakeResolution::R128, dilation: 0, ..base.common };
+            base.maps.select([
+                BakedMap::Normal,
+                BakedMap::Height,
+                BakedMap::Id,
+                BakedMap::Opacity,
+                BakedMap::AmbientOcclusion,
+                BakedMap::WorldNormal,
+                BakedMap::Curvature,
+            ]);
+            base.cage = CageSettings { max_frontal: 0.02, max_rear: 0.02, ..base.cage };
+            base.high_poly = HighPolySettings {
+                match_mode: texturecraft_core::MeshMatchMode::ByMeshName,
+                low_suffix: String::new(),
+                use_low_as_high: false,
+                ..base.high_poly
+            };
+            base.maps.ao.parameters = AmbientOcclusionSettings {
+                rays: RaySettings { rays: 16, ..RaySettings::default() },
+                self_occlusion: SelfOcclusion::SameMeshName,
+                ..base.maps.ao.parameters
+            };
+            base.maps.curvature.parameters = CurvatureSettings { method: CurvatureMethod::Mesh, ..base.maps.curvature.parameters };
+            base
         };
-        assert_agree(&run(&low, Some(&high), &s, None), &run(&low, Some(&high), &s, Some(&g)));
+
+        assert_agree(&run(&low, Some(&high), &settings, None), &run(&low, Some(&high), &settings, Some(&gpu)));
     }
 
     /// `cargo test -p texturecraft-render --release -- --ignored --nocapture gpu_bake_speed`
@@ -439,8 +522,24 @@ mod tests {
         let Some(g) = gpu() else { return };
         let ball = primitives::material_ball();
         let rays = RaySettings { rays: 64, ..RaySettings::default() };
-        let s = BakeSettings { resolution: 2048, ao: rays, thickness: rays, bent_normal: rays, ..BakeSettings::default() };
-        run(&ball, None, &BakeSettings { resolution: 64, ..s.clone() }, Some(&g));
+        let s = {
+            let mut base = BakeSettings::default();
+            base.common = CommonBakeSettings { resolution: BakeResolution::R2048, ..base.common };
+            base.maps.ao.parameters = AmbientOcclusionSettings { rays, ..base.maps.ao.parameters };
+            base.maps.thickness.parameters = ThicknessSettings { rays, ..base.maps.thickness.parameters };
+            base.maps.bent_normal.parameters = BentNormalSettings { rays, ..base.maps.bent_normal.parameters };
+            base
+        };
+        run(
+            &ball,
+            None,
+            &{
+                let mut base = s.clone();
+                base.common = CommonBakeSettings { resolution: BakeResolution::R64, ..base.common };
+                base
+            },
+            Some(&g),
+        );
         let time = |t: Option<&GpuBaker>| {
             let start = Instant::now();
             let out = run(&ball, None, &s, t);
@@ -452,16 +551,20 @@ mod tests {
         println!("GPU again (warm clocks): {gpu_t2:.2?}");
         println!(
             "material ball 2048², {} maps, 64 rays: CPU {cpu_t:.2?}, {} {gpu_t:.2?}, {:.1}x",
-            s.maps.len(),
+            s.maps.enabled().count(),
             gpu.tracer,
             cpu_t.as_secs_f64() / gpu_t.as_secs_f64()
         );
         assert_agree(&cpu, &gpu);
         for maps in [vec![BakedMap::Position], vec![BakedMap::AmbientOcclusion], vec![BakedMap::Thickness]] {
-            let s = BakeSettings { maps: maps.into_iter().collect(), ..s.clone() };
+            let s = {
+                let mut base = s.clone();
+                base.maps.select(maps);
+                base
+            };
             let start = Instant::now();
             run(&ball, None, &s, Some(&g));
-            println!("{:?}: {:.2?}", s.maps, start.elapsed());
+            println!("{:?}: {:.2?}", s.maps.enabled().collect::<Vec<_>>(), start.elapsed());
         }
     }
 }

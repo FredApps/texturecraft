@@ -1,14 +1,14 @@
-//! The project: texture sets, their layer stacks, and project-wide settings.
+//! The project: texture sets, their layer stacks, and project-wide settings
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Channel, ChannelFormat, CoreError, Effect, Layer, LayerId, LayerKind, Result};
+use crate::{BakeSettings, BakedMap, Channel, ChannelFormat, CoreError, Effect, Layer, LayerId, LayerKind, Result};
 
 pub const FORMAT_VERSION: u32 = 1;
 
-/// Maximum group nesting (also bounds recursion over hostile project files).
+/// Maximum group nesting (also bounds recursion over hostile project files)
 pub const MAX_DEPTH: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -16,273 +16,6 @@ pub enum NormalFormat {
     #[default]
     OpenGl,
     DirectX,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-pub enum BakedMap {
-    Normal,
-    WorldNormal,
-    Id,
-    AmbientOcclusion,
-    Curvature,
-    Position,
-    Thickness,
-    Height,
-    /// World-space direction of least occlusion (packed like the world-space normal).
-    BentNormal,
-    /// 1 where the high poly covers the low poly (times the high poly's vertex alpha).
-    Opacity,
-    /// The high poly's vertex colors.
-    ColorMap,
-    /// Facing ratio towards [`BakeSettings::direction`] (0.5 = perpendicular).
-    WorldDirection,
-}
-
-impl BakedMap {
-    pub const ALL: [BakedMap; 12] = [
-        BakedMap::Normal,
-        BakedMap::WorldNormal,
-        BakedMap::Id,
-        BakedMap::AmbientOcclusion,
-        BakedMap::Curvature,
-        BakedMap::Position,
-        BakedMap::Thickness,
-        BakedMap::Height,
-        BakedMap::BentNormal,
-        BakedMap::Opacity,
-        BakedMap::ColorMap,
-        BakedMap::WorldDirection,
-    ];
-    pub fn label(self) -> &'static str {
-        match self {
-            BakedMap::Normal => "Normal",
-            BakedMap::WorldNormal => "World space normal",
-            BakedMap::Id => "ID",
-            BakedMap::AmbientOcclusion => "Ambient occlusion",
-            BakedMap::Curvature => "Curvature",
-            BakedMap::Position => "Position",
-            BakedMap::Thickness => "Thickness",
-            BakedMap::Height => "Height",
-            BakedMap::BentNormal => "Bent normals",
-            BakedMap::Opacity => "Opacity",
-            BakedMap::ColorMap => "Color map",
-            BakedMap::WorldDirection => "World space direction",
-        }
-    }
-    pub fn id(self) -> &'static str {
-        match self {
-            BakedMap::Normal => "normal_base",
-            BakedMap::WorldNormal => "world_space_normals",
-            BakedMap::Id => "id",
-            BakedMap::AmbientOcclusion => "ambient_occlusion",
-            BakedMap::Curvature => "curvature",
-            BakedMap::Position => "position",
-            BakedMap::Thickness => "thickness",
-            BakedMap::Height => "height",
-            BakedMap::BentNormal => "bent_normals",
-            BakedMap::Opacity => "opacity",
-            BakedMap::ColorMap => "color_map",
-            BakedMap::WorldDirection => "world_space_direction",
-        }
-    }
-    /// The identifier shared with MaterialCraft (graph inputs fed from this map).
-    pub fn interop_id(self) -> &'static str {
-        match self {
-            BakedMap::Normal => "normal",
-            BakedMap::WorldNormal => "worldNormal",
-            BakedMap::Id => "id",
-            BakedMap::AmbientOcclusion => "ambientOcclusion",
-            BakedMap::Curvature => "curvature",
-            BakedMap::Position => "position",
-            BakedMap::Thickness => "thickness",
-            BakedMap::Height => "height",
-            BakedMap::BentNormal => "bentNormal",
-            BakedMap::Opacity => "opacity",
-            BakedMap::ColorMap => "colorMap",
-            BakedMap::WorldDirection => "worldDirection",
-        }
-    }
-    /// The map a MaterialCraft graph input `identifier` reads: its shared or own id, ignoring
-    /// case and underscores (`ambient_occlusion` = `ambientOcclusion`).
-    pub fn for_input(identifier: &str) -> Option<BakedMap> {
-        let norm = |x: &str| x.to_ascii_lowercase().replace(['_', '-', ' '], "");
-        let want = norm(identifier);
-        BakedMap::ALL.into_iter().find(|m| norm(m.interop_id()) == want || norm(m.id()) == want)
-    }
-    /// Components stored (3 for vector maps, 1 for scalar maps).
-    pub fn components(self) -> usize {
-        match self {
-            BakedMap::Normal | BakedMap::WorldNormal | BakedMap::Id | BakedMap::Position | BakedMap::BentNormal | BakedMap::ColorMap => 3,
-            _ => 1,
-        }
-    }
-    /// Value where nothing was baked (uncovered texels, missing maps).
-    pub fn neutral(self) -> [f32; 3] {
-        match self {
-            BakedMap::Normal | BakedMap::WorldNormal | BakedMap::BentNormal => [0.5, 0.5, 1.0],
-            BakedMap::AmbientOcclusion | BakedMap::Thickness => [1.0; 3],
-            BakedMap::Curvature | BakedMap::Height | BakedMap::WorldDirection => [0.5; 3],
-            BakedMap::Id | BakedMap::Position | BakedMap::Opacity | BakedMap::ColorMap => [0.0; 3],
-        }
-    }
-    pub fn parse(s: &str) -> Option<BakedMap> {
-        let norm = |x: &str| x.to_ascii_lowercase().replace([' ', '_', '-'], "");
-        BakedMap::ALL.into_iter().find(|m| norm(m.label()) == norm(s) || norm(m.id()) == norm(s) || norm(&format!("{m:?}")) == norm(s))
-    }
-}
-
-/// How low-poly parts find their high-poly counterparts (the bake "Match" option).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum BakeMatch {
-    /// Every low-poly part sees every high-poly part.
-    #[default]
-    Always,
-    /// A low-poly part sees only high-poly parts of the same name once the suffixes are removed
-    /// (`wheel_low` ↔ `wheel_high`).
-    ByMeshName,
-}
-
-/// How secondary rays spread over their cone.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum RayDistribution {
-    /// Cosine-weighted: more rays near the normal.
-    #[default]
-    Cosine,
-    /// Uniform over the cone's solid angle.
-    Uniform,
-}
-
-/// Which geometry occludes ambient occlusion and bent-normal rays.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum SelfOcclusion {
-    /// Every part occludes every other.
-    #[default]
-    Always,
-    /// Only parts with the same mesh name (suffixes removed) occlude each other.
-    SameMeshName,
-}
-
-/// Position map normalization.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum PositionMode {
-    /// Each axis spans the bounding box (0..1 per axis).
-    #[default]
-    BoundingBox,
-    /// One scale for every axis: the bounding sphere around the box centre (keeps proportions).
-    BoundingSphere,
-}
-
-/// World space direction map encoding.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum DirectionMode {
-    /// −1..1 to 0..1: mid grey where the surface is perpendicular to the direction.
-    #[default]
-    Signed,
-    /// 0..1: black where the surface is perpendicular or faces away.
-    Positive,
-}
-
-/// Secondary-ray parameters of one map (ambient occlusion, thickness, bent normals).
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RaySettings {
-    /// Rays per sample.
-    pub rays: u32,
-    /// Max ray length relative to the bounding-box diagonal.
-    pub max_distance: f32,
-    /// Full cone angle around the normal in degrees (180 = the whole hemisphere).
-    pub spread: f32,
-    pub distribution: RayDistribution,
-}
-
-impl Default for RaySettings {
-    fn default() -> Self {
-        RaySettings { rays: 32, max_distance: 0.25, spread: 180.0, distribution: RayDistribution::Cosine }
-    }
-}
-
-/// Bake parameters (the common parameters plus the per-map parameters). Fields missing
-/// from older projects take their defaults.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct BakeSettings {
-    /// Included by "Bake selected textures".
-    pub enabled: bool,
-    pub resolution: u32,
-    /// Supersampling per axis: 1 (none), 2, 4 or 8.
-    pub antialiasing: u32,
-    pub dilation: u32,
-    /// Ambient occlusion rays.
-    pub ao: RaySettings,
-    /// Ambient occlusion and bent-normal rays ignore surfaces they hit from behind.
-    pub ao_ignore_backface: bool,
-    pub ao_self_occlusion: SelfOcclusion,
-    /// Thickness rays (into the surface).
-    pub thickness: RaySettings,
-    /// Bent-normal rays (they follow the ambient occlusion's occluder rules).
-    pub bent_normal: RaySettings,
-    /// Curvature strength.
-    pub curvature_strength: f32,
-    /// Curvature from the baked normal map instead of the mesh.
-    pub curvature_from_normal: bool,
-    /// Sampling radius of curvature from the normal map, in texels (0: by resolution).
-    pub curvature_radius: u32,
-    pub position_mode: PositionMode,
-    /// World-space direction of the "World space direction" map.
-    pub direction: [f32; 3],
-    pub direction_mode: DirectionMode,
-    pub maps: BTreeSet<BakedMap>,
-    /// Bake from the low poly itself ("Use low poly mesh as high poly").
-    pub use_low_as_high: bool,
-    /// Ray start distance in front of the low poly, relative to the bbox diagonal.
-    pub max_frontal: f32,
-    pub max_rear: f32,
-    /// Cast rays along normals averaged over hard edges (no gaps at split normals).
-    pub average_normals: bool,
-    pub matching: BakeMatch,
-    pub low_suffix: String,
-    pub high_suffix: String,
-}
-
-impl Default for BakeSettings {
-    fn default() -> Self {
-        BakeSettings {
-            enabled: true,
-            resolution: 1024,
-            antialiasing: 1,
-            dilation: 16,
-            ao: RaySettings::default(),
-            ao_ignore_backface: false,
-            ao_self_occlusion: SelfOcclusion::Always,
-            // Thickness is hit distance / max distance: long rays turn thin parts almost black.
-            thickness: RaySettings { max_distance: 0.1, ..RaySettings::default() },
-            bent_normal: RaySettings::default(),
-            curvature_strength: 1.0,
-            curvature_from_normal: false,
-            curvature_radius: 0,
-            position_mode: PositionMode::BoundingBox,
-            direction: [0.0, 1.0, 0.0],
-            direction_mode: DirectionMode::Signed,
-            maps: [
-                BakedMap::Normal,
-                BakedMap::WorldNormal,
-                BakedMap::Id,
-                BakedMap::AmbientOcclusion,
-                BakedMap::Curvature,
-                BakedMap::Position,
-                BakedMap::Thickness,
-            ]
-            .into_iter()
-            .collect(),
-            use_low_as_high: true,
-            max_frontal: 0.01,
-            max_rear: 0.01,
-            average_normals: true,
-            matching: BakeMatch::Always,
-            low_suffix: "_low".into(),
-            high_suffix: "_high".into(),
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1027,34 +760,21 @@ mod tests {
     }
 
     #[test]
-    fn per_map_bake_settings_round_trip_and_old_projects_load() {
-        let mut p = project();
-        let b = &mut p.texture_sets[0].bake;
-        b.ao = RaySettings { rays: 96, max_distance: 0.4, spread: 120.0, distribution: RayDistribution::Uniform };
-        b.ao_ignore_backface = true;
-        b.ao_self_occlusion = SelfOcclusion::SameMeshName;
-        b.thickness.spread = 60.0;
-        b.bent_normal.rays = 8;
-        b.curvature_radius = 3;
-        b.position_mode = PositionMode::BoundingSphere;
-        b.direction_mode = DirectionMode::Positive;
-        let json = serde_json::to_string(&p).unwrap();
-        assert_eq!(serde_json::from_str::<Project>(&json).unwrap(), p);
-        // Settings saved before per-map rays (one shared ray count) load with the defaults.
-        let mut v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let old = v["texture_sets"][0]["bake"].as_object_mut().unwrap();
-        for k in ["ao", "ao_ignore_backface", "ao_self_occlusion", "thickness", "bent_normal", "curvature_radius", "position_mode", "direction_mode"] {
-            old.remove(k);
-        }
-        old.insert("rays".into(), 64.into());
-        old.insert("max_distance".into(), 0.3.into());
-        let back: Project = serde_json::from_value(v).unwrap();
-        let d = BakeSettings::default();
-        let b = &back.texture_sets[0].bake;
-        assert_eq!(
-            (b.ao, b.thickness, b.bent_normal, b.ao_self_occlusion, b.position_mode),
-            (d.ao, d.thickness, d.bent_normal, d.ao_self_occlusion, d.position_mode)
-        );
+    fn per_map_bake_settings_round_trip() {
+        use crate::{BackfaceMode, PositionMode, RayDistribution, RaySettings, SelfOcclusion};
+
+        let mut project = project();
+        let settings = &mut project.texture_sets[0].bake;
+        settings.maps.ao.parameters.rays =
+            RaySettings { rays: 96, max_distance: 0.4, spread: 120.0, distribution: RayDistribution::Uniform, ..RaySettings::default() };
+        settings.maps.ao.parameters.ignore_backface = BackfaceMode::Always;
+        settings.maps.ao.parameters.self_occlusion = SelfOcclusion::SameMeshName;
+        settings.maps.thickness.parameters.rays.spread = 60.0;
+        settings.maps.bent_normal.parameters.rays.rays = 8;
+        settings.maps.position.parameters.normalization = PositionMode::BoundingSphere;
+
+        let json = serde_json::to_string(&project).unwrap();
+        assert_eq!(serde_json::from_str::<Project>(&json).unwrap(), project);
     }
 
     #[test]

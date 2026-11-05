@@ -122,6 +122,7 @@ Built-in presets:
 pub struct ProjectFile {
     pub project: Project, pub pixels: PixelStore, pub baked: BTreeMap<usize, BakedMaps>,
     pub mesh: Option<(String /* ext */, Vec<u8>)>, pub thumbnail: Option<Vec<u8>>,
+    pub warnings: Vec<String>, // Import warnings, never saved
 }
 pub fn save_project_bytes(pf: &ProjectFile) -> Result<Vec<u8>>;
 pub fn load_project_bytes(bytes: &[u8]) -> Result<ProjectFile>;
@@ -148,3 +149,8 @@ Loading runs `Project::validate`, refuses a newer `format_version` (`FormatError
 checks every tile against its texture set's resolution and component count, rejects repeated or
 out-of-range tiles and trailing data, drops pixels of layers that are in no stack, and caps the
 total decompressed size at 8 GiB.
+
+Unreadable bake settings fall back to defaults field by field while readable settings and project
+content are retained. Legacy baked-map filenames remain readable; unsupported baked-map types are
+skipped. Recovery adds a warning to `ProjectFile::warnings`, displayed in the session log when the
+project opens. Structural errors and corrupt pixel data still fail validation.

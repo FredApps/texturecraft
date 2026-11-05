@@ -1,7 +1,7 @@
 //! UI state (serde, so the control channel can read and drive it).
 
 use serde::{Deserialize, Serialize};
-use texturecraft_engine::core::{BakedMap, Channel};
+use texturecraft_engine::core::Channel;
 
 use crate::docking::Dock;
 use crate::keymap::Keymap;
@@ -239,6 +239,10 @@ pub struct UiState {
     /// The docked, tabbed and floating panels around the viewport.
     #[serde(default)]
     pub dock: Dock,
+    #[serde(default = "Dock::for_baking")]
+    pub(crate) inactive_mode_dock: Dock,
+    #[serde(default)]
+    pub(crate) dock_is_baking: bool,
     /// Window ▸ Hide UI (Tab): only the viewport.
     pub hide_ui: bool,
     pub windows: Windows,
@@ -273,31 +277,20 @@ pub struct UiState {
     /// Custom keyboard shortcuts (item id → "Ctrl+Shift+E", "" = none) over the defaults.
     #[serde(default)]
     pub keymap: Keymap,
-    /// The baker whose parameters bake mode shows (None: the common parameters).
-    #[serde(default)]
-    pub bake_baker: Option<BakedMap>,
     /// The brush that paints the skew correction map in the 2D view of bake mode.
     #[serde(default)]
-    pub skew_brush: SkewBrush,
-}
-
-/// Settings of the skew correction brush (radius in UV units).
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct SkewBrush {
-    pub on: bool,
-    pub radius: f32,
-    /// 1 turns the rays onto the base normal, 0 erases.
-    pub value: f32,
-    pub hardness: f32,
-}
-
-impl Default for SkewBrush {
-    fn default() -> Self {
-        SkewBrush { on: false, radius: 0.03, value: 1.0, hardness: 0.5 }
-    }
+    pub bake_paint_brush: crate::bake_mode::BakePaintBrush,
 }
 
 impl UiState {
+    pub(crate) fn sync_mode_dock(&mut self) {
+        let baking = self.mode == Mode::Baking;
+        if baking != self.dock_is_baking {
+            std::mem::swap(&mut self.dock, &mut self.inactive_mode_dock);
+            self.dock_is_baking = baking;
+        }
+    }
+
     /// Take `layout`'s panels, windows and view settings, keeping this state's dialogs, export
     /// settings and recent files.
     pub fn adopt_layout(&mut self, layout: UiState) {
@@ -318,6 +311,8 @@ impl Default for UiState {
             mode: Mode::Painting,
             layout: ViewLayout::Split,
             dock: Dock::default(),
+            inactive_mode_dock: Dock::for_baking(),
+            dock_is_baking: false,
             hide_ui: false,
             windows: Windows::default(),
             uv_zoom: 1.0,
@@ -336,8 +331,7 @@ impl Default for UiState {
             export: ExportUi::default(),
             recent: Vec::new(),
             keymap: Keymap::new(),
-            bake_baker: None,
-            skew_brush: SkewBrush::default(),
+            bake_paint_brush: crate::bake_mode::BakePaintBrush::default(),
         }
     }
 }
