@@ -89,6 +89,7 @@ impl Session {
             bake_paint: BTreeMap::new(),
             thumbnail: None,
             resources,
+            warnings: Vec::new(),
         };
         texturecraft_formats::save_project_bytes(&pf).map_err(fe)
     }

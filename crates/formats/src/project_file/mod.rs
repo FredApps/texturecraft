@@ -23,7 +23,7 @@ use std::io::{Cursor, Read, Seek, Write};
 use std::sync::Arc;
 
 use texturecraft_compose::{BakedMaps, PixelStore};
-use texturecraft_core::{BakePaintTarget, BakedMap, Channel, FORMAT_VERSION, LayerId, Project};
+use texturecraft_core::{BakePaintTarget, Channel, FORMAT_VERSION, LayerId, Project};
 use texturecraft_texel::{TILE_AREA, TileImage};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
@@ -44,6 +44,7 @@ const MAX_TOTAL: u64 = 8 << 30;
 const MAX_TEXELS: u64 = 1 << 28;
 
 mod bake_paint_data;
+mod recovery;
 pub use bake_paint_data::BakePaintData;
 
 /// Everything a project file holds.
@@ -64,6 +65,8 @@ pub struct ProjectFile {
     pub thumbnail: Option<Vec<u8>>,
     /// Imported resources (images used by fills, alphas, stencils), by name: original bytes.
     pub resources: BTreeMap<String, Vec<u8>>,
+    /// Import warnings for the caller's log; never saved in the archive
+    pub warnings: Vec<String>,
 }
 
 /// A resource name safe as a zip entry and a file name: `[A-Za-z0-9_.-]`, at most 120 chars.
@@ -341,6 +344,7 @@ fn load<R: Read + Seek>(reader: R) -> Result<ProjectFile> {
     if zip.len() > MAX_ENTRIES {
         return Err(FormatError::TooLarge(format!("project file has more than {MAX_ENTRIES} entries")));
     }
+
     let mut budget = Budget(0);
     let json = read_all(&mut zip.by_name("project.json").map_err(zip_err)?, MAX_JSON, &mut budget, "project.json")?;
     #[derive(serde::Deserialize)]
@@ -351,7 +355,8 @@ fn load<R: Read + Seek>(reader: R) -> Result<ProjectFile> {
     if v.format_version > FORMAT_VERSION {
         return Err(FormatError::NewerVersion { found: v.format_version, supported: FORMAT_VERSION });
     }
-    let project: Project = serde_json::from_slice(&json).map_err(|e| malformed(KIND, format!("project.json: {e}")))?;
+
+    let (project, mut recovered) = recovery::read_project(&json).map_err(|e| malformed(KIND, format!("project.json: {e}")))?;
     project.validate()?;
     let too_large = |t: &texturecraft_core::TextureSet| u64::from(t.size().0) * u64::from(t.size().1) > MAX_TEXELS;
     if let Some(ts) = project.texture_sets.iter().find(|t| t.resolution == 0 || t.resolution > MAX_IMAGE_SIZE || too_large(t)) {
@@ -367,8 +372,10 @@ fn load<R: Read + Seek>(reader: R) -> Result<ProjectFile> {
         bake_paint: BTreeMap::new(),
         thumbnail: None,
         resources: BTreeMap::new(),
+        warnings: Vec::new(),
         project,
     };
+
     for i in 0..zip.len() {
         let mut f = zip.by_index(i).map_err(zip_err)?;
         let name = f.name().map_err(zip_err)?.into_owned();
@@ -379,12 +386,14 @@ fn load<R: Read + Seek>(reader: R) -> Result<ProjectFile> {
             if res_name.is_empty() || sanitize_resource_name(res_name) != res_name {
                 return Err(malformed(KIND, format!("bad resource name {name}")));
             }
+
             let bytes = read_all(&mut f, MAX_RESOURCE, &mut budget, &name)?;
             pf.resources.insert(res_name.to_string(), bytes);
         } else if let Some((dir, file)) = name.split_once('/').filter(|(d, _)| *d == "highpoly" || *d == "cage") {
             if file.is_empty() || sanitize_resource_name(file) != file {
                 return Err(malformed(KIND, format!("bad mesh name {name}")));
             }
+
             let entry = (file.to_string(), read_all(&mut f, crate::mesh_import::MAX_MESH_FILE_BYTES, &mut budget, &name)?);
             match dir {
                 "cage" => pf.cage = Some(entry),
@@ -396,6 +405,7 @@ fn load<R: Read + Seek>(reader: R) -> Result<ProjectFile> {
             if texture_set >= pf.project.texture_sets.len() {
                 return Err(malformed(KIND, format!("unknown texture set in {name}")));
             }
+
             let target = match target {
                 "cage" => BakePaintTarget::Cage,
                 "skew" => BakePaintTarget::Skew,
@@ -410,22 +420,29 @@ fn load<R: Read + Seek>(reader: R) -> Result<ProjectFile> {
             let (id, chan) = rest.split_once('_').ok_or_else(|| malformed(KIND, format!("bad entry name {name}")))?;
             let id = LayerId(id.parse().map_err(|_| malformed(KIND, format!("bad entry name {name}")))?);
             let c = Channel::ALL.into_iter().find(|c| c.id() == chan).ok_or_else(|| malformed(KIND, format!("unknown channel in {name}")))?;
-            // Pixels of layers that are no longer in any stack are dropped.
+            // Drop pixels of layers that are no longer in any stack
             let Some(size) = size_of(id) else { continue };
+
             let img = read_tiles(&mut f, size, c.components() + 1, &mut budget, &name)?;
             pf.pixels.layers.insert((id, c), img);
         } else if let Some(rest) = name.strip_prefix("pixels/mask_").and_then(|r| r.strip_suffix(".bin")) {
             let id = LayerId(rest.parse().map_err(|_| malformed(KIND, format!("bad entry name {name}")))?);
             let Some(size) = size_of(id) else { continue };
+
             let img = read_tiles(&mut f, size, 2, &mut budget, &name)?;
             pf.pixels.masks.insert(id, img);
         } else if let Some(rest) = name.strip_prefix("baked/").and_then(|r| r.strip_suffix(".bin")) {
             let (ts, map) = rest.split_once('_').ok_or_else(|| malformed(KIND, format!("bad entry name {name}")))?;
             let ts: usize = ts.parse().map_err(|_| malformed(KIND, format!("bad entry name {name}")))?;
-            let m = BakedMap::parse(map).ok_or_else(|| malformed(KIND, format!("unknown baked map in {name}")))?;
+            let Some(m) = recovery::baked_map(map) else {
+                recovered = true;
+                continue;
+            };
+
             if ts >= pf.project.texture_sets.len() {
                 continue;
             }
+
             let (res, height, data) = read_baked(&mut f, m.components(), &mut budget, &name)?;
             let maps = pf.baked.entry(ts).or_default();
             if maps.maps.is_empty() {
@@ -435,8 +452,15 @@ fn load<R: Read + Seek>(reader: R) -> Result<ProjectFile> {
             }
             maps.maps.insert(m, Arc::new(data));
         }
-        // Other entries (from newer minor revisions) are ignored.
+        // Ignore other entries from newer minor revisions
     }
+
+    if recovered {
+        pf.warnings.push(
+            "Warning: Some project settings or mesh maps could not be imported. TextureCraft recovered what it could, using defaults where needed.".into(),
+        );
+    }
+
     Ok(pf)
 }
 
