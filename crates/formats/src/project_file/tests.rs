@@ -232,6 +232,7 @@ fn load_size_matches_what_load_counts() {
     }
 }
 
+#[test]
 fn bake_model_options_survive_the_project_archive() {
     use texturecraft_core::{BackfaceMode, CageType, HeightNormalization};
 
