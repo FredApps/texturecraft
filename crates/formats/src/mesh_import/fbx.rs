@@ -598,8 +598,7 @@ fn material_name(id: &str, m: &Node) -> String {
     if name.is_empty() { format!("Material_{id}") } else { name.to_string() }
 }
 
-/// Each material's diffuse color (× diffuse factor) or, when one is connected and embedded,
-/// its diffuse texture (the texture replaces the color, as in most FBX viewers).
+/// Preserve material colors independently of textures for ID baking
 fn base_colors(
     materials: &HashMap<String, &Node>,
     textures: &HashMap<String, &Node>,
@@ -632,14 +631,15 @@ fn base_colors(
             let (video, tex) = (texture.and_then(|t| video_of.get(t)).and_then(|v| videos.get(v)), texture.and_then(|t| textures.get(t)));
             // Embedded content first, then the file the texture (or its video) names.
             let image = video.or(tex).and_then(|n| n.content()).or_else(|| [tex, video].into_iter().flatten().find_map(|n| texture_file(n, files)));
-            let factor = match (&image, m.property("DiffuseColor").as_deref()) {
-                (None, Some([r, g, b, ..])) => {
+            let diffuse_color = m.property("DiffuseColor");
+            let factor = match diffuse_color.as_deref() {
+                Some([r, g, b, ..]) => {
                     let f = m.number("DiffuseFactor").unwrap_or(1.0);
                     Vec4::new((r * f) as f32, (g * f) as f32, (b * f) as f32, 1.0)
                 }
                 _ => Vec4::ONE,
             };
-            (image.is_some() || (factor != Vec4::ONE && factor.is_finite())).then(|| RawBaseColor { material: material_name(id, m), factor, image })
+            (factor.is_finite() && (image.is_some() || diffuse_color.is_some())).then(|| RawBaseColor { material: material_name(id, m), factor, image })
         })
         .collect();
     out.sort_by(|a, b| a.material.cmp(&b.material));

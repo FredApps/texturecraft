@@ -2,6 +2,7 @@
 
 use serde_json::{Value, json};
 use texturecraft_compose::BakedMaps;
+use texturecraft_core::{BakeResolution, CurvatureMethod};
 use texturecraft_geom::primitives;
 
 use crate::commands::{CommandSpec, always, bad, boolp, strp, u64p};
@@ -56,31 +57,37 @@ fn material(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "layer": l.0 }))
 }
 
-/// The sample project: the material ball, baked, with smart materials on both texture sets.
+/// A baked material ball with smart materials on both texture sets
 pub fn sample_session(resolution: u32, bake_resolution: u32) -> Result<Session> {
-    let mut s = Session::new_project("Material Ball", primitives::material_ball(), "builtin:material_ball", None, resolution)?;
-    for ts in 0..s.set_count() {
-        let set = s.doc.project.texture_set_mut(ts)?;
-        set.bake.resolution = bake_resolution;
-        for r in [&mut set.bake.ao, &mut set.bake.thickness, &mut set.bake.bent_normal] {
-            r.rays = 24;
+    let mut session = Session::new_project("Material Ball", primitives::material_ball(), "builtin:material_ball", None, resolution)?;
+    for set_index in 0..session.set_count() {
+        let set = session.doc.project.texture_set_mut(set_index)?;
+        set.bake.common.resolution = BakeResolution::from_pixels(bake_resolution).ok_or_else(|| bad("project.sample", "invalid bake resolution"))?;
+
+        // Mesh curvature gives the procedural sample visible edge wear
+        set.bake.high_poly.use_low_as_high = true;
+        set.bake.maps.curvature.parameters.method = CurvatureMethod::Mesh;
+        for ray_settings in
+            [&mut set.bake.maps.ao.parameters.rays, &mut set.bake.maps.thickness.parameters.rays, &mut set.bake.maps.bent_normal.parameters.rays]
+        {
+            ray_settings.rays = 24;
         }
-        s.bake_now(ts, false)?;
+        session.bake_now(set_index, false)?;
     }
-    s.active_set = 1;
-    crate::materials::apply(&mut s, "iron_rusted")?;
-    s.active_set = 0;
-    crate::materials::apply(&mut s, "steel_painted_worn")?;
-    // Ready to paint: an empty paint layer on top of each stack, selected (the smart material
-    // fully covers the bottom layer, so strokes there would stay hidden).
-    for ts in (0..s.set_count()).rev() {
-        s.active_set = ts;
-        s.selected.remove(&ts);
-        crate::execute(&mut s, "layer.add.paint", &Value::Null)?;
+    session.active_set = 1;
+    crate::materials::apply(&mut session, "iron_rusted")?;
+    session.active_set = 0;
+    crate::materials::apply(&mut session, "steel_painted_worn")?;
+
+    // Paint above the smart material so new strokes remain visible
+    for set_index in (0..session.set_count()).rev() {
+        session.active_set = set_index;
+        session.selected.remove(&set_index);
+        crate::execute(&mut session, "layer.add.paint", &Value::Null)?;
     }
-    s.undo.clear();
-    s.modified = false;
-    Ok(s)
+    session.undo.clear();
+    session.modified = false;
+    Ok(session)
 }
 
 fn sample(s: &mut Session, _: &Value) -> Result<Value> {

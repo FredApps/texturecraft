@@ -123,27 +123,33 @@ pub enum DropZone {
     View3d,
 }
 
-/// Make `resp` a drop target for shelf assets `zone` accepts: outline it while one hovers,
-/// apply it on release.
-pub fn drop_target(app: &mut TextureCraftApp, ui: &Ui, resp: &egui::Response, zone: DropZone) {
-    let tk = Tokens::get(ui.ctx());
-    let accepts = |d: &ShelfDrag| match d.asset {
+/// Highlight accepted shelf assets on hover and apply them on drop
+pub fn drop_target(app: &mut TextureCraftApp, ui: &Ui, response: &egui::Response, zone: DropZone) {
+    if app.ui.mode != crate::state::Mode::Painting {
+        return;
+    }
+
+    let tokens = Tokens::get(ui.ctx());
+    let accepts = |drag: &ShelfDrag| match drag.asset {
         Asset::Alpha(_) => true,
         Asset::Material(_) | Asset::Library(_) => zone != DropZone::Brush,
         Asset::Texture(_) => zone == DropZone::View3d,
         Asset::SmartMask(_) | Asset::Filter(_) => false,
     };
-    if resp.dnd_hover_payload::<ShelfDrag>().is_some_and(|d| accepts(&d)) {
-        ui.painter().rect_stroke(resp.rect.shrink(1.0), 3.0, Stroke::new(2.0, tk.accent), egui::StrokeKind::Inside);
+    if response.dnd_hover_payload::<ShelfDrag>().is_some_and(|drag| accepts(&drag)) {
+        ui.painter().rect_stroke(response.rect.shrink(1.0), 3.0, Stroke::new(2.0, tokens.accent), egui::StrokeKind::Inside);
     }
-    let pointer = ui.input(|i| i.pointer.interact_pos());
-    if let Some(d) = dnd_release::<ShelfDrag>(resp)
-        && accepts(&d)
+    let pointer = ui.input(|input| input.pointer.interact_pos());
+    if let Some(drag) = dnd_release::<ShelfDrag>(response)
+        && accepts(&drag)
     {
-        match (&d.asset, pointer) {
-            (Asset::Texture(name), Some(p)) => {
-                let (q, vp) = (p - resp.rect.min, resp.rect.size());
-                app.run("layer.add.decal", json!({"image": name, "x": q.x, "y": q.y, "viewport": [vp.x, vp.y]}));
+        match (&drag.asset, pointer) {
+            (Asset::Texture(name), Some(position)) => {
+                let (local_position, viewport_size) = (position - response.rect.min, response.rect.size());
+                app.run(
+                    "layer.add.decal",
+                    json!({"image": name, "x": local_position.x, "y": local_position.y, "viewport": [viewport_size.x, viewport_size.y]}),
+                );
             }
             (asset, _) => apply(app, asset),
         }

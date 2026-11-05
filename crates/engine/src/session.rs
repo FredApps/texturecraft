@@ -24,6 +24,7 @@ pub struct Document {
     pub project: Project,
     pub pixels: PixelStore,
     pub baked: BTreeMap<usize, BakedMaps>,
+    pub bake_paint: BTreeMap<(usize, texturecraft_core::BakePaintTarget), Arc<texturecraft_bake::BakePaintMap>>,
     /// Imported image resources by name: original file bytes.
     pub resources: BTreeMap<String, Arc<Vec<u8>>>,
 }
@@ -152,7 +153,7 @@ impl ViewMode {
         match self {
             ViewMode::Material => "Material".into(),
             ViewMode::Channel(c) => c.label().into(),
-            ViewMode::MeshMap(m) => m.label().into(),
+            ViewMode::MeshMap(m) => m.id().into(),
             ViewMode::UvChecker => "UV checker".into(),
             ViewMode::Mask(_) => "Layer mask".into(),
         }
@@ -320,8 +321,6 @@ pub struct Session {
     pub mesh_source: Option<(String, Vec<u8>)>,
     /// High-definition meshes and cage for baking (saved inside the project).
     pub bake_meshes: crate::BakeMeshes,
-    /// The map that bakes itself again when its inputs change (not saved).
-    pub auto_rebake: crate::auto_rebake::AutoRebake,
     pub caches: Vec<SetCache>,
     pub(crate) undo: Vec<(String, Document)>,
     pub(crate) redo: Vec<(String, Document)>,
@@ -384,7 +383,6 @@ impl Session {
             bvh: Arc::new(bvh),
             mesh_source,
             bake_meshes: Default::default(),
-            auto_rebake: Default::default(),
             caches,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -451,7 +449,11 @@ impl Session {
             ts.stack.push(id);
             project.texture_sets.push(ts);
         }
-        let mut s = Session::new(Document { project, pixels: PixelStore::default(), baked: BTreeMap::new(), resources: BTreeMap::new() }, mesh, mesh_source)?;
+        let mut s = Session::new(
+            Document { bake_paint: BTreeMap::new(), project, pixels: PixelStore::default(), baked: BTreeMap::new(), resources: BTreeMap::new() },
+            mesh,
+            mesh_source,
+        )?;
         s.log.extend(log);
         Ok(s)
     }

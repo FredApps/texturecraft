@@ -24,6 +24,8 @@ use crate::theme::Tokens;
 pub enum Panel {
     Viewport,
     Assets,
+    BakeMaps,
+    BakeSettings,
     TextureSetList,
     Layers,
     TextureSetSettings,
@@ -35,8 +37,10 @@ pub enum Panel {
 }
 
 /// Window ▸ Views items and the panels they show or hide.
-pub const VIEWS: [(&str, Panel); 9] = [
+pub const VIEWS: [(&str, Panel); 11] = [
     ("ui.view.assets", Panel::Assets),
+    ("ui.view.bakeMaps", Panel::BakeMaps),
+    ("ui.view.bakeSettings", Panel::BakeSettings),
     ("ui.view.display", Panel::Display),
     ("ui.view.history", Panel::History),
     ("ui.view.layers", Panel::Layers),
@@ -53,9 +57,19 @@ pub fn view_panel(id: &str) -> Option<Panel> {
 }
 
 impl Panel {
-    pub const ALL: [Panel; 10] = [
+    pub(crate) fn available_in(self, mode: crate::state::Mode) -> bool {
+        match self {
+            Self::BakeMaps | Self::BakeSettings => mode == crate::state::Mode::Baking,
+            Self::Assets | Self::Layers | Self::Properties | Self::TextureSetSettings => mode != crate::state::Mode::Baking,
+            _ => true,
+        }
+    }
+
+    pub const ALL: [Panel; 12] = [
         Panel::Viewport,
         Panel::Assets,
+        Panel::BakeMaps,
+        Panel::BakeSettings,
         Panel::TextureSetList,
         Panel::Layers,
         Panel::TextureSetSettings,
@@ -70,7 +84,9 @@ impl Panel {
         match self {
             Panel::Viewport => "Viewport",
             Panel::Assets => "Assets",
-            Panel::TextureSetList => "Texture Set List",
+            Panel::BakeMaps => "Bake Maps",
+            Panel::BakeSettings => "Settings",
+            Panel::TextureSetList => "Texture Sets",
             Panel::Layers => "Layers",
             Panel::TextureSetSettings => "Texture Set Settings",
             Panel::Properties => "Properties",
@@ -132,6 +148,20 @@ pub fn default_workspace() -> Workspace {
             };
             workspace.hidden.push((panel, location));
         }
+    }
+    for panel in [BakeMaps, BakeSettings] {
+        workspace.hidden.push((
+            panel,
+            Location {
+                floating: None,
+                anchor: Some(TextureSetList),
+                placement: Placement::Tab { before: None },
+                size: None,
+                stack: None,
+                sibling: Vec::new(),
+                group: None,
+            },
+        ));
     }
     workspace
 }
@@ -222,6 +252,26 @@ impl Dock {
         Dock { workspace, raise: None }
     }
 
+    pub(crate) fn for_baking() -> Self {
+        let mut workspace = default_workspace();
+        for panel in [Panel::Assets, Panel::Layers, Panel::TextureSetSettings, Panel::Properties] {
+            if let Ok(location) = workspace.layout.location(&panel) {
+                workspace.hidden.push((panel, location));
+            }
+        }
+        workspace.hidden.retain(|(panel, _)| !matches!(panel, Panel::BakeMaps | Panel::BakeSettings));
+        workspace.layout = Layout {
+            root: Some(Node::Split {
+                axis: SplitAxis::Horizontal,
+                size: SplitSize::FixedFirst(320.0),
+                first: Box::new(tabs(&[Panel::TextureSetList, Panel::BakeSettings, Panel::BakeMaps])),
+                second: Box::new(tabs(&[Panel::Viewport])),
+            }),
+            floating: Vec::new(),
+        };
+        Dock { workspace, raise: None }
+    }
+
     pub fn workspace(&self) -> &Workspace {
         &self.workspace
     }
@@ -306,24 +356,29 @@ fn style(ui: &Ui, t: &Tokens) -> DockStyle {
 
 /// Draw the dock (viewport and panels) into `ui`.
 pub fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
-    let ctx = ui.ctx().clone();
-    let tk = Tokens::get(&ctx);
-    let style = style(ui, &tk);
+    for panel in Panel::ALL {
+        if !panel.available_in(app.ui.mode) && app.ui.dock.is_open(panel) {
+            app.ui.dock.close(panel);
+        }
+    }
+
+    let context = ui.ctx().clone();
+    let tokens = Tokens::get(&context);
+    let style = style(ui, &tokens);
     let layout = app.ui.dock.workspace.layout.clone();
-    let mut area = DockArea::new(area_id()).input_blocked(ctx.memory(|m| m.top_modal_layer()).is_some());
+    let mut area = DockArea::new(area_id()).input_blocked(context.memory(|memory| memory.top_modal_layer()).is_some());
     if let Some(panel) = app.ui.dock.raise.take() {
         area = area.raise_panel(panel);
     }
-    let output = area.show_content(ui, &layout, &style, &mut Panels { app, tk });
+    let output = area.show_content(ui, &layout, &style, &mut Panels { app, tk: tokens });
     #[cfg(not(target_arch = "wasm32"))]
-    crate::menus::forwarded_shortcuts(app, &ctx, output.forwarded_events, output.forwarded_modifiers.unwrap_or_default());
+    crate::menus::forwarded_shortcuts(app, &context, output.forwarded_events, output.forwarded_modifiers.unwrap_or_default());
     if let Some(error) = &output.error {
         log::warn!("docking: {error}");
     }
-    // A body that changed the layout (a panel opened from its own menu) wins over this frame's
-    // gestures, which were made against the old one.
+    // A layout changed by a panel takes priority over gestures from the old layout
     if app.ui.dock.workspace.layout != layout {
-        craft_ui::docking::cancel_drag::<Panel>(&ctx, area_id());
+        craft_ui::docking::cancel_drag::<Panel>(&context, area_id());
         return;
     }
     for action in output.actions {
@@ -346,8 +401,10 @@ impl DockContent<Panel> for Panels<'_> {
             return;
         }
         egui::Frame::new().inner_margin(Margin::symmetric(8, 4)).show(ui, |ui| match panel {
-            Panel::Assets if app.ui.mode == crate::state::Mode::Baking => crate::windows::bake_body(app, ui),
+            Panel::BakeMaps => crate::bake_mode::bake_body(app, ui),
             Panel::Assets => crate::shelf::body(app, ui),
+            Panel::BakeSettings => crate::bake_mode::settings_body(app, ui),
+            Panel::TextureSetList if app.ui.mode == crate::state::Mode::Baking => crate::bake_mode::texture_sets(app, ui),
             Panel::TextureSetList => crate::dock::texture_set_list(app, ui),
             Panel::Layers => crate::dock::layers(app, ui),
             Panel::TextureSetSettings => crate::dock::texture_set_settings(app, ui),
@@ -368,8 +425,8 @@ impl DockContent<Panel> for Panels<'_> {
     fn logical_label(&self, panel: &Panel) -> String {
         match panel {
             Panel::Properties => crate::dock::properties_title(self.app),
-            // Bake mode shows its settings where the shelf lives.
-            Panel::Assets if self.app.ui.mode == crate::state::Mode::Baking => tr("Bake Mesh Maps").to_string(),
+            Panel::BakeMaps => tr("Bake Maps").to_string(),
+            Panel::BakeSettings => tr("Settings").to_string(),
             p => tr(p.name()).to_string(),
         }
     }

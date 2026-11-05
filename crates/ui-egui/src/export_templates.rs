@@ -70,7 +70,7 @@ static PALETTE: LazyLock<Palette> = LazyLock::new(|| {
     [
         (n_("Texture set channels"), Channel::ALL.iter().map(|&channel| (channel.label(), SourceRef::Channel { channel, component: 0 })).collect()),
         (n_("Converted maps"), VirtualMap::ALL.iter().map(|&map| (map.label(), SourceRef::Virtual { map, component: 0 })).collect()),
-        (n_("Mesh maps"), BakedMap::ALL.iter().map(|&map| (map.label(), SourceRef::Baked { map, component: 0 })).collect()),
+        (n_("Mesh maps"), BakedMap::ALL.iter().map(|&map| (crate::i18n::baked_map_label(map), SourceRef::Baked { map, component: 0 })).collect()),
         (n_("Constants"), vec![(n_("Black"), SourceRef::Constant(0.0)), (n_("Gray 50%"), SourceRef::Constant(0.5)), (n_("White"), SourceRef::Constant(1.0))]),
     ]
 });
@@ -79,7 +79,7 @@ fn source_label(s: &SourceRef) -> &'static str {
     match s {
         SourceRef::Channel { channel, .. } => channel.label(),
         SourceRef::Virtual { map, .. } => map.label(),
-        SourceRef::Baked { map, .. } => map.label(),
+        SourceRef::Baked { map, .. } => crate::i18n::baked_map_label(*map),
         SourceRef::Constant(_) => n_("Constant"),
     }
 }

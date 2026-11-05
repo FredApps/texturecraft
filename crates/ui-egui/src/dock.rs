@@ -1,4 +1,4 @@
-//! Panel bodies of the right column: Texture Set List, Layers, Texture Set Settings, Properties
+//! Panel bodies of the right column: Texture Sets, Layers, Texture Set Settings, Properties
 //! (hosted as dock tabs by `docking`).
 
 use egui::{Color32, Rect, RichText, Sense, Stroke, Ui, pos2, vec2};
@@ -827,7 +827,7 @@ pub(crate) fn texture_set_settings(app: &mut TextureCraftApp, ui: &mut Ui) {
                 let (r, _) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::hover());
                 ui.painter().rect_filled(r, 2.0, if present { mesh_map_color(m) } else { tk.button });
                 ui.vertical(|ui| {
-                    ui.label(RichText::new(tr(m.label())).strong());
+                    ui.label(RichText::new(tr(crate::i18n::baked_map_label(m))).strong());
                     ui.label(
                         RichText::new(if present { format!("{}_{}", set.name, m.id()) } else { tr("Missing (bake to create)").into() })
                             .size(10.5)
@@ -892,8 +892,8 @@ fn image_drop(ui: &Ui, resp: &egui::Response) -> Option<String> {
     }
 }
 
-fn mesh_map_color(m: BakedMap) -> Color32 {
-    match m {
+fn mesh_map_color(map: BakedMap) -> Color32 {
+    match map {
         BakedMap::Normal => Color32::from_rgb(128, 128, 255),
         BakedMap::WorldNormal => Color32::from_rgb(120, 200, 140),
         BakedMap::Id => Color32::from_rgb(220, 60, 60),
@@ -904,8 +904,6 @@ fn mesh_map_color(m: BakedMap) -> Color32 {
         BakedMap::Height => Color32::from_gray(128),
         BakedMap::BentNormal => Color32::from_rgb(140, 170, 230),
         BakedMap::Opacity => Color32::from_gray(230),
-        BakedMap::ColorMap => Color32::from_rgb(200, 150, 90),
-        BakedMap::WorldDirection => Color32::from_gray(180),
     }
 }
 

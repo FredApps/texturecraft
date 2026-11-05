@@ -338,6 +338,23 @@ fn fbx_diffuse_colors_and_embedded_textures_reach_high_polys() {
     hammer("x.fbx", &binary_fbx(&nodes, 7500, false));
 }
 
+#[test]
+fn fbx_retains_white_materials_and_colors_beside_textures() {
+    let mut nodes = textured_scene(&tiny_png());
+    let objects = nodes.iter_mut().find(|node| node.name == "Objects").unwrap();
+    let red = objects.children.iter_mut().find(|node| matches!(node.props.first(), Some(P::L(30)))).unwrap();
+    red.children = vec![props70(vec![prop("DiffuseColor", &[1.0, 1.0, 1.0])])];
+    let blue = objects.children.iter_mut().find(|node| matches!(node.props.first(), Some(P::L(31)))).unwrap();
+    blue.children.push(props70(vec![prop("DiffuseColor", &[0.1, 0.2, 0.3])]));
+
+    let imported = import_high_poly_bytes("colors.fbx", &binary_fbx(&nodes, 7500, true)).unwrap();
+    let white = imported.base_color[0].as_ref().unwrap();
+    let textured = imported.base_color[1].as_ref().unwrap();
+    assert_eq!(white.factor, texturecraft_geom::glam::Vec4::ONE);
+    assert_eq!(textured.factor, texturecraft_geom::glam::Vec4::new(0.1, 0.2, 0.3, 1.0));
+    assert_eq!(textured.texels.len(), 4);
+}
+
 /// [`textured_scene`] with Blue's texture kept as a file: `tex/wood.png` relative to the FBX, or
 /// only an absolute path elsewhere (found by its file name next to the FBX).
 fn texture_file_scene(relative: &'static str) -> Vec<N> {

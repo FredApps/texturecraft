@@ -354,23 +354,26 @@ impl Session {
         Ok(link_of(self, "material.link", id)?.params.iter().map(|p| (p.id.clone(), p.value.clone())).collect())
     }
 
-    /// The re-cook of linked layer `id` with `overrides` over its values, at its texture set's
-    /// resolution, with the set's baked mesh maps for matching graph inputs.
+    /// Prepare a re-cook with current parameter values and matching baked mesh maps
     pub fn link_job(&self, id: LayerId, overrides: &Map<String, Value>) -> Result<LinkJob> {
         let link = link_of(self, "material.link", id)?;
-        let (ts, _, _) = self.doc.project.locate(id).ok_or_else(|| EngineError::Other(format!("layer {} is not in a stack", id.0)))?;
+        let (texture_set, _, _) = self.doc.project.locate(id).ok_or_else(|| EngineError::Other(format!("layer {} is not in a stack", id.0)))?;
         let mut values = self.link_values(id)?;
         values.extend(overrides.clone());
+
         let mut inputs = Vec::new();
-        if let Some(baked) = self.doc.baked.get(&ts) {
-            for ident in &link.inputs {
-                let Some((m, data)) = BakedMap::for_input(ident).and_then(|m| Some((m, baked.maps.get(&m)?))) else { continue };
-                let png = texturecraft_formats::mcmat::mesh_map_png(baked.resolution, m.components(), data).map_err(|e| EngineError::Other(e.to_string()))?;
-                inputs.push((ident.clone(), png));
+        if let Some(baked) = self.doc.baked.get(&texture_set) {
+            for identifier in &link.inputs {
+                let Some((map, data)) = BakedMap::parse(identifier).and_then(|map| Some((map, baked.maps.get(&map)?))) else { continue };
+
+                let png = texturecraft_formats::mcmat::mesh_map_png(baked.resolution, map.components(), data)
+                    .map_err(|error| EngineError::Other(error.to_string()))?;
+                inputs.push((identifier.clone(), png));
             }
         }
-        // shortcut: one cook per texture set at its base resolution; UDIM tiles share it.
-        let size = self.doc.project.texture_set(ts)?.resolution;
+
+        // UDIM tiles share one cook at the texture set's base resolution
+        let size = self.doc.project.texture_set(texture_set)?.resolution;
         Ok(LinkJob { layer: id, package: self.link_package(id)?, size, values, inputs })
     }
 

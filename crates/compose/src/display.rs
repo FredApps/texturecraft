@@ -159,7 +159,7 @@ pub fn tile_bytes(comp: &Composite, baked: &BakedMaps, kind: DisplayKind, tx: u3
                 if gloss { (get(Channel::Glossiness), default16(Channel::Glossiness)) } else { (get(Channel::Roughness), default16(Channel::Roughness)) };
             for i in 0..TILE_AREA {
                 let (x, y) = (tx * TILE + (i as u32 % TILE), ty * TILE + (i as u32 / TILE));
-                let baked_ao = baked.scalar(BakedMap::AmbientOcclusion, x, y, res).unwrap_or(1.0);
+                let baked_ao = baked.scalar(BakedMap::AmbientOcclusion, x, y, (res, comp.height)).unwrap_or(1.0);
                 let ch_ao = ao.and_then(|a| a.get(i)).map(|v| *v as f32 / 65535.0).unwrap_or(1.0);
                 let px = &mut out[i * 4..i * 4 + 4];
                 px[0] = ((baked_ao * ch_ao).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
@@ -175,7 +175,7 @@ pub fn tile_bytes(comp: &Composite, baked: &BakedMaps, kind: DisplayKind, tx: u3
                 let px = &mut out[i * 4..i * 4 + 4];
                 // The baked normal is the base the painted normal details sit on (as in export).
                 let (x, y) = (tx * TILE + (i as u32 % TILE), ty * TILE + (i as u32 / TILE));
-                let base = baked.sample(BakedMap::Normal, x, y, res);
+                let base = baked.sample(BakedMap::Normal, x, y, (res, comp.height));
                 match (n, base) {
                     (Some(t), None) => {
                         for (k, d) in px.iter_mut().take(3).enumerate() {

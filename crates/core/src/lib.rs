@@ -7,11 +7,19 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod bake;
 pub mod blend;
 pub mod channel;
 pub mod layer;
 pub mod project;
 
+pub use bake::{
+    AmbientOcclusionAttenuation, AmbientOcclusionSettings, BackfaceMode, BakeAntialiasing, BakePaintTarget, BakeResolution, BakeSettings, BakedMap,
+    BentNormalSettings, CageSettings, CageType, CommonBakeSettings, CurvatureMethod, CurvatureSettings, GroundPlaneSettings, HeightNormalization,
+    HeightSettings, HighPolySettings, IdColorGenerator, IdColorSource, IdSettings, MapSettings, MeshCurvatureSettings, MeshMapSettings, MeshMatchMode,
+    NormalMapCurvatureSettings, PositionAxis, PositionMode, PositionNormalizationScale, PositionSettings, RayDistribution, RaySettings, SelfOcclusion,
+    SkewCorrectionMethod, SkewSettings, ThicknessNormalization, ThicknessSettings,
+};
 pub use blend::{BlendMode, blend1, blend3, lum, mix3};
 pub use channel::{Channel, ChannelFormat, ChannelKind};
 pub use layer::{
@@ -19,9 +27,8 @@ pub use layer::{
     LinkPreset, Mask, MaskBackground, MaterialLink, PathShape, Procedural, ProceduralKind, Projection, Source, gradient, hsl_adjust, per_unit,
 };
 pub use project::{
-    AoMixing, BakeMatch, BakeSettings, BakedMap, BlockScales, Camera, DepthOfField, DirectionMode, DisplaySettings, FORMAT_VERSION, MAX_RESOLUTION,
-    MIN_RESOLUTION, NormalFormat, NormalMixing, PositionMode, Project, RayDistribution, RaySettings, SelfOcclusion, TextureSet, TileGrid, ToneMapping,
-    UDIM_RANGE, udim_at,
+    AoMixing, BlockScales, Camera, DepthOfField, DisplaySettings, FORMAT_VERSION, MAX_RESOLUTION, MIN_RESOLUTION, NormalFormat, NormalMixing, Project,
+    TextureSet, TileGrid, ToneMapping, UDIM_RANGE, udim_at,
 };
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq)]

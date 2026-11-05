@@ -34,7 +34,13 @@ fn mcmat(roughness: f32, wear: f32) -> Vec<u8> {
             {"id": "tint", "label": "Tint", "default": {"t": "color", "v": [1.0, 1.0, 1.0, 1.0]}, "value": {"t": "color", "v": [1.0, 1.0, 1.0, 1.0]}},
             {"id": "note", "label": "Note", "default": {"t": "text", "v": ""}, "value": {"t": "text", "v": ""}}
         ],
-        "inputs": [{"identifier": "curvature", "kind": "gray"}],
+        "inputs": [
+            {"identifier": "curvature", "kind": "gray"},
+            {"identifier": "normal", "kind": "color"},
+            {"identifier": "worldNormal", "kind": "color"},
+            {"identifier": "ambientOcclusion", "kind": "gray"},
+            {"identifier": "bentNormal", "kind": "color"}
+        ],
         "presets": [{"name": "Worn", "values": {"wear": {"t": "float", "v": 1.0}, "note": {"t": "text", "v": "x"}}}],
         "source": "source.mcraft"
     });
@@ -86,7 +92,7 @@ fn imports_as_a_linked_fill_with_its_maps() {
     let l = link(&s, id);
     assert_eq!(l.graph, "Brick_wall");
     assert_eq!(l.params.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), ["wear", "tint"]);
-    assert_eq!(l.inputs, ["curvature"]);
+    assert_eq!(l.inputs, ["curvature", "normal", "worldNormal", "ambientOcclusion", "bentNormal"]);
     assert_eq!(s.doc.resources.get(&l.package).map(|b| b.as_slice()), Some(&b"package bytes"[..]));
     assert!(!s.images.contains_key(&l.package), "the package is not decoded as an image");
     // Inspect shows the link; one undo removes everything.
@@ -147,19 +153,18 @@ fn parameters_are_checked_stored_and_recooked_in_one_undo_step() {
 
 #[test]
 fn duplicates_keep_their_maps_and_mesh_maps_feed_inputs() {
-    let mut s = session();
-    let id = s.add_linked_material_bytes_at(&mcmat(0.25, 0.5), Place::Selection).unwrap();
-    let dup = LayerId(execute(&mut s, "layer.duplicate", &json!({"layer": id.0})).unwrap()["layer"].as_u64().unwrap());
-    let shared = map_name(&s, dup, Channel::Roughness);
-    s.apply_link_cook(id, &mcmat(0.75, 0.5), false).unwrap();
-    assert!(s.doc.resources.contains_key(&shared), "the duplicate still shows the first cook");
+    let mut session = session();
+    let id = session.add_linked_material_bytes_at(&mcmat(0.25, 0.5), Place::Selection).unwrap();
+    let duplicate = LayerId(execute(&mut session, "layer.duplicate", &json!({"layer": id.0})).unwrap()["layer"].as_u64().unwrap());
+    let shared = map_name(&session, duplicate, Channel::Roughness);
+    session.apply_link_cook(id, &mcmat(0.75, 0.5), false).unwrap();
+    assert!(session.doc.resources.contains_key(&shared), "the duplicate still shows the first cook");
 
-    s.doc.baked.insert(0, BakedMaps { resolution: 4, maps: [(BakedMap::Curvature, Arc::new(vec![0.5f32; 16]))].into_iter().collect() });
-    let job = s.link_job(id, &serde_json::Map::new()).unwrap();
-    assert_eq!(job.inputs.len(), 1);
-    assert_eq!(job.inputs[0].0, "curvature");
-    assert_eq!(BakedMap::for_input("ambient_occlusion"), Some(BakedMap::AmbientOcclusion));
-    assert_eq!(BakedMap::for_input("worldNormal"), Some(BakedMap::WorldNormal));
+    let maps = [BakedMap::Curvature, BakedMap::Normal, BakedMap::WorldNormal, BakedMap::AmbientOcclusion, BakedMap::BentNormal];
+    session.doc.baked.insert(0, BakedMaps { resolution: 4, maps: maps.into_iter().map(|map| (map, Arc::new(vec![0.5f32; 16 * map.components()]))).collect() });
+    let job = session.link_job(id, &serde_json::Map::new()).unwrap();
+    assert_eq!(job.inputs.iter().map(|(identifier, _)| identifier.as_str()).collect::<Vec<_>>(), maps.map(BakedMap::id));
+    assert_eq!(maps.map(BakedMap::id), ["curvature", "normal", "worldNormal", "ambientOcclusion", "bentNormal"]);
 }
 
 #[test]

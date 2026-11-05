@@ -131,6 +131,7 @@ pub(crate) fn relayout(doc: &mut Document, ts: usize, old: &TextureSet, log: &mu
     // Blocks and tiles are multiples of 64 texels (resolutions are powers of two ≥ 128), so the
     // map is affine (or None) over each destination tile.
     crate::layer_ops::map_set_images(doc, ts, |img, empty| remap_image(img, (nw, nh), empty, &texel, &tiles, true));
+    remap_bake_paint(doc, ts, old, &new, &map)?;
     if let Some(baked) = doc.baked.get(&ts) {
         match remap_baked(baked, old, &new, &map) {
             Some(b) => {
@@ -186,32 +187,68 @@ pub(crate) fn remap_image(
 
 /// Baked maps of layout `old` resampled (nearest texel) into layout `new` at the same density
 /// per UV tile; None when that is beyond what bakes may hold.
-fn remap_baked(b: &BakedMaps, old: &TextureSet, new: &TextureSet, map: &(dyn Fn([f32; 2]) -> Option<[f32; 2]> + Sync)) -> Option<BakedMaps> {
-    let grid = |t: &TextureSet| t.tile_grid().map_or((1, 1), |g| (g.cols, g.rows));
-    let ((ocols, _), (ncols, nrows)) = (grid(old), grid(new));
-    let per_tile = b.resolution / ocols.max(1);
-    let (w, h) = (per_tile.checked_mul(ncols)?, per_tile.checked_mul(nrows)?);
-    if w == 0 || u64::from(w) * u64::from(h) > texturecraft_bake::MAX_TEXELS {
-        return None;
-    }
-    let mut out = BakedMaps { resolution: w, ..b.clone() };
-    for (m, data) in &b.maps {
-        let (comps, ow, oh) = (m.components(), b.resolution as usize, b.height(*m) as usize);
-        let neutral = m.neutral();
-        let mut texels = vec![0.0f32; w as usize * h as usize * comps];
-        texels.par_chunks_mut(w as usize * comps).enumerate().for_each(|(y, row)| {
-            for (x, px) in row.chunks_mut(comps).enumerate() {
-                let src = map([(x as f32 + 0.5) / w as f32, (y as f32 + 0.5) / h as f32]).and_then(|o| {
-                    let (sx, sy) = (((o[0] * ow as f32) as usize).min(ow.saturating_sub(1)), ((o[1] * oh as f32) as usize).min(oh.saturating_sub(1)));
-                    let i = (sy * ow + sx) * comps;
-                    data.get(i..i + comps)
+fn remap_baked(baked: &BakedMaps, old: &TextureSet, new: &TextureSet, map: &(dyn Fn([f32; 2]) -> Option<[f32; 2]> + Sync)) -> Option<BakedMaps> {
+    let first_map = baked.maps.keys().next()?;
+    let (width, height) = remapped_size((baked.resolution, baked.height(*first_map)), old, new)?;
+    let mut output = BakedMaps { resolution: width, ..BakedMaps::default() };
+    for (kind, data) in &baked.maps {
+        let (component_count, old_width, old_height) = (kind.components(), baked.resolution as usize, baked.height(*kind) as usize);
+        let neutral = kind.neutral();
+        let mut texels = vec![0.0f32; width as usize * height as usize * component_count];
+        texels.par_chunks_mut(width as usize * component_count).enumerate().for_each(|(y, row)| {
+            for (x, pixel) in row.chunks_mut(component_count).enumerate() {
+                let source = map([(x as f32 + 0.5) / width as f32, (y as f32 + 0.5) / height as f32]).and_then(|uv| {
+                    let source_x = ((uv[0] * old_width as f32) as usize).min(old_width.saturating_sub(1));
+                    let source_y = ((uv[1] * old_height as f32) as usize).min(old_height.saturating_sub(1));
+                    let offset = (source_y * old_width + source_x) * component_count;
+                    data.get(offset..offset + component_count)
                 });
-                px.copy_from_slice(src.unwrap_or(&neutral[..comps]));
+                pixel.copy_from_slice(source.unwrap_or(&neutral[..component_count]));
             }
         });
-        out.maps.insert(*m, Arc::new(texels));
+        output.maps.insert(*kind, Arc::new(texels));
     }
-    Some(out)
+    Some(output)
+}
+
+fn remapped_size((width, height): (u32, u32), old: &TextureSet, new: &TextureSet) -> Option<(u32, u32)> {
+    let grid = |set: &TextureSet| set.tile_grid().map_or((1, 1), |grid| (grid.cols, grid.rows));
+    let ((old_columns, old_rows), (new_columns, new_rows)) = (grid(old), grid(new));
+    let width = (width / old_columns.max(1)).max(1).checked_mul(new_columns)?;
+    let height = (height / old_rows.max(1)).max(1).checked_mul(new_rows)?;
+    (u64::from(width) * u64::from(height) <= texturecraft_bake::MAX_TEXELS).then_some((width, height))
+}
+
+fn remap_bake_paint(
+    document: &mut Document,
+    texture_set: usize,
+    old: &TextureSet,
+    new: &TextureSet,
+    map: &(dyn Fn([f32; 2]) -> Option<[f32; 2]> + Sync),
+) -> Result<()> {
+    use texturecraft_bake::BakePaintMap;
+    use texturecraft_core::BakePaintTarget;
+    for ((index, target), painted) in &mut document.bake_paint {
+        if *index != texture_set {
+            continue;
+        }
+        let (width, height) = remapped_size((painted.width, painted.height), old, new)
+            .ok_or_else(|| bad("textureSet.uvTiles", "painted bake maps would exceed the supported size"))?;
+        let empty = match target {
+            BakePaintTarget::Cage => 1.0,
+            BakePaintTarget::Skew => 0.0,
+        };
+        let mut values = vec![empty; width as usize * height as usize];
+        values.par_chunks_mut(width as usize).enumerate().for_each(|(y, row)| {
+            for (x, value) in row.iter_mut().enumerate() {
+                if let Some(uv) = map([(x as f32 + 0.5) / width as f32, (y as f32 + 0.5) / height as f32]) {
+                    *value = painted.sample(texturecraft_geom::glam::Vec2::from_array(uv));
+                }
+            }
+        });
+        *painted = Arc::new(BakePaintMap { width, height, values });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -396,4 +433,19 @@ mod tests {
         assert!(painted_fraction(&s) > 0.97);
         assert!(execute(&mut s, "textureSet.uvTiles", &json!({})).is_err());
     }
+}
+
+#[test]
+fn bake_maps_follow_uv_layout_without_losing_rectangular_dimensions() {
+    use texturecraft_core::{BakePaintTarget, BakedMap};
+    let mut session = Session::new_project("UV", texturecraft_geom::primitives::builtin("udim_plane").unwrap(), "builtin:udim_plane", None, 256).unwrap();
+    crate::execute(&mut session, "bake.settings", &json!({"model": {"common": {"resolution": "R64", "resolution_height": "R128"}}})).unwrap();
+    crate::execute(&mut session, "bake.run", &json!({"maps": ["normal"]})).unwrap();
+    crate::execute(&mut session, "bake.skew.paint", &json!({"points": [[0.125, 0.25]], "radius": 0.06, "size": 64})).unwrap();
+    crate::execute(&mut session, "textureSet.uvTiles", &json!({"enabled": false})).unwrap();
+    let baked = &session.doc.baked[&0];
+    assert_eq!((baked.resolution, baked.height(BakedMap::Normal)), (64, 128));
+    let painted = &session.doc.bake_paint[&(0, BakePaintTarget::Skew)];
+    assert!(painted.sample(texturecraft_geom::glam::Vec2::new(0.25, 0.25)) > 0.9);
+    assert_eq!(painted.sample(texturecraft_geom::glam::Vec2::new(0.75, 0.75)), 0.0);
 }

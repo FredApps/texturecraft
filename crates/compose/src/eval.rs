@@ -1043,7 +1043,7 @@ impl<'a, 'b> Texel<'a, 'b> {
     }
 
     fn baked(&self, m: BakedMap) -> Option<f32> {
-        self.inp.baked.scalar(m, self.x, self.y, self.res)
+        self.inp.baked.scalar(m, self.x, self.y, (self.res, self.inp.gbuf.height))
     }
 
     /// Where projection `proj` samples this texel: the texel's coordinates, or for a decal its
@@ -1179,7 +1179,7 @@ impl<'a, 'b> Texel<'a, 'b> {
                     v += (val - v) * o;
                 }
                 EffectKind::ColorSelection { colors, tolerance } => {
-                    let id = self.inp.baked.sample(BakedMap::Id, self.x, self.y, self.res);
+                    let id = self.inp.baked.sample(BakedMap::Id, self.x, self.y, (self.res, self.inp.gbuf.height));
                     let hit = id.is_some_and(|c| colors.iter().any(|k| (k[0] - c[0]).abs().max((k[1] - c[1]).abs()).max((k[2] - c[2]).abs()) <= *tolerance));
                     let val = if hit { 1.0 } else { 0.0 };
                     v += (blend1(e.blend, v, val) - v) * o;

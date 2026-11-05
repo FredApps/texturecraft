@@ -71,7 +71,7 @@ impl Session {
         set.tile_resolutions = src_set.tile_resolutions.clone();
         set.channels = src_set.channels.clone();
         project.texture_sets.push(set);
-        let mut mini = Document { project, pixels: PixelStore::default(), baked: BTreeMap::new(), resources: BTreeMap::new() };
+        let mut mini = Document { bake_paint: BTreeMap::new(), project, pixels: PixelStore::default(), baked: BTreeMap::new(), resources: BTreeMap::new() };
         let new = crate::layer_ops::copy_tree(&self.doc, id, &mut mini, 0, None, false, 0)?;
         if let Ok(l) = mini.project.layer_mut(new) {
             l.name = name.to_string();
@@ -86,9 +86,10 @@ impl Session {
             mesh: None,
             high_poly: Vec::new(),
             cage: None,
-            skew: None,
+            bake_paint: BTreeMap::new(),
             thumbnail: None,
             resources,
+            warnings: Vec::new(),
         };
         texturecraft_formats::save_project_bytes(&pf).map_err(fe)
     }
@@ -112,7 +113,7 @@ impl Session {
             .and_then(|t| t.stack.last().copied())
             .ok_or_else(|| EngineError::Other("the smart material file has no layer".into()))?;
         let resources: BTreeMap<String, Arc<Vec<u8>>> = pf.resources.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
-        let src = Document { project: pf.project, pixels: pf.pixels, baked: BTreeMap::new(), resources: resources.clone() };
+        let src = Document { bake_paint: BTreeMap::new(), project: pf.project, pixels: pf.pixels, baked: BTreeMap::new(), resources: resources.clone() };
         let id = self.edit("Add smart material", |s| {
             for (k, v) in &resources {
                 s.doc.resources.entry(k.clone()).or_insert_with(|| v.clone());

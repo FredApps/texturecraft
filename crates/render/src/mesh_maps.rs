@@ -11,12 +11,9 @@ pub fn mesh_map_rgba(baked: Option<&BakedMaps>, m: BakedMap, size: u32) -> Vec<u
     let size = size.max(1);
     let mut out = vec![128u8; (size * size * 4) as usize];
     let Some(b) = baked.filter(|b| b.maps.contains_key(&m)) else { return out };
-    // `sample` scales both axes by the width: rows of a UV tile atlas map through its aspect.
-    let (w, h) = (u64::from(b.resolution.max(1)), u64::from(b.height(m)));
     for y in 0..size {
-        let sy = (u64::from(y) * h / w) as u32;
         for x in 0..size {
-            let v = b.sample(m, x, sy, size).unwrap_or([0.5; 3]);
+            let v = b.sample(m, x, y, (size, size)).unwrap_or([0.5; 3]);
             let i = ((y * size + x) * 4) as usize;
             for k in 0..3 {
                 // Data maps are shown as stored, i.e. treated as display values.
