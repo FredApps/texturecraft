@@ -58,6 +58,13 @@ replace it without touching the engine.
 
 ## 3. Golden rules
 
+### Never name the reference product (absolutely essential)
+
+- The repository never names the commercial product TextureCraft is modeled on, nor its vendor,
+  in code, comments, docs, commit messages, test names, file names or UI text. Say "the reference
+  app", "the professional model-painter workflow" or describe the feature itself.
+- Notes that name it may live only in the gitignored `plan/` folder or in this `AGENTS.md` file
+
 ### Assets, icons and images (absolutely essential)
 
 - **Never use any icon, image, logo, texture, material, brush, environment, font or other asset
