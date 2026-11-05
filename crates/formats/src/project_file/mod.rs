@@ -28,7 +28,7 @@ use texturecraft_texel::{TILE_AREA, TileImage};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
-use self::entries::{Body, Entry};
+use self::entries::Entry;
 use crate::{FormatError, MAX_IMAGE_SIZE, Result, malformed};
 
 mod entries;
