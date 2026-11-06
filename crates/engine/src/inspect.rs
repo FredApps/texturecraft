@@ -129,26 +129,34 @@ pub fn texture_sets(s: &Session) -> Value {
     json!((0..s.set_count()).map(|i| texture_set(s, i)).collect::<Vec<_>>())
 }
 
-/// One texture set; UV-tiled sets list their tiles and where each sits in the texel atlas.
-pub fn texture_set(s: &Session, i: usize) -> Value {
-    let Some(t) = s.doc.project.texture_sets.get(i) else { return Value::Null };
-    let grid = t.tile_grid();
-    let tiles: Vec<Value> =
-        t.uv_tiles.iter().filter_map(|u| grid?.block(*u).map(|(x, y)| json!({ "udim": u, "block": [x, y], "resolution": t.tile_resolution(*u) }))).collect();
+/// One texture set, including UV tile layout and bake selection
+pub fn texture_set(session: &Session, index: usize) -> Value {
+    let Some(texture_set) = session.doc.project.texture_sets.get(index) else { return Value::Null };
+
+    let grid = texture_set.tile_grid();
+    let tiles: Vec<Value> = texture_set
+        .uv_tiles
+        .iter()
+        .filter_map(|tile| {
+            grid?.block(*tile).map(|(x, y)| {
+                json!({"udim": tile, "block": [x, y], "resolution": texture_set.tile_resolution(*tile), "bakeEnabled": !texture_set.bake_excluded_tiles.contains(tile)})
+            })
+        })
+        .collect();
     json!({
-        "index": i,
-        "name": t.name,
-        "resolution": t.resolution,
-        "size": t.size(),
-        "blockResolution": t.block_resolution(),
-        "uvTiles": t.uv_tiles,
+        "index": index,
+        "name": texture_set.name,
+        "resolution": texture_set.resolution,
+        "size": texture_set.size(),
+        "blockResolution": texture_set.block_resolution(),
+        "uvTiles": texture_set.uv_tiles,
         "tiles": tiles,
-        "channels": t.channels.iter().map(|(c, f)| json!({ "channel": c.id(), "format": f.label() })).collect::<Vec<_>>(),
-        "layers": s.doc.project.walk(i).len(),
-        "parts": crate::set_cmds::parts(s, i),
-        "baked": crate::project_cmds::baked_json(s.doc.baked.get(&i)),
-        "visible": t.visible,
-        "active": i == s.ts(),
+        "channels": texture_set.channels.iter().map(|(channel, format)| json!({ "channel": channel.id(), "format": format.label() })).collect::<Vec<_>>(),
+        "layers": session.doc.project.walk(index).len(),
+        "parts": crate::set_cmds::parts(session, index),
+        "baked": crate::project_cmds::baked_json(session.doc.baked.get(&index)),
+        "visible": texture_set.visible,
+        "active": index == session.ts(),
     })
 }
 
@@ -161,7 +169,7 @@ pub fn session(s: &Session) -> Value {
         "path": s.path,
         "modified": s.modified,
         "textureSets": texture_sets(s),
-        "bakeMeshes": crate::bake_cmds::meshes_json(s),
+        "bakeMeshes": crate::bake::meshes_json(s),
         "activeTextureSet": ts,
         "selectedLayer": s.selected_layer().map(|l| l.0),
         "target": match s.target { StackTarget::Content => json!("content"), StackTarget::Mask => json!("mask"), StackTarget::Effect(e) => json!(e.0) },

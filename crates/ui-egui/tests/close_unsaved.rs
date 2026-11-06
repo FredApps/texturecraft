@@ -90,3 +90,17 @@ fn closing_the_project_with_changes_asks_first() {
     assert_ne!(name(&h), "Edited", "Don't save closes the project");
     assert!(h.state().ui.windows.unsaved.is_none() && !h.state().session.modified);
 }
+
+/// The dialog fits one sentence and one button row instead of growing to the screen height
+#[test]
+fn the_dialog_fits_its_contents() {
+    // The title bar, one line, one button row and margins take 119 px at 1x and the bug made it 420; the 31 px left over absorbs font and theme tweaks
+    const MAX_HEIGHT: f32 = 150.0;
+
+    let mut h = harness(true);
+    request_close(&mut h);
+    h.run_steps(2);
+
+    let dialog = h.ctx.memory(|m| m.area_rect(egui::Id::unique("unsaved"))).expect("the dialog is shown");
+    assert!(dialog.height() < MAX_HEIGHT, "the dialog is {} px tall", dialog.height());
+}

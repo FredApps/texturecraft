@@ -40,48 +40,59 @@ pub(crate) fn ask_to_save(app: &mut TextureCraftApp, then: crate::state::Unsaved
 /// (in the browser, Save downloads the project).
 fn unsaved(app: &mut TextureCraftApp, ctx: &egui::Context) {
     use crate::state::Unsaved;
+
     if ctx.input(|i| i.viewport().close_requested()) && ask_to_save(app, Unsaved::Quit) {
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
     }
-    let Some(then) = app.ui.windows.unsaved.clone() else { return };
+    let Some(pending) = app.ui.windows.unsaved.clone() else { return };
+
     let mut open = true;
-    let mut save = None;
+    let mut save_first = None;
     let mut cancel = false;
-    let name: [(&str, &dyn std::fmt::Display); 1] = [("name", &app.session.doc.project.name)];
-    let question =
-        if then == Unsaved::Quit { trf("Save the changes to {name} before closing?", &name) } else { trf("Save the changes to {name} first?", &name) };
+    let question_args: [(&str, &dyn std::fmt::Display); 1] = [("name", &app.session.doc.project.name)];
+    let question = if pending == Unsaved::Quit {
+        trf("Save the changes to {name} before closing?", &question_args)
+    } else {
+        trf("Save the changes to {name} first?", &question_args)
+    };
     dialog("unsaved", tr("Unsaved changes"), &mut open).show(ctx, |ui| {
         ui.label(question);
         ui.add_space(8.0);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.add(primary_button(ui, tr("Save"))).clicked() {
-                save = Some(true);
-            }
-            if ui.button(tr("Don't save")).clicked() {
-                save = Some(false);
-            }
-            if ui.button(tr("Cancel")).clicked() {
-                cancel = true;
-            }
+
+        // One row keeps the window to its contents; a bare right-to-left layout fills the screen height
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(primary_button(ui, tr("Save"))).clicked() {
+                    save_first = Some(true);
+                }
+                if ui.button(tr("Don't save")).clicked() {
+                    save_first = Some(false);
+                }
+                if ui.button(tr("Cancel")).clicked() {
+                    cancel = true;
+                }
+            });
         });
     });
     if !open || cancel {
         app.ui.windows.unsaved = None;
     }
-    match save {
+
+    match save_first {
         Some(true) => {
             file_action(app, ctx, "file.save");
         }
-        // Going ahead anyway: the changes are let go.
+        // Going ahead anyway: the changes are let go
         Some(false) => app.session.modified = false,
         None => return,
     }
-    // A cancelled or failed save keeps the project and this dialog open.
+
+    // A cancelled or failed save keeps the project and this dialog open
     if app.session.modified {
         return;
     }
     app.ui.windows.unsaved = None;
-    match then {
+    match pending {
         Unsaved::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         Unsaved::Command(id) => crate::menus::invoke(app, ctx, &id),
         #[cfg(not(target_arch = "wasm32"))]
@@ -615,8 +626,7 @@ fn settings(app: &mut TextureCraftApp, ctx: &egui::Context) {
     app.ui.windows.settings = open;
 }
 
-/// Browser File › Export Mesh: pick the download format (the desktop picks it in the save
-/// dialog).
+/// Browser File › Export Mesh: pick the download format
 #[cfg(target_arch = "wasm32")]
 fn export_mesh(app: &mut TextureCraftApp, ctx: &egui::Context) {
     let formats = [
@@ -627,18 +637,20 @@ fn export_mesh(app: &mut TextureCraftApp, ctx: &egui::Context) {
     if !app.ui.windows.export_mesh {
         return;
     }
+
     let mut open = true;
     let mut picked = None;
     dialog("export_mesh", tr("Export mesh"), &mut open).show(ctx, |ui| {
         ui.label(caption(tr("Download as")));
-        for (ext, label, hint) in formats {
-            if ui.add_sized(vec2(220.0, 24.0), egui::Button::new(label)).on_hover_text(hint).clicked() {
-                picked = Some(ext);
+        for (extension, label, hint) in formats {
+            if ui.add_sized(vec2(220.0, ui.spacing().interact_size.y), egui::Button::new(label)).on_hover_text(hint).clicked() {
+                picked = Some(extension);
             }
         }
     });
-    if let Some(ext) = picked {
-        crate::web_files::export_mesh(app, ext);
+
+    if let Some(extension) = picked {
+        crate::web_files::export_mesh(app, extension);
         open = false;
     }
     app.ui.windows.export_mesh = open;

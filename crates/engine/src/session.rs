@@ -728,6 +728,7 @@ impl Session {
                     gbuf: &cache.gbuf,
                     pixels: &self.doc.pixels,
                     baked: self.doc.baked.get(&ts).unwrap_or(&empty),
+                    block_scales: cache.composite.block_scales.clone(),
                     preview,
                     images: &self.images,
                     bounds: self.mesh.bounds(),
@@ -816,6 +817,7 @@ impl Session {
             gbuf: &cache.gbuf,
             pixels: &self.doc.pixels,
             baked: self.doc.baked.get(&ts).unwrap_or(&empty),
+            block_scales: cache.composite.block_scales.clone(),
             preview: None,
             images: &self.images,
             bounds: self.mesh.bounds(),
@@ -827,6 +829,13 @@ impl Session {
         let (ts, _, _) = self.doc.project.locate(id)?;
         let gray = self.with_inputs(ts, |inp| texturecraft_compose::mask_image(inp, id, size))?;
         Some(gray.iter().flat_map(|g| [*g, *g, *g, 255]).collect())
+    }
+
+    /// Mask values at texture-set coordinates in request order; None without an enabled mask
+    /// Uncovered and out-of-range texels read zero; neighbourhood filters also read surrounding texels
+    pub fn mask_at(&self, id: LayerId, texels: &[(u32, u32)]) -> Option<Vec<f32>> {
+        let (texture_set, _, _) = self.doc.project.locate(id)?;
+        self.with_inputs(texture_set, |inputs| texturecraft_compose::mask_at(inputs, id, texels))
     }
 
     /// Histogram (`bins` buckets over 0..1) of the values entering effect `effect`: its layer's

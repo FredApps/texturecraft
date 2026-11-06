@@ -11,6 +11,8 @@ use texturecraft_engine::core::ProceduralKind;
 use texturecraft_engine::filter_lib::FILTERS;
 #[cfg(not(target_arch = "wasm32"))]
 use texturecraft_engine::formats::mcmat::MCMAT_EXT;
+use texturecraft_engine::geom::glam::Vec2;
+use texturecraft_engine::mask_preview::MAX_PREVIEW_SIZE_PX;
 use texturecraft_engine::materials::MATERIALS;
 use texturecraft_engine::paint::alphas;
 use texturecraft_engine::paint::presets::{BrushPreset, PRESETS};
@@ -19,8 +21,30 @@ use texturecraft_render::ibl::ENVIRONMENTS;
 
 use crate::TextureCraftApp;
 use crate::i18n::{tr, trf};
+use crate::shelf_preview::ShelfPreview;
 use crate::theme::Tokens;
+use crate::thumbs::Thumbs;
 use crate::widgets::{dnd_release, icon_button};
+
+/// A shelf tile's size in points
+const TILE_WIDTH: f32 = 72.0;
+const TILE_HEIGHT: f32 = 86.0;
+/// Corner radius of a tile's hover and selection highlights, in points
+const TILE_ROUNDING: f32 = 3.0;
+/// The thumbnail's size in a tile and its center below the tile's top, in points
+const THUMBNAIL_SIZE: f32 = 56.0;
+const THUMBNAIL_CENTER_Y: f32 = 32.0;
+/// A placeholder disc's radius relative to the thumbnail's width
+const PLACEHOLDER_RADIUS: f32 = 0.45;
+/// A tile label's font size, its gap below the thumbnail and its total side margin, in points
+const LABEL_FONT_SIZE: f32 = 9.5;
+const LABEL_GAP: f32 = 3.0;
+const LABEL_MARGIN: f32 = 4.0;
+/// The hover preview's size and its gap above the label, in points
+const BIG_PREVIEW_SIZE: f32 = 256.0;
+const BIG_PREVIEW_LABEL_GAP: f32 = 4.0;
+/// Dwell in seconds before rendering, shorter than the popup delay
+const BIG_PREVIEW_DWELL: f32 = 0.1;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tab {
@@ -119,11 +143,27 @@ pub enum DropZone {
     Brush,
     /// The 2D view: alphas and materials.
     View2d,
-    /// The 3D view: alphas, materials and textures (placed as decals where they drop).
+    /// The 3D view: alphas, materials (on the texture set they drop on) and textures (placed as decals where they drop).
     View3d,
 }
 
-/// Highlight accepted shelf assets on hover and apply them on drop
+/// The texture set under the pointer while a shelf material is dragged over the 3D view `response`: the set a drop there applies it to
+pub fn material_drop_set(app: &TextureCraftApp, ui: &Ui, response: &egui::Response) -> Option<usize> {
+    if app.ui.mode != crate::state::Mode::Painting {
+        return None;
+    }
+
+    response.dnd_hover_payload::<ShelfDrag>().filter(|drag| drag.asset.is_material())?;
+    set_under_pointer(app, ui, response)
+}
+
+/// The texture set of the surface under the pointer in the 3D view `response`
+fn set_under_pointer(app: &TextureCraftApp, ui: &Ui, response: &egui::Response) -> Option<usize> {
+    let local_position = ui.input(|input| input.pointer.interact_pos())? - response.rect.min;
+    app.session.texture_set_at(Vec2::new(local_position.x, local_position.y), app.session.viewport)
+}
+
+/// Highlight accepted shelf assets on hover and apply them on drop. In the 3D view a material goes to the texture set under the pointer, highlighted by the view itself ([`material_drop_set`])
 pub fn drop_target(app: &mut TextureCraftApp, ui: &Ui, response: &egui::Response, zone: DropZone) {
     if app.ui.mode != crate::state::Mode::Painting {
         return;
@@ -136,54 +176,64 @@ pub fn drop_target(app: &mut TextureCraftApp, ui: &Ui, response: &egui::Response
         Asset::Texture(_) => zone == DropZone::View3d,
         Asset::SmartMask(_) | Asset::Filter(_) => false,
     };
-    if response.dnd_hover_payload::<ShelfDrag>().is_some_and(|drag| accepts(&drag)) {
+    let onto_set = |asset: &Asset| zone == DropZone::View3d && asset.is_material();
+    if response.dnd_hover_payload::<ShelfDrag>().is_some_and(|drag| accepts(&drag) && !onto_set(&drag.asset)) {
         ui.painter().rect_stroke(response.rect.shrink(1.0), 3.0, Stroke::new(2.0, tokens.accent), egui::StrokeKind::Inside);
     }
+
     let pointer = ui.input(|input| input.pointer.interact_pos());
-    if let Some(drag) = dnd_release::<ShelfDrag>(response)
-        && accepts(&drag)
-    {
-        match (&drag.asset, pointer) {
-            (Asset::Texture(name), Some(position)) => {
-                let (local_position, viewport_size) = (position - response.rect.min, response.rect.size());
-                app.run(
-                    "layer.add.decal",
-                    json!({"image": name, "x": local_position.x, "y": local_position.y, "viewport": [viewport_size.x, viewport_size.y]}),
-                );
-            }
-            (asset, _) => apply(app, asset),
+    let Some(drag) = dnd_release::<ShelfDrag>(response).filter(|drag| accepts(drag)) else { return };
+
+    match (&drag.asset, pointer) {
+        (Asset::Texture(name), Some(position)) => {
+            let (local_position, viewport_size) = (position - response.rect.min, response.rect.size());
+            app.run("layer.add.decal", json!({"image": name, "x": local_position.x, "y": local_position.y, "viewport": [viewport_size.x, viewport_size.y]}));
         }
+        // The background takes nothing
+        (asset, _) if onto_set(asset) => {
+            let Some(ts) = set_under_pointer(app, ui, response) else { return };
+
+            if app.run("textureSet.select", json!({"ts": ts})).is_some() {
+                apply(app, asset);
+            }
+        }
+        (asset, _) => apply(app, asset),
     }
 }
 
-/// The Assets panel body (a dock tab).
+/// The Assets panel body (a dock tab)
 pub fn body(app: &mut TextureCraftApp, ui: &mut Ui) {
-    let tk = Tokens::get(ui.ctx());
+    let tokens = Tokens::get(ui.ctx());
     let ctx = ui.ctx().clone();
     let mut tab = app.ui.shelf_tab.min(TABS.len() - 1);
     let searching = !app.ui.shelf_filter.is_empty();
+
     ui.horizontal_wrapped(|ui| {
+        let button_size = ui.spacing().interact_size.y;
         ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
         for (i, (_, icon, label)) in TABS.iter().enumerate() {
-            if icon_button(ui, icon, tr(label), i == tab && !searching, 24.0).clicked() {
+            if icon_button(ui, icon, tr(label), i == tab && !searching, button_size).clicked() {
                 tab = i;
                 app.ui.shelf_filter.clear();
             }
         }
     });
     app.ui.shelf_tab = tab;
+
     ui.horizontal(|ui| {
-        ui.label(RichText::new(ic::MAGNIFYING_GLASS).color(tk.text_dim));
+        ui.label(RichText::new(ic::MAGNIFYING_GLASS).color(tokens.text_dim));
         ui.add(egui::TextEdit::singleline(&mut app.ui.shelf_filter).hint_text(tr("Search all assets")).desired_width(f32::INFINITY));
     });
     ui.add_space(4.0);
+
     let filter = app.ui.shelf_filter.to_lowercase();
     egui::ScrollArea::vertical().id_salt("shelf_scroll").auto_shrink([false, false]).show(ui, |ui| {
-        // Searching shows matches from every tab, each under its tab's name.
+        // Searching shows matches from every tab, each under its tab's name
         for (i, (t, _, title)) in TABS.iter().enumerate() {
             if filter.is_empty() && i != tab {
                 continue;
             }
+
             let title = tr(title);
             match t {
                 Tab::Materials => materials(app, ui, &ctx, &filter, false, title),
@@ -262,13 +312,8 @@ fn materials(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, filter
         tiles(ui, |ui| {
             for m in shown.iter().filter(|m| m.category == cat) {
                 let tex = app.thumbs.material(ctx, m.id);
-                let hint = if m.smart {
-                    tr("Add the smart material folder above the selected layer (or drag it into the layer stack)")
-                } else {
-                    tr("Add a fill layer with this material above the selected layer (or drag it into the layer stack)")
-                };
                 let asset = Asset::Material(m.id);
-                if tile(ui, tex.as_ref(), m.label, hint, Some(&asset)).clicked() {
+                if tile(ui, &mut app.thumbs, tex.as_ref(), || ShelfPreview::Material(m.id), m.label, Some(&asset)).clicked() {
                     apply(app, &asset);
                 }
             }
@@ -335,8 +380,7 @@ fn smart_masks(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, filt
         for m in shown {
             let tex = app.thumbs.smart_mask(ctx, m.id);
             let asset = Asset::SmartMask(m.id);
-            let hint = tr("Replace the selected layer's mask with this smart mask (or drag it onto a layer)");
-            if tile(ui, tex.as_ref(), m.label, hint, Some(&asset)).clicked() {
+            if tile(ui, &mut app.thumbs, tex.as_ref(), || ShelfPreview::SmartMask(m.id), m.label, Some(&asset)).clicked() {
                 apply(app, &asset);
             }
         }
@@ -356,13 +400,8 @@ fn filters(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, filter: 
         tiles(ui, |ui| {
             for f in shown.iter().filter(|f| f.group == group) {
                 let tex = app.thumbs.filter(ctx, f.id);
-                let hint = if f.mask {
-                    tr("Add to the selected layer's content, or its mask when the mask is selected (or drag it onto a layer)")
-                } else {
-                    tr("Add this finish to the selected layer's roughness and height (or drag it onto a layer)")
-                };
                 let asset = Asset::Filter(f.id);
-                if tile(ui, tex.as_ref(), tr(f.label), hint, Some(&asset)).clicked() {
+                if tile(ui, &mut app.thumbs, tex.as_ref(), || ShelfPreview::Filter(f.id), tr(f.label), Some(&asset)).clicked() {
                     apply(app, &asset);
                 }
             }
@@ -381,7 +420,7 @@ fn brushes(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, filter: 
             tiles(ui, |ui| {
                 for p in shown.iter().filter(|p| p.category == cat) {
                     let tex = app.thumbs.brush_preset(ctx, p);
-                    if tile(ui, tex.as_ref(), p.label, tr("Use this brush (keeps its size)"), None).clicked() {
+                    if tile(ui, &mut app.thumbs, tex.as_ref(), || ShelfPreview::Brush(p), p.label, None).clicked() {
                         app.run("brush.preset.apply", json!({"preset": p.id}));
                     }
                 }
@@ -462,9 +501,9 @@ fn alpha_library(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, fi
             for &a in shown.iter().filter(|a| a.category == cat) {
                 let tex = app.thumbs.alpha(ctx, a);
                 let asset = Asset::Alpha(&a.id);
-                let r = tile(ui, tex.as_ref(), &a.label, tr("Use as the brush alpha (or drag it onto the viewport or brush properties)"), Some(&asset));
+                let r = tile(ui, &mut app.thumbs, tex.as_ref(), || ShelfPreview::Alpha(a), &a.label, Some(&asset));
                 if current.as_deref() == Some(a.id.as_str()) {
-                    ui.painter().rect_stroke(r.rect, 3.0, Stroke::new(1.0, tk.accent), egui::StrokeKind::Inside);
+                    ui.painter().rect_stroke(r.rect, TILE_ROUNDING, Stroke::new(1.0, tk.accent), egui::StrokeKind::Inside);
                 }
                 if r.clicked() {
                     apply(app, &asset);
@@ -483,7 +522,7 @@ fn procedurals(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, filt
     tiles(ui, |ui| {
         for k in shown {
             let tex = app.thumbs.procedural(ctx, k);
-            if tile(ui, tex.as_ref(), tr(k.label()), tr("Add a fill layer using this pattern"), None).clicked() {
+            if tile(ui, &mut app.thumbs, tex.as_ref(), || ShelfPreview::Procedural(k), tr(k.label()), None).clicked() {
                 app.run("layer.add.fill", json!({"name": k.label()}));
                 app.run("layer.fill.set", json!({"channel": "baseColor", "procedural": k.label(), "low": [0.1, 0.1, 0.1], "high": [0.9, 0.9, 0.9]}));
             }
@@ -524,9 +563,11 @@ fn textures(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, filter:
     tiles(ui, |ui| {
         for name in names {
             let Some(img) = app.session.images.get(&name).cloned() else { continue };
+
             let tex = app.thumbs.image(ctx, &name, &img);
             let asset = Asset::Texture(name.clone());
-            let r = tile(ui, Some(&tex), &name, tr("Add a fill layer using this image (or drag it onto the 3D view to place it as a decal)"), Some(&asset));
+            let preview = || ShelfPreview::Image(name.clone(), img);
+            let r = tile(ui, &mut app.thumbs, Some(&tex), preview, &name, Some(&asset));
             if r.clicked() {
                 apply(app, &asset);
             }
@@ -544,33 +585,77 @@ fn textures(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, filter:
     });
 }
 
-/// A shelf tile: thumbnail (a placeholder disc while it renders) and a wrapped label; tiles with
-/// a `drag` asset can be dragged.
-fn tile(ui: &mut Ui, tex: Option<&egui::TextureHandle>, label: &str, hint: &str, drag: Option<&Asset>) -> egui::Response {
+/// Asset tile with optional dragging and a larger hover preview
+fn tile(
+    ui: &mut Ui,
+    thumbs: &mut Thumbs,
+    tex: Option<&egui::TextureHandle>,
+    preview: impl FnOnce() -> ShelfPreview,
+    label: &str,
+    drag: Option<&Asset>,
+) -> egui::Response {
     let tk = Tokens::get(ui.ctx());
     let sense = if drag.is_some() { Sense::click_and_drag() } else { Sense::click() };
-    let (rect, resp) = ui.allocate_exact_size(vec2(72.0, 86.0), sense);
+    let (rect, resp) = ui.allocate_exact_size(vec2(TILE_WIDTH, TILE_HEIGHT), sense);
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
     if let Some(asset) = drag
         && resp.drag_started()
     {
         resp.dnd_set_drag_payload(ShelfDrag { asset: asset.clone(), label: label.to_string() });
     }
-    let p = ui.painter();
+
+    let painter = ui.painter();
     if resp.hovered() || resp.dragged() {
-        p.rect_filled(rect, 3.0, tk.row_hover);
+        painter.rect_filled(rect, TILE_ROUNDING, tk.row_hover);
     }
-    let img = egui::Rect::from_center_size(rect.center_top() + vec2(0.0, 32.0), vec2(56.0, 56.0));
+    let image_rect = egui::Rect::from_center_size(rect.center_top() + vec2(0.0, THUMBNAIL_CENTER_Y), vec2(THUMBNAIL_SIZE, THUMBNAIL_SIZE));
+    thumbnail(painter, tex, image_rect, &tk);
+    let galley = painter.layout(label.to_string(), egui::FontId::proportional(LABEL_FONT_SIZE), tk.text, rect.width() - LABEL_MARGIN);
+    painter.galley(egui::pos2(rect.center().x - galley.size().x * 0.5, image_rect.bottom() + LABEL_GAP), galley, tk.text);
+
+    let big = if resp.hovered() { big_preview(ui, thumbs, preview) } else { None };
+    resp.on_hover_ui(|ui| hover_preview(ui, tex, big.as_ref(), label))
+}
+
+/// Start rendering during the popup delay once the pointer rests
+fn big_preview(ui: &Ui, thumbs: &mut Thumbs, preview: impl FnOnce() -> ShelfPreview) -> Option<egui::TextureHandle> {
+    let ctx = ui.ctx();
+    let preview = preview();
+    let requested_size_px = (BIG_PREVIEW_SIZE * ctx.pixels_per_point()).round() as usize;
+
+    // High display scales must respect the mask camera's allocation limit
+    let size_px = if matches!(&preview, ShelfPreview::SmartMask(_)) { requested_size_px.clamp(1, MAX_PREVIEW_SIZE_PX) } else { requested_size_px };
+
+    // Scrolling moves tiles beneath a stationary pointer
+    let idle_seconds = ui.input(|input| if input.is_scrolling() { 0.0 } else { input.pointer.time_since_last_movement().min(input.time_since_last_scroll()) });
+    if idle_seconds >= BIG_PREVIEW_DWELL {
+        return thumbs.big(ctx, preview, size_px);
+    }
+
+    ctx.request_repaint_after_secs(BIG_PREVIEW_DWELL - idle_seconds);
+    thumbs.rendered_big(ctx, &preview, size_px)
+}
+
+/// `tex` drawn into `rect`, or a placeholder disc while it renders
+fn thumbnail(painter: &egui::Painter, tex: Option<&egui::TextureHandle>, rect: egui::Rect, tk: &Tokens) {
     match tex {
         Some(t) => {
-            p.image(t.id(), img, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+            painter.image(t.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
         }
         None => {
-            p.circle_filled(img.center(), img.width() * 0.45, tk.row_hover);
+            painter.circle_filled(rect.center(), rect.width() * PLACEHOLDER_RADIUS, tk.row_hover);
         }
     }
-    let galley = p.layout(label.to_string(), egui::FontId::proportional(9.5), tk.text, rect.width() - 4.0);
-    p.galley(egui::pos2(rect.center().x - galley.size().x * 0.5, img.bottom() + 3.0), galley, tk.text);
-    resp.on_hover_ui(|ui| {
-        ui.label(format!("{label}: {hint}"));
-    })
+}
+
+/// Use the thumbnail as a placeholder until the hover preview arrives
+fn hover_preview(ui: &mut Ui, small: Option<&egui::TextureHandle>, big: Option<&egui::TextureHandle>, label: &str) {
+    let tk = Tokens::get(ui.ctx());
+    ui.set_max_width(BIG_PREVIEW_SIZE);
+    ui.vertical_centered(|ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(BIG_PREVIEW_SIZE, BIG_PREVIEW_SIZE), Sense::hover());
+        thumbnail(ui.painter(), big.or(small), rect, &tk);
+        ui.add_space(BIG_PREVIEW_LABEL_GAP);
+        ui.label(label);
+    });
 }

@@ -82,6 +82,26 @@ fn round_trip_is_identical_and_deterministic() {
     assert_same(&builtin, &load_project_bytes(&save_project_bytes(&builtin).unwrap()).unwrap());
 }
 
+#[test]
+fn legacy_bakes_load_as_is_without_layout_conversion() {
+    let mut sample = sample();
+    sample.pf.project.format_version = 1;
+    sample.pf.pixels.layers.clear();
+    let set = &mut sample.pf.project.texture_sets[0];
+    set.resolution = 256;
+    set.uv_tiles = vec![1001, 1002];
+    set.tile_resolutions.insert(1002, 128);
+    let pixels: Vec<f32> = (0..16).flat_map(|y| (0..32).map(move |x| (y * 32 + x) as f32)).collect();
+    sample.pf.baked.insert(0, BakedMaps { resolution: 32, maps: [(BakedMap::AmbientOcclusion, Arc::new(pixels))].into() });
+
+    let loaded = load_project_bytes(&save_project_bytes(&sample.pf).unwrap()).unwrap();
+    assert_eq!(loaded.project.format_version, FORMAT_VERSION);
+    assert_eq!(loaded.baked, sample.pf.baked, "old bake pixels are accepted without preserving their former layout");
+    assert_eq!(loaded.bake_paint, sample.pf.bake_paint, "correction paint remains in the working layout");
+    let reopened = load_project_bytes(&save_project_bytes(&loaded).unwrap()).unwrap();
+    assert_same(&loaded, &reopened);
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn save_and_load_through_files() {

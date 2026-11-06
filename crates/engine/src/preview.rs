@@ -1,7 +1,9 @@
-//! Shelf previews: built-in materials and smart masks evaluated on a unit sphere seen from +Z,
-//! without a mesh or baked maps (generators that need mesh maps are approximated with world-space
-//! noise). Cheap enough for lazily rendered thumbnails.
+//! Shelf previews: built-in materials evaluated on a unit sphere seen from +Z, without a mesh or
+//! baked maps (generators that need mesh maps are approximated with world-space noise), and
+//! library filters. Cheap enough for lazily rendered thumbnails. Smart masks have their own baked
+//! preview ([`crate::mask_preview`]).
 
+use rayon::prelude::*;
 use texturecraft_compose::pattern::{Coords, procedural, world_noise};
 use texturecraft_core::{
     Channel, Effect, EffectKind, Fill, Filter, Generator, GeneratorKind, Layer, LayerKind, Mask, MaskBackground, Procedural, ProceduralKind, Project,
@@ -94,28 +96,34 @@ const CHANNELS: [Channel; 4] = [Channel::BaseColor, Channel::Metallic, Channel::
 
 /// Preview of built-in material `id` (None for an unknown id).
 pub fn material(id: &str, size: usize) -> Option<Vec<Option<Sample>>> {
-    let mut p = Project::new("preview", "");
-    let layers = build(&mut Builder { p: &mut p, channels: CHANNELS.to_vec() }, id).ok()?;
-    Some(
-        sphere_normals(size)
-            .map(|n| {
-                let c = coords(n?);
-                let mut acc = CHANNELS.map(Channel::default_value);
-                for l in layers.iter().filter(|l| l.visible) {
-                    let LayerKind::Fill(f) = &l.kind else { continue };
-                    let w = l.mask.as_ref().map_or(1.0, |m| mask(m, &c));
-                    for (a, ch) in acc.iter_mut().zip(CHANNELS) {
-                        if let (Some(b), Some(v)) = (l.blend(ch), f.sources.get(&ch).and_then(|s| source(s, &f.projection, &c))) {
-                            let t = w * b.opacity.clamp(0.0, 1.0);
-                            *a = [0, 1, 2].map(|k| a[k] + (v[k] - a[k]) * t);
-                        }
+    let mut project = Project::new("preview", "");
+    let layers = build(&mut Builder { p: &mut project, channels: CHANNELS.to_vec() }, id).ok()?;
+
+    // Pixels evaluate independently and big previews take long on one core
+    let normals: Vec<_> = sphere_normals(size).collect();
+    let samples = normals
+        .into_par_iter()
+        .map(|normal| {
+            let at = coords(normal?);
+            let mut values = CHANNELS.map(Channel::default_value);
+            for layer in layers.iter().filter(|l| l.visible) {
+                let LayerKind::Fill(fill) = &layer.kind else { continue };
+
+                let coverage = layer.mask.as_ref().map_or(1.0, |m| mask(m, &at));
+                for (value, channel) in values.iter_mut().zip(CHANNELS) {
+                    let layer_value = fill.sources.get(&channel).and_then(|s| source(s, &fill.projection, &at));
+                    if let (Some(blend), Some(layer_value)) = (layer.blend(channel), layer_value) {
+                        let weight = coverage * blend.opacity.clamp(0.0, 1.0);
+                        *value = [0, 1, 2].map(|k| value[k] + (layer_value[k] - value[k]) * weight);
                     }
                 }
-                let [base, metal, rough, height] = acc;
-                Some(Sample { base, metallic: metal[0], roughness: rough[0], height: height[0] })
-            })
-            .collect(),
-    )
+            }
+
+            let [base, metal, rough, height] = values;
+            Some(Sample { base, metallic: metal[0], roughness: rough[0], height: height[0] })
+        })
+        .collect();
+    Some(samples)
 }
 
 /// `f` with its reach in texels multiplied by `k` (previews show at a fraction of 2K).
@@ -164,6 +172,7 @@ pub fn filter(id: &str, size: usize) -> Option<Vec<Option<Sample>>> {
         gbuf: &gbuf,
         pixels: &pixels,
         baked: &baked,
+        block_scales: p.texture_set(0).map(|set| set.block_scales()).unwrap_or_default(),
         preview: None,
         images: &images,
         bounds: mesh.bounds(),
@@ -183,13 +192,6 @@ pub fn filter(id: &str, size: usize) -> Option<Vec<Option<Sample>>> {
     )
 }
 
-/// Preview of smart mask `id`: the mask value per pixel (None for an unknown id).
-pub fn smart_mask(id: &str, size: usize) -> Option<Vec<Option<f32>>> {
-    let (bg, fx) = crate::smart_masks::preset(id)?;
-    let m = crate::smart_masks::build_mask(&mut Project::new("preview", ""), bg, fx);
-    Some(sphere_normals(size).map(|n| n.map(|n| mask(&m, &coords(n)))).collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,11 +204,7 @@ mod tests {
             assert!(center.base.iter().chain([&center.metallic, &center.roughness, &center.height]).all(|v| v.is_finite()), "{}", m.id);
             assert!(px[0].is_none(), "corners are outside the sphere");
         }
-        for sm in crate::smart_masks::SMART_MASKS {
-            let px = smart_mask(sm.id, 16).unwrap_or_else(|| panic!("{}", sm.id));
-            assert!(px.iter().flatten().all(|v| (0.0..=1.0).contains(v)), "{}", sm.id);
-        }
-        assert!(material("nope", 8).is_none() && smart_mask("nope", 8).is_none() && filter("nope", 8).is_none());
+        assert!(material("nope", 8).is_none() && filter("nope", 8).is_none());
         for f in crate::filter_lib::FILTERS {
             let px = filter(f.id, 24).unwrap_or_else(|| panic!("{}", f.id));
             let center = px[12 * 24 + 12].unwrap_or_else(|| panic!("{}", f.id));

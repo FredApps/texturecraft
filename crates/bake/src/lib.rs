@@ -143,14 +143,20 @@ fn alloc<T: Clone>(count: usize, value: T) -> Result<Vec<T>, BakeError> {
 }
 
 pub fn bake(request: &BakeRequest, progress: &Progress) -> Result<BakeOutput, BakeError> {
-    bake_in_strips(request, progress, STRIP_TEXELS, &CpuTracer)
+    bake_in_strips(request, progress, STRIP_TEXELS, &CpuTracer, &[])
 }
 
 /// Retry on the CPU if the supplied tracer fails
 pub fn bake_on(request: &BakeRequest, progress: &Progress, tracer: &dyn Tracer) -> Result<BakeOutput, BakeError> {
-    match bake_in_strips(request, progress, STRIP_TEXELS, tracer) {
+    bake_tiles(request, progress, &[], Some(tracer))
+}
+
+/// Excluded atlas blocks produce no samples; their geometry still participates in ray tracing
+pub fn bake_tiles(request: &BakeRequest, progress: &Progress, excluded_tiles: &[(u32, u32)], tracer: Option<&dyn Tracer>) -> Result<BakeOutput, BakeError> {
+    let tracer = tracer.unwrap_or(&CpuTracer);
+    match bake_in_strips(request, progress, STRIP_TEXELS, tracer, excluded_tiles) {
         Err(BakeError::Tracer(error)) => {
-            let mut output = bake(request, progress)?;
+            let mut output = bake_in_strips(request, progress, STRIP_TEXELS, &CpuTracer, excluded_tiles)?;
             output.tracer = format!("CPU ({} unavailable: {error})", tracer.name());
             Ok(output)
         }
@@ -160,8 +166,18 @@ pub fn bake_on(request: &BakeRequest, progress: &Progress, tracer: &dyn Tracer) 
 
 type OutRow<'a> = Vec<&'a mut [f32]>;
 
-fn bake_in_strips(request: &BakeRequest, progress: &Progress, strip_texels: usize, tracer: &dyn Tracer) -> Result<BakeOutput, BakeError> {
+fn bake_in_strips(
+    request: &BakeRequest,
+    progress: &Progress,
+    strip_texels: usize,
+    tracer: &dyn Tracer,
+    excluded_tiles: &[(u32, u32)],
+) -> Result<BakeOutput, BakeError> {
     validate(request)?;
+    if excluded_tiles.iter().any(|(column, row)| *column >= request.tiles.0 || *row >= request.tiles.1) {
+        return Err(BakeError::Invalid("excluded UV tile lies outside the bake atlas".into()));
+    }
+
     let settings = request.settings;
     let (tile_width, tile_height) = settings.common.output_size();
     let tile_size = (tile_width as usize, tile_height as usize);
@@ -196,7 +212,17 @@ fn bake_in_strips(request: &BakeRequest, progress: &Progress, strip_texels: usiz
         let (sample_start_y, strip_sample_height) = (strip_start * samples_per_axis, rows * samples_per_axis);
         strip_mesh.uvs =
             request.mesh.uvs.iter().map(|uv| Vec2::new(uv.x, (uv.y * sample_height as f32 - sample_start_y as f32) / strip_sample_height as f32)).collect();
-        let gbuffer = UvGBuffer::new(&strip_mesh, request.material, sample_width as u32, strip_sample_height as u32);
+        let mut gbuffer = UvGBuffer::new(&strip_mesh, request.material, sample_width as u32, strip_sample_height as u32);
+        for &(column, row) in excluded_tiles {
+            let start_x = column as usize * tile_size.0 * samples_per_axis;
+            let start_y = row as usize * tile_size.1 * samples_per_axis;
+            let end_y = (start_y + tile_size.1 * samples_per_axis).min(sample_start_y + strip_sample_height);
+            for sample_y in start_y.max(sample_start_y)..end_y {
+                let first = (sample_y - sample_start_y) * sample_width + start_x;
+                gbuffer.tri.get_mut(first..first + tile_size.0 * samples_per_axis).ok_or_else(strip_error)?.fill(NO_TRI);
+            }
+        }
+
         let coverage_rows = covered.get_mut(strip_start * width..(strip_start + rows) * width).ok_or_else(strip_error)?;
         coverage_rows.par_chunks_mut(width).enumerate().for_each(|(row_index, row)| {
             for (x, covered_pixel) in row.iter_mut().enumerate() {

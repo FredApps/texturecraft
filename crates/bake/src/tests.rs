@@ -17,6 +17,9 @@ use super::*;
 #[path = "test/setting.rs"]
 mod setting;
 
+#[path = "test/tile_selection.rs"]
+mod tile_selection;
+
 fn settings(resolution: u32, maps: &[BakedMap]) -> BakeSettings {
     with_rays(
         {
@@ -307,7 +310,7 @@ fn strips_match_a_single_pass() {
         tiles: (1, 1),
     };
     let whole = bake(&req, &Progress::new()).unwrap();
-    let strips = bake_in_strips(&req, &Progress::new(), 128 * 2, &CpuTracer).unwrap();
+    let strips = bake_in_strips(&req, &Progress::new(), 128 * 2, &CpuTracer, &[]).unwrap();
     for (map, a) in &whole.maps {
         let b = &strips.maps[map];
         let off = a.iter().zip(b).filter(|(a, b)| (*a - *b).abs() > 1e-3).count();

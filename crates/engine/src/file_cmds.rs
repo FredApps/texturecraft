@@ -132,7 +132,7 @@ impl Session {
     fn material_files(&mut self, opts: ExportOptions, tiled: bool, materials: usize) -> Result<Vec<Vec<ExportedFile>>> {
         let opts = ExportOptions { atlas: true, ..opts };
         (0..materials)
-            .map(|m| match self.doc.project.texture_sets.iter().position(|t| t.material == m) {
+            .map(|m| match self.texture_set_of_material(m) {
                 Some(ts) if tiled || self.doc.project.texture_sets.get(ts).is_some_and(|t| t.tile_grid().is_none()) => self.export_files(&[ts], &opts),
                 _ => Ok(Vec::new()),
             })
@@ -448,6 +448,7 @@ impl Session {
         let mut next = Session::new(doc, mesh, source)?;
         next.log.extend(warnings);
         next.path = self.path.clone();
+        next.modified = true;
         let preserved = preserve_strokes.then(|| crate::preserve::preserve_strokes(self, &mut next));
         self.switch_to(next);
         Ok(preserved.map_or(Value::Null, |n| json!({ "preserved": n })))
@@ -609,6 +610,16 @@ fn close(s: &mut Session, _: &Value) -> Result<Value> {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reimporting_a_saved_project_marks_it_modified() {
+        let obj = b"v -1 -1 0\nv 1 -1 0\nv 1 1 0\nvt 0 0\nvt 1 0\nvt 1 1\nf 1/1 2/2 3/3\n";
+        let original = Session::from_mesh_bytes("mesh.obj", obj, 128, "mesh").unwrap();
+        let mut saved = Session::from_project_bytes(&original.to_project_bytes().unwrap()).unwrap();
+        assert!(!saved.modified);
+        crate::execute(&mut saved, "file.reimportMesh", &Value::Null).unwrap();
+        assert!(saved.modified, "reimport must trigger the unsaved-changes prompt");
+    }
 
     #[test]
     fn export_mesh_writes_obj_by_default_and_textured_glb() {

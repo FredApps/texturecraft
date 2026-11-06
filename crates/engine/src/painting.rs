@@ -35,6 +35,16 @@ impl Session {
         pick(&ctx, screen)
     }
 
+    /// The texture set that paints mesh material `material` (a [`SurfaceHit::material`])
+    pub fn texture_set_of_material(&self, material: usize) -> Option<usize> {
+        self.doc.project.texture_sets.iter().position(|t| t.material == material)
+    }
+
+    /// The texture set of the surface under viewport pixel `screen`
+    pub fn texture_set_at(&self, screen: Vec2, viewport: Vec2) -> Option<usize> {
+        self.pick(screen, viewport).and_then(|hit| self.texture_set_of_material(hit.material))
+    }
+
     /// Resolve what a stroke on the selected layer paints into, creating the mask paint effect
     /// when painting a mask. Must run inside the stroke's history snapshot.
     fn paint_target(&mut self) -> Result<PaintTarget> {
@@ -560,7 +570,7 @@ impl Session {
     /// Color picker: copy the material under the cursor into the tool's paint values.
     pub fn color_pick(&mut self, screen: Vec2, viewport: Vec2) -> Result<BTreeMap<Channel, [f32; 3]>> {
         let hit = self.pick(screen, viewport).ok_or_else(|| EngineError::Other("nothing under the cursor".into()))?;
-        let ts = self.doc.project.texture_sets.iter().position(|t| t.material == hit.material).unwrap_or(self.ts());
+        let ts = self.texture_set_of_material(hit.material).unwrap_or(self.ts());
         let cache = self.caches.get(ts).ok_or_else(|| EngineError::Other("texture set not ready".into()))?;
         let (w, h) = (cache.size.0 as f32, cache.size.1 as f32);
         let (x, y) = ((hit.uv.x * w).clamp(0.0, w - 1.0) as u32, (hit.uv.y * h).clamp(0.0, h - 1.0) as u32);

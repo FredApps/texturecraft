@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+mod baked_maps;
 pub mod below;
 pub mod display;
 pub mod eval;
@@ -17,6 +18,6 @@ pub use below::{BelowCache, StackKey};
 pub use display::{DisplayKind, tile_bytes};
 pub use eval::{
     Composite, Inputs, PaintTarget, Stencil, StrokePreview, all_tiles, composite_tiles, composite_tiles_cached, covered_tiles, effect_histogram, flatten_layer,
-    mask_image, pad_tiles,
+    mask_at, mask_image, pad_tiles,
 };
 pub use store::{BakedMaps, ImageRes, ImageStore, PixelStore};

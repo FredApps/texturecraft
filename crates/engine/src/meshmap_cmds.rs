@@ -59,7 +59,7 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         None => resample(map.components(), (res, height), directx, |u, v| img.sample(u, v)),
         // An atlas texel reads the image of the tile its mesh UV falls in.
         Some((grid, imgs)) => resample(map.components(), (res, height), directx, |u, v| {
-            let uv = set.from_atlas(grid, [u, v]);
+            let uv = grid.from_atlas([u, v]);
             udim_at(uv).and_then(|t| imgs.get(&t)).map_or([0.0; 4], |img| img.sample(uv[0] - uv[0].floor(), uv[1] - uv[1].floor()))
         }),
     };

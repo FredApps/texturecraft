@@ -1,7 +1,8 @@
 use super::MergedHigh;
 use crate::{EngineError, Result};
 use std::sync::Arc;
-use texturecraft_bake::{BakeOutput, BakePaintMap, BakeRequest, HighPoly, Progress, bake, bake_on, tracing::Tracer};
+use texturecraft_bake::{BakeOutput, BakePaintMap, BakeRequest, HighPoly, Progress, bake_tiles, tracing::Tracer};
+use texturecraft_compose::BakedMaps;
 use texturecraft_core::BakeSettings;
 use texturecraft_geom::{Bvh, Mesh};
 
@@ -20,6 +21,9 @@ pub struct BakeTask {
     pub cage_paint: Option<Arc<BakePaintMap>>,
     /// UV tile grid (columns, rows) of the set; (1, 1) without UV tiles.
     pub tiles: (u32, u32),
+    /// Snapshot of tile selection and pixels to retain while the worker runs
+    pub excluded_tiles: Vec<(u32, u32)>,
+    pub previous_maps: BakedMaps,
     /// The GPU ray tracer, if installed and not turned off (`bake.run {cpu: true}`).
     pub tracer: Option<Arc<dyn Tracer>>,
 }
@@ -40,10 +44,9 @@ impl BakeTask {
             cage_paint: self.cage_paint.as_deref(),
             tiles: self.tiles,
         };
-        match &self.tracer {
-            Some(tracer) => bake_on(&request, progress, tracer.as_ref()),
-            None => bake(&request, progress),
-        }
-        .map_err(|e| EngineError::Other(format!("bake failed: {e}")))
+        let mut output = bake_tiles(&request, progress, &self.excluded_tiles, self.tracer.as_deref())
+            .map_err(|error| EngineError::Other(format!("bake failed: {error}")))?;
+        super::preserve_tiles::restore(&mut output, &self.previous_maps, &self.excluded_tiles, self.tiles)?;
+        Ok(output)
     }
 }

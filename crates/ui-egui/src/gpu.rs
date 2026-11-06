@@ -216,8 +216,14 @@ impl GpuLink {
                     if self.aux.get(&ts) == Some(&key) {
                         continue;
                     }
-                    let res = s.caches.get(ts).map_or(1024, |c| texturecraft_render::aux_size(c.size));
-                    out.aux.push((ts, res, texturecraft_render::mesh_maps::mesh_map_rgba(s.doc.baked.get(&ts), m, res)));
+                    let Some(cache) = s.caches.get(ts) else { continue };
+
+                    let res = texturecraft_render::aux_size(cache.size);
+                    out.aux.push((
+                        ts,
+                        res,
+                        texturecraft_render::mesh_maps::mesh_map_rgba(s.doc.baked.get(&ts), m, res, cache.size, &cache.composite.block_scales),
+                    ));
                     self.aux.insert(ts, key);
                 }
             }

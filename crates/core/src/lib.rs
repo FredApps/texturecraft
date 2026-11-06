@@ -9,6 +9,7 @@
 
 pub mod bake;
 pub mod blend;
+mod block_scales;
 pub mod channel;
 pub mod layer;
 pub mod project;
