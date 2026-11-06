@@ -9,6 +9,7 @@
 
 pub mod bake_mode;
 pub mod control;
+mod decal_drop;
 pub mod dock;
 pub mod docking;
 pub mod export_templates;

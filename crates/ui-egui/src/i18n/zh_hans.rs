@@ -430,6 +430,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Magenta / green", "洋红 / 绿色"),
     ("Main shader", "主着色器"),
     ("Marble veins", "大理石纹"),
+    ("Mask", "遮罩"),
     ("Mask Editor: Edge wear", "遮罩编辑器：边缘磨损"),
     ("Mask value (gray)", "遮罩值（灰度）"),
     ("Mask with height", "用高度遮罩"),

@@ -463,6 +463,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Magenta / green", "마젠타 / 녹색"),
     ("Main shader", "메인 셰이더"),
     ("Marble veins", "대리석 무늬"),
+    ("Mask", "마스크"),
     ("Mask Editor: Edge wear", "마스크 에디터: 모서리 마모"),
     ("Mask value (gray)", "마스크 값 (회색)"),
     ("Mask with height", "높이로 마스크"),

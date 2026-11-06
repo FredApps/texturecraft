@@ -481,6 +481,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Magenta / green", "Magenta / verde"),
     ("Main shader", "Shader principale"),
     ("Marble veins", "Venature marmo"),
+    ("Mask", "Maschera"),
     ("Mask Editor: Edge wear", "Editor maschera: Usura bordi"),
     ("Mask value (gray)", "Valore maschera (grigio)"),
     ("Mask with height", "Maschera con altezza"),
