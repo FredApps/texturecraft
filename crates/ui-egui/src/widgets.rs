@@ -4,6 +4,7 @@
 use craft_ui::buttons::{ButtonVisuals, IconButton, IconButtonStyle};
 use egui::{Color32, CornerRadius, Response, RichText, Sense, Stroke, Ui, vec2};
 
+use crate::i18n::tr;
 use crate::theme::Tokens;
 
 /// The drag-and-drop payload of type `T` released on `resp` this frame. Unlike
@@ -261,23 +262,62 @@ pub(crate) fn section_chevron(ui: &Ui, is_open: bool) -> RichText {
 
 /// A collapsible section header with a chevron
 pub fn section(ui: &mut Ui, id: &str, title: &str, default_open: bool, body: impl FnOnce(&mut Ui)) {
+    collapsible_section(ui, id, title, default_open, None, body);
+}
+
+/// A [`section`] whose header ends in a reset icon, inert while `at_default`; true when clicked
+pub fn section_with_reset(ui: &mut Ui, id: &str, title: &str, default_open: bool, at_default: bool, body: impl FnOnce(&mut Ui)) -> bool {
+    collapsible_section(ui, id, title, default_open, Some(at_default), body)
+}
+
+/// Glyph size of a section header's reset icon
+const SECTION_RESET_ICON_SIZE: f32 = 14.0;
+
+/// How much of `text_dim` the reset icon keeps while its section is at its defaults
+const SECTION_RESET_AT_DEFAULT_OPACITY: f32 = 0.4;
+
+/// The header row and body of [`section`]; `reset_at_default` adds the reset icon
+fn collapsible_section(ui: &mut Ui, id: &str, title: &str, default_open: bool, reset_at_default: Option<bool>, body: impl FnOnce(&mut Ui)) -> bool {
     let tokens = Tokens::get(ui.ctx());
     let id = ui.make_persistent_id(id);
     let mut collapsing_state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, default_open);
-    let response = ui
-        .horizontal(|ui| {
-            ui.add(egui::Label::new(section_chevron(ui, collapsing_state.is_open())).selectable(false));
-            ui.add(egui::Label::new(RichText::new(title).strong().color(tokens.text_strong)).selectable(false));
-        })
-        .response
-        .interact(Sense::click());
-    if response.clicked() {
+
+    let mut reset_rect = None;
+    let header = ui.horizontal(|ui| {
+        ui.add(egui::Label::new(section_chevron(ui, collapsing_state.is_open())).selectable(false));
+        ui.add(egui::Label::new(RichText::new(title).strong().color(tokens.text_strong)).selectable(false));
+        if reset_at_default.is_some() {
+            let icon_size = vec2(SECTION_RESET_ICON_SIZE, SECTION_RESET_ICON_SIZE);
+            reset_rect = Some(ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.allocate_exact_size(icon_size, Sense::hover()).0).inner);
+        }
+    });
+    if header.response.interact(Sense::click()).clicked() {
         collapsing_state.toggle(ui);
+    }
+
+    // Registered after the header so the icon, not the header, takes its clicks
+    let mut reset_clicked = false;
+    if let (Some(at_default), Some(rect)) = (reset_at_default, reset_rect) {
+        let response = ui.interact(rect, id.with("reset"), Sense::click()).on_hover_text(tr("Reset to defaults"));
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, !at_default, tr("Reset to defaults")));
+
+        let color = if at_default {
+            tokens.text_dim.gamma_multiply(SECTION_RESET_AT_DEFAULT_OPACITY)
+        } else if response.hovered() {
+            tokens.text_strong
+        } else {
+            tokens.text_dim
+        };
+        let font = egui::FontId::proportional(SECTION_RESET_ICON_SIZE);
+        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, egui_phosphor::regular::CLOCK_COUNTER_CLOCKWISE, font, color);
+        reset_clicked = response.clicked() && !at_default;
     }
 
     collapsing_state.show_body_unindented(ui, |ui| {
         ui.indent(id.with("in"), body);
     });
+
+    reset_clicked
 }
 
 /// A channel chip ("color", "metal", "rough"…): toggled = the accent-tinted well.

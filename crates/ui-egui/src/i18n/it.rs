@@ -682,6 +682,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Rescan the library folder", "Ripeti la scansione della cartella della libreria"),
     ("Reset UI", "Ripristina interfaccia"),
     ("Reset all", "Ripristina tutto"),
+    ("Reset to defaults", "Ripristina i valori predefiniti"),
     ("Reset to {shortcut}", "Ripristina {shortcut}"),
     ("Resizing", "Ridimensionamento"),
     ("Restore every default shortcut", "Ripristina tutte le scorciatoie predefinite"),

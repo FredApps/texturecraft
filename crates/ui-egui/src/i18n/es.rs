@@ -673,6 +673,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Rescan the library folder", "Volver a examinar la carpeta de la biblioteca"),
     ("Reset UI", "Restablecer interfaz"),
     ("Reset all", "Restablecer todo"),
+    ("Reset to defaults", "Restablecer valores predeterminados"),
     ("Reset to {shortcut}", "Restablecer a {shortcut}"),
     ("Resizing", "Redimensionando"),
     ("Restore every default shortcut", "Restaurar todos los atajos predeterminados"),
