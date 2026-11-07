@@ -1129,6 +1129,7 @@ impl<'a, 'b> Texel<'a, 'b> {
         w * image.map_or(1.0, |img| img.sample(c.uv.x, c.uv.y)[3].clamp(0.0, 1.0))
     }
 
+    /// The value `source` gives this texel through `projection`, read as a channel of `kind`
     fn source(&mut self, source: &Source, projection: &Projection, kind: ChannelKind) -> [f32; 3] {
         match source {
             Source::Uniform(value) => *value,

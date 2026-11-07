@@ -13,6 +13,7 @@ use texturecraft_engine::{Tool, ViewMode};
 use texturecraft_render::{Frame, SetHighlight, Shade, ViewKind};
 
 use crate::TextureCraftApp;
+use crate::decal_drop::DecalDrop;
 use crate::gpu::ViewCallback;
 use crate::i18n::{tr, trf};
 use crate::state::ViewLayout;
@@ -571,7 +572,8 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         && !focus_pick
         && placing.is_none()
         && touch.is_none()
-        && !decal_drag;
+        && !decal_drag
+        && !DecalDrop::waiting(ui.ctx());
     let path_tool = app.session.tool.tool == Tool::Path;
     let viewport = app.session.viewport;
     let show = |app: &TextureCraftApp, point: Vec3| project(app, rect, point);
@@ -1236,7 +1238,8 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     crate::properties_popup::open_on_right_click(app, ui, &response, rect, v_held);
 
     // Painting in UV space
-    let painting = app.ui.mode == crate::state::Mode::Painting && app.properties_popup.is_none() && !alt && !adjusting && !v_held;
+    let painting =
+        app.ui.mode == crate::state::Mode::Painting && app.properties_popup.is_none() && !alt && !adjusting && !v_held && !DecalDrop::waiting(ui.ctx());
     if painting && path_tool {
         path_input(app, ui, &response, true, |_, pointer| Some(to_uv(pointer).extend(0.0)), show);
     } else if painting {

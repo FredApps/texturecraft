@@ -25,6 +25,7 @@ pub struct DecalDrop {
 }
 
 impl DecalDrop {
+    /// Where the waiting drop and its menu's state are kept
     fn menu_id() -> Id {
         Id::unique("decal_drop_menu")
     }
@@ -32,6 +33,11 @@ impl DecalDrop {
     /// Open the menu for this drop (replacing any other waiting drop): it stays open while the drop waits
     pub fn open(self, ui: &Ui) {
         ui.ctx().data_mut(|data| data.insert_temp(Self::menu_id(), self));
+    }
+
+    /// Whether a drop waits for its menu pick: the views don't paint meanwhile, so the click that dismisses the menu paints nothing
+    pub fn waiting(ctx: &egui::Context) -> bool {
+        ctx.data(|data| data.get_temp::<DecalDrop>(Self::menu_id()).is_some())
     }
 
     /// Show the waiting drop's menu over the 3D view `response`; a pick places the decal, a click elsewhere drops nothing

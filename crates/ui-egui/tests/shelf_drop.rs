@@ -3,6 +3,7 @@
 use egui::{Event, Modifiers, PointerButton, Pos2};
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
+use texturecraft_engine::Tool;
 use texturecraft_engine::core::Channel;
 use texturecraft_engine::geom::glam::Vec2;
 use texturecraft_ui_egui::TextureCraftApp;
@@ -125,10 +126,14 @@ fn an_image_drop_places_nothing_until_a_pick_and_nothing_on_the_background() {
     let (stacks, history) = (stack_sizes(&harness), harness.state().session.history_labels().len());
     assert!(menu_open(&harness, position));
 
-    // A click elsewhere closes the menu
-    let corner = harness.state().viewport_rect.min + egui::vec2(SEARCH_STEP, SEARCH_STEP);
-    harness.event(Event::PointerButton { pos: corner, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
-    harness.event(Event::PointerButton { pos: corner, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+    // A click elsewhere on the mesh closes the menu and fills nothing there (a polygon fill click records a step in this harness)
+    harness.state_mut().session.tool.tool = Tool::PolygonFill;
+    let elsewhere = point_over(&harness, Some(0));
+    harness.hover_at(elsewhere);
+    harness.run_steps(1);
+    harness.event(Event::PointerButton { pos: elsewhere, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+    harness.run_steps(1);
+    harness.event(Event::PointerButton { pos: elsewhere, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
     harness.run_steps(2);
     assert!(!menu_open(&harness, position));
     assert_eq!(stack_sizes(&harness), stacks);
