@@ -358,6 +358,9 @@ fn a_project_too_big_to_reopen_is_not_saved() {
     let err = check_loadable(&s.pf, size - 1).unwrap_err();
     assert!(matches!(err, FormatError::TooLarge(_)));
     assert!(err.to_string().contains("nothing was saved"), "{err}");
+    // Exact byte counts: a size just over the limit does not read as the limit.
+    let msg = err.to_string();
+    assert!(msg.contains(&format!("({size} bytes)")) && msg.contains(&format!("({} bytes)", size - 1)), "{msg}");
 }
 
 #[cfg(not(target_arch = "wasm32"))]

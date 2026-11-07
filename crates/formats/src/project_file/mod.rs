@@ -147,7 +147,7 @@ fn check_loadable(pf: &ProjectFile, limit: u64) -> Result<()> {
     if size > limit {
         let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
         return Err(FormatError::TooLarge(format!(
-            "the project holds {:.2} GiB of data once unpacked, but TextureCraft opens project files only up to {:.2} GiB, so nothing was saved and an existing file is unchanged. \
+            "the project holds {:.2} GiB ({size} bytes) of data once unpacked, but TextureCraft opens project files only up to {:.2} GiB ({limit} bytes), so nothing was saved and an existing file is unchanged. \
              Remove paint layers or baked maps to make it smaller",
             gib(size),
             gib(limit)
