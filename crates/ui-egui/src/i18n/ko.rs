@@ -80,6 +80,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Apply", "적용"),
     ("ArtCraft website...", "ArtCraft 웹사이트..."),
     ("Assets", "에셋"),
+    ("Auto", "자동"),
     ("Automatic (from the mesh UVs)", "자동 (메시 UV 기준)"),
     ("Autosave every", "자동 저장 간격"),
     (
@@ -317,6 +318,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Filters", "필터"),
     ("Fine noise", "미세 노이즈"),
     ("Fingerprints", "지문"),
+    ("Fit the input range to the histogram", "입력 범위를 히스토그램에 맞추기"),
     ("Flatten layer", "레이어 병합"),
     ("Flips the image's green channel, for normal maps made with Y pointing down", "이미지의 녹색 채널을 뒤집습니다 (Y가 아래를 향하도록 만든 노멀 맵용)"),
     ("Flow", "흐름"),
@@ -653,6 +655,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Replacement color", "대체 색상"),
     ("Report a bug...", "버그 신고..."),
     ("Rescan the library folder", "라이브러리 폴더를 다시 검색합니다"),
+    ("Reset", "초기화"),
     ("Reset UI", "UI 초기화"),
     ("Reset all", "모두 초기화"),
     ("Reset to {shortcut}", "{shortcut}(으)로 초기화"),

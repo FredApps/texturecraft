@@ -142,31 +142,6 @@ fn track(ui: &Ui, resp: &Response, x: std::ops::RangeInclusive<f32>, y: f32, t: 
     p.circle(egui::pos2(xk, y), knob, tk.panel, Stroke::new(1.5, ring));
 }
 
-/// A histogram of `counts` (buckets over 0..1, scaled to the fullest) in a field-colored well
-/// the width of the panel, the part of 0..1 outside `range` dimmed.
-pub fn histogram(ui: &mut Ui, counts: &[u32], range: (f32, f32)) -> Response {
-    let tk = Tokens::get(ui.ctx());
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 56.0), Sense::hover());
-    let p = ui.painter_at(rect);
-    p.rect(rect, CornerRadius::same(tk.radius), tk.field, Stroke::new(1.0, tk.field_border), egui::StrokeKind::Inside);
-    let inner = rect.shrink(3.0);
-    let max = counts.iter().copied().max().unwrap_or(0).max(1) as f32;
-    let w = inner.width() / counts.len().max(1) as f32;
-    for (i, c) in counts.iter().enumerate() {
-        let h = inner.height() * *c as f32 / max;
-        let x = inner.left() + i as f32 * w;
-        p.rect_filled(egui::Rect::from_min_max(egui::pos2(x, inner.bottom() - h), egui::pos2(x + w, inner.bottom())), 0.0, tk.text_dim);
-    }
-    let x = |t: f32| inner.left() + inner.width() * t.clamp(0.0, 1.0);
-    let shade = tk.field.gamma_multiply(0.7);
-    p.rect_filled(egui::Rect::from_x_y_ranges(inner.left()..=x(range.0), inner.y_range()), 0.0, shade);
-    p.rect_filled(egui::Rect::from_x_y_ranges(x(range.1)..=inner.right(), inner.y_range()), 0.0, shade);
-    for t in [range.0, range.1] {
-        p.line_segment([egui::pos2(x(t), inner.top()), egui::pos2(x(t), inner.bottom())], Stroke::new(1.0, tk.accent));
-    }
-    resp
-}
-
 /// One line of `text` cut with "…" to fit `max_width`, for list rows that shrink with their panel.
 pub fn elided(painter: &egui::Painter, text: impl Into<String>, size: f32, color: Color32, max_width: f32) -> std::sync::Arc<egui::Galley> {
     let mut job = egui::text::LayoutJob::simple_singleline(text.into(), egui::FontId::proportional(size), color);

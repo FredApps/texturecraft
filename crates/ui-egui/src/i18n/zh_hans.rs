@@ -71,6 +71,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Apply", "应用"),
     ("ArtCraft website...", "ArtCraft 网站..."),
     ("Assets", "资产"),
+    ("Auto", "自动"),
     ("Automatic (from the mesh UVs)", "自动（基于网格 UV）"),
     ("Autosave every", "自动保存间隔"),
     (
@@ -290,6 +291,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Filters", "滤镜"),
     ("Fine noise", "细噪波"),
     ("Fingerprints", "指纹"),
+    ("Fit the input range to the histogram", "使输入范围适合直方图"),
     ("Flatten layer", "合并图层"),
     ("Flips the image's green channel, for normal maps made with Y pointing down", "翻转图像的绿色通道，用于 Y 轴朝下制作的法线贴图"),
     ("Flow", "流量"),
@@ -614,6 +616,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Replacement color", "替换后的颜色"),
     ("Report a bug...", "报告错误..."),
     ("Rescan the library folder", "重新扫描库文件夹"),
+    ("Reset", "重置"),
     ("Reset UI", "重置界面"),
     ("Reset all", "全部重置"),
     ("Reset to {shortcut}", "重置为 {shortcut}"),
