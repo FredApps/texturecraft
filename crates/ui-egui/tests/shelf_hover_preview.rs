@@ -145,14 +145,24 @@ fn scrolling_with_a_stationary_pointer_defers_the_big_preview() {
 
 #[test]
 fn high_dpi_smart_mask_hover_stays_within_the_renderer_limit() {
-    use texturecraft_engine::mask_preview::MAX_PREVIEW_SIZE_PX;
     use texturecraft_engine::smart_masks::SMART_MASKS;
 
+    check_high_dpi_orb_hover(2, SMART_MASKS[0].label);
+}
+
+#[test]
+fn high_dpi_smart_material_hover_stays_within_the_renderer_limit() {
+    check_high_dpi_orb_hover(1, "Steel Painted Worn");
+}
+
+fn check_high_dpi_orb_hover(shelf_tab: usize, label: &str) {
+    use texturecraft_engine::orb_preview::MAX_PREVIEW_SIZE_PX;
+
     let (mut harness, _) = materials_shelf(1.0 / 4.0, 3.0);
-    harness.state_mut().ui.shelf_tab = 2;
+    harness.state_mut().ui.shelf_tab = shelf_tab;
     harness.run_steps(4);
     assert_eq!(harness.ctx.pixels_per_point(), 3.0, "the test uses the native 300% display scale");
-    harness.get_by_label(SMART_MASKS[0].label).hover();
+    harness.get_by_role_and_label(egui::Role::Button, label).hover();
 
     let expected = Some([MAX_PREVIEW_SIZE_PX; 2]);
     let started = Instant::now();

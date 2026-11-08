@@ -2,7 +2,7 @@
 
 use egui::{Color32, ColorImage};
 use texturecraft_engine::geom::glam::Vec3;
-use texturecraft_engine::mask_preview::MaskPreviewPixel;
+use texturecraft_engine::orb_preview::MaskPreviewPixel;
 use texturecraft_engine::texel::linear_to_srgb;
 
 /// View-space lighting uses an upper-left key and a weaker right fill

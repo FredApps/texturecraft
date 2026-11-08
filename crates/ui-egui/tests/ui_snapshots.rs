@@ -250,3 +250,55 @@ fn smart_mask_shelf_snapshot() {
     assert_eq!(harness.query_all_by_label(mask.label).count(), 2, "the popup shows the mask name");
     save(&mut harness, &output_dir, "smart-mask-hover");
 }
+
+#[test]
+#[ignore]
+fn smart_material_shelf_snapshot() {
+    use texturecraft_engine::materials::MATERIALS;
+    use texturecraft_ui_egui::shelf_preview::ShelfPreview;
+
+    let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else {
+        eprintln!("set TC_UI_SNAPSHOTS=<dir> to write the pictures");
+        return;
+    };
+
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let session =
+        texturecraft_engine::Session::new_project("Smart material previews", texturecraft_engine::geom::primitives::cube(2.0), "builtin:cube", None, 128)
+            .unwrap();
+    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|context| {
+        let render_state = context.wgpu_render_state.as_ref().expect("the snapshot uses wgpu");
+        eprintln!("snapshot adapter: {:?}", render_state.adapter.get_info());
+        TextureCraftApp::new(context, session)
+    });
+    harness.state_mut().ui.shelf_tab = 1;
+    let context = harness.ctx.clone();
+    let started = std::time::Instant::now();
+    loop {
+        harness.run_steps(1);
+        let thumbnails = &mut harness.state_mut().thumbs;
+        if MATERIALS.iter().filter(|material| material.smart).all(|material| thumbnails.material(&context, material.id).is_some()) {
+            break;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(120), "smart material thumbnails did not arrive");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    eprintln!("all smart material thumbnails ready after {:.3} s", started.elapsed().as_secs_f64());
+    save(&mut harness, &output_dir, "smart-material-shelf");
+
+    let material = MATERIALS.iter().find(|material| material.id == "steel_painted_worn").unwrap();
+    harness.get_by_role_and_label(egui::Role::Button, material.label).hover();
+    let preview = ShelfPreview::material(material.id);
+    let started = std::time::Instant::now();
+    loop {
+        harness.run_steps(1);
+        if harness.state_mut().thumbs.rendered_big(&context, &preview, 256).is_some() {
+            break;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(60), "smart material hover preview did not arrive");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    harness.run_steps(60);
+    assert_eq!(harness.query_all_by_label(material.label).count(), 2, "the popup shows the material name");
+    save(&mut harness, &output_dir, "smart-material-hover");
+}

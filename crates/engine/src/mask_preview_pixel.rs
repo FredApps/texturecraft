@@ -1,4 +1,4 @@
-//! One pixel of a smart mask preview (see [`crate::mask_preview::MaskPreview`]).
+//! One pixel of a smart mask preview (see [`crate::orb_preview::OrbPreview::mask`])
 
 use texturecraft_geom::glam::Vec3;
 

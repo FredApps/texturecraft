@@ -12,8 +12,8 @@ use texturecraft_engine::filter_lib::FILTERS;
 #[cfg(not(target_arch = "wasm32"))]
 use texturecraft_engine::formats::mcmat::MCMAT_EXT;
 use texturecraft_engine::geom::glam::Vec2;
-use texturecraft_engine::mask_preview::MAX_PREVIEW_SIZE_PX;
 use texturecraft_engine::materials::MATERIALS;
+use texturecraft_engine::orb_preview::MAX_PREVIEW_SIZE_PX;
 use texturecraft_engine::paint::alphas;
 use texturecraft_engine::paint::presets::{BrushPreset, PRESETS};
 use texturecraft_engine::smart_masks::SMART_MASKS;
@@ -34,8 +34,9 @@ const TILE_ROUNDING: f32 = 3.0;
 /// The thumbnail's size in a tile and its center below the tile's top, in points
 const THUMBNAIL_SIZE: f32 = 56.0;
 const THUMBNAIL_CENTER_Y: f32 = 32.0;
-/// A placeholder disc's radius relative to the thumbnail's width
-const PLACEHOLDER_RADIUS: f32 = 0.45;
+/// Loading icon size relative to the thumbnail width, and its opacity over the dim text color
+const LOADING_ICON_SCALE: f32 = 0.9;
+const LOADING_ICON_OPACITY: f32 = 0.5;
 /// A tile label's font size, its gap below the thumbnail and its total side margin, in points
 const LABEL_FONT_SIZE: f32 = 9.5;
 const LABEL_GAP: f32 = 3.0;
@@ -300,20 +301,22 @@ pub(crate) fn categories<T>(items: &[T], category: impl Fn(&T) -> &'static str) 
     out
 }
 
-/// Built-in materials (or smart materials), grouped by category.
+/// Built-in materials or smart materials, grouped by category
 fn materials(app: &mut TextureCraftApp, ui: &mut Ui, ctx: &egui::Context, filter: &str, smart: bool, name: &str) {
-    let shown: Vec<_> = MATERIALS.iter().filter(|m| m.smart == smart && matches(filter, &[m.label, m.category, m.id])).collect();
+    let shown: Vec<_> =
+        MATERIALS.iter().filter(|material| material.smart == smart && matches(filter, &[material.label, material.category, material.id])).collect();
     if shown.is_empty() {
         return;
     }
+
     title(ui, name);
-    for cat in categories(&shown, |m| m.category) {
-        header(ui, cat);
+    for category in categories(&shown, |material| material.category) {
+        header(ui, category);
         tiles(ui, |ui| {
-            for m in shown.iter().filter(|m| m.category == cat) {
-                let tex = app.thumbs.material(ctx, m.id);
-                let asset = Asset::Material(m.id);
-                if tile(ui, &mut app.thumbs, tex.as_ref(), || ShelfPreview::Material(m.id), m.label, Some(&asset)).clicked() {
+            for material in shown.iter().filter(|material| material.category == category) {
+                let texture = app.thumbs.material(ctx, material.id);
+                let asset = Asset::Material(material.id);
+                if tile(ui, &mut app.thumbs, texture.as_ref(), || ShelfPreview::material(material.id), material.label, Some(&asset)).clicked() {
                     apply(app, &asset);
                 }
             }
@@ -623,8 +626,9 @@ fn big_preview(ui: &Ui, thumbs: &mut Thumbs, preview: impl FnOnce() -> ShelfPrev
     let preview = preview();
     let requested_size_px = (BIG_PREVIEW_SIZE * ctx.pixels_per_point()).round() as usize;
 
-    // High display scales must respect the mask camera's allocation limit
-    let size_px = if matches!(&preview, ShelfPreview::SmartMask(_)) { requested_size_px.clamp(1, MAX_PREVIEW_SIZE_PX) } else { requested_size_px };
+    // High display scales must respect the orb camera's allocation limit
+    let on_the_orb = matches!(&preview, ShelfPreview::SmartMask(_) | ShelfPreview::SmartMaterial(_));
+    let size_px = if on_the_orb { requested_size_px.clamp(1, MAX_PREVIEW_SIZE_PX) } else { requested_size_px };
 
     // Scrolling moves tiles beneath a stationary pointer
     let idle_seconds = ui.input(|input| if input.is_scrolling() { 0.0 } else { input.pointer.time_since_last_movement().min(input.time_since_last_scroll()) });
@@ -636,14 +640,21 @@ fn big_preview(ui: &Ui, thumbs: &mut Thumbs, preview: impl FnOnce() -> ShelfPrev
     thumbs.rendered_big(ctx, &preview, size_px)
 }
 
-/// `tex` drawn into `rect`, or a placeholder disc while it renders
-fn thumbnail(painter: &egui::Painter, tex: Option<&egui::TextureHandle>, rect: egui::Rect, tk: &Tokens) {
-    match tex {
-        Some(t) => {
-            painter.image(t.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+/// `texture` drawn into `rect`, or a dim loading icon while it renders
+fn thumbnail(painter: &egui::Painter, texture: Option<&egui::TextureHandle>, rect: egui::Rect, tk: &Tokens) {
+    match texture {
+        Some(texture) => {
+            painter.image(texture.id(), rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
         }
         None => {
-            painter.circle_filled(rect.center(), rect.width() * PLACEHOLDER_RADIUS, tk.row_hover);
+            let font = egui::FontId::proportional(rect.width() * LOADING_ICON_SCALE);
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                egui_phosphor::regular::ARROWS_CLOCKWISE,
+                font,
+                tk.text_dim.gamma_multiply(LOADING_ICON_OPACITY),
+            );
         }
     }
 }

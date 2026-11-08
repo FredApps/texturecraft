@@ -1,4 +1,4 @@
-//! Cached camera rays for one smart mask preview size
+//! Cached camera rays for one preview orb size
 
 use std::collections::HashMap;
 
@@ -11,11 +11,11 @@ use crate::Session;
 const CAMERA_PITCH_DEG: f32 = 35.0;
 const CAMERA_YAW_DEG: f32 = -34.4;
 
-/// Index into [`MaskPreviewCamera::texels`] and view-space normal; None on a miss
+/// Index into [`OrbCamera::texels`] and view-space normal; None on a miss
 pub(crate) type CameraSample = Option<(usize, Vec3)>;
 
-/// What each ray of a square orthographic view of the preview shape sees
-pub(crate) struct MaskPreviewCamera {
+/// What each ray of a square orthographic view of the orb sees
+pub(crate) struct OrbCamera {
     /// Rays along each side of the view
     pub rays_per_side: usize,
     /// The texels (x, y) the camera sees, each once
@@ -24,12 +24,12 @@ pub(crate) struct MaskPreviewCamera {
     pub samples: Vec<CameraSample>,
 }
 
-impl MaskPreviewCamera {
+impl OrbCamera {
     /// Trace a square orthographic view onto a `texture_px²` texture
-    pub fn new(session: &Session, texture_px: u32, rays_per_side: usize) -> MaskPreviewCamera {
-        let (lo, hi) = session.mesh.bounds();
-        let center = (lo + hi) * 0.5;
-        let radius = session.mesh.positions.iter().map(|p| p.distance(center)).fold(0.0f32, f32::max);
+    pub fn new(session: &Session, texture_px: u32, rays_per_side: usize) -> OrbCamera {
+        let (min, max) = session.mesh.bounds();
+        let center = (min + max) * 0.5;
+        let radius = session.mesh.positions.iter().map(|position| position.distance(center)).fold(0.0f32, f32::max);
         let pitch = CAMERA_PITCH_DEG.to_radians();
         let turn = Quat::from_rotation_y(CAMERA_YAW_DEG.to_radians());
         let forward = turn * Vec3::new(0.0, -pitch.sin(), -pitch.cos());
@@ -40,9 +40,9 @@ impl MaskPreviewCamera {
         let mut texels = Vec::new();
         let mut index_of = HashMap::new();
         let samples = (0..rays_per_side * rays_per_side)
-            .map(|i| {
+            .map(|ray| {
                 let side = rays_per_side as f32;
-                let ndc = Vec2::new(((i % rays_per_side) as f32 + 0.5) / side * 2.0 - 1.0, 1.0 - ((i / rays_per_side) as f32 + 0.5) / side * 2.0);
+                let ndc = Vec2::new(((ray % rays_per_side) as f32 + 0.5) / side * 2.0 - 1.0, 1.0 - ((ray / rays_per_side) as f32 + 0.5) / side * 2.0);
                 // Start well outside the shape so every ray enters it from the front
                 let origin = center + (right * ndc.x + up * ndc.y) * radius - forward * radius * 4.0;
                 let hit = session.bvh.closest(origin, forward, radius * 8.0)?;
@@ -52,10 +52,12 @@ impl MaskPreviewCamera {
                     texels.push(texel);
                     texels.len() - 1
                 });
-                let n = surface.nrm;
-                Some((index, Vec3::new(n.dot(right), n.dot(up), -n.dot(forward))))
+
+                let normal = surface.nrm;
+                Some((index, Vec3::new(normal.dot(right), normal.dot(up), -normal.dot(forward))))
             })
             .collect();
-        MaskPreviewCamera { rays_per_side, texels, samples }
+
+        OrbCamera { rays_per_side, texels, samples }
     }
 }

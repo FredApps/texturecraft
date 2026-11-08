@@ -7,6 +7,6 @@ pub enum WorkerPreview {
     /// Requested; the worker has not answered yet
     Rendering,
     Ready(TextureHandle),
-    /// The asset is unknown or the worker could not render it (the tile keeps its placeholder)
+    /// The asset is unknown or the worker could not render it (the tile keeps its loading icon)
     Failed,
 }
