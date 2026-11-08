@@ -32,6 +32,7 @@ use texturecraft_texel::TILE;
 
 use crate::gpu_trace::{Checked, checked};
 use crate::ibl;
+use crate::overlay_quad::OverlayQuad;
 use crate::set_highlight::SetHighlight;
 use crate::subdivide::{self, Vertex};
 
@@ -282,6 +283,8 @@ pub struct Frame {
     pub shade: Shade,
     /// Visibility per texture set.
     pub visible: Vec<bool>,
+    /// See-through quads in the 3D view, hidden behind the mesh
+    pub overlay: Vec<OverlayQuad>,
 }
 
 struct Tex {
@@ -492,6 +495,9 @@ struct ViewTargets {
     behind: Option<Behind>,
     blit_buf: wgpu::Buffer,
     blit_bg: wgpu::BindGroup,
+    /// The frame's overlay triangles and how many vertices of the buffer they use
+    overlay: Option<wgpu::Buffer>,
+    overlay_vertices: u32,
     /// Set by [`Renderer::prepare`]: the view has content to blit.
     ready: bool,
 }
@@ -528,6 +534,7 @@ pub struct Renderer {
     uv_pipeline: wgpu::RenderPipeline,
     wire_pipeline: wgpu::RenderPipeline,
     wire3d_pipeline: wgpu::RenderPipeline,
+    overlay_pipeline: wgpu::RenderPipeline,
     /// The highlighted set's mesh edges, wider and in the highlight color
     highlight_pipeline: wgpu::RenderPipeline,
     bg_pipeline: wgpu::RenderPipeline,
@@ -904,6 +911,7 @@ impl Renderer {
         let wire_pipeline = pipeline(device, "tc_wire", &layout, &module, "vs_uv", &vb, hdr("fs_wire", blend), MSAA, always());
         let wire3d_depth = Some(depth_state(false, wgpu::CompareFunction::LessEqual));
         let wire3d_pipeline = pipeline(device, "tc_wire3d", &layout, &module, "vs_wire3d", &vb, hdr("fs_wire3d", blend), MSAA, wire3d_depth.clone());
+        let overlay_pipeline = pipeline(device, "tc_overlay", &bg_layout, &module, "vs_overlay", &vb, hdr("fs_overlay", blend), MSAA, wire3d_depth.clone());
         let highlight_pipeline =
             pipeline(device, "tc_highlight", &layout, &module, "vs_wire_highlight", &vb, hdr("fs_wire_highlight", blend), MSAA, wire3d_depth);
         let bg_pipeline = pipeline(device, "tc_bg", &bg_layout, &module, "vs_bg", &[], hdr("fs_bg", None), MSAA, always());
@@ -1013,6 +1021,7 @@ impl Renderer {
             uv_pipeline,
             wire_pipeline,
             wire3d_pipeline,
+            overlay_pipeline,
             highlight_pipeline,
             bg_pipeline,
             blit_pipeline,
@@ -1472,6 +1481,8 @@ impl Renderer {
             behind: None,
             blit_buf,
             blit_bg,
+            overlay: None,
+            overlay_vertices: 0,
             ready: false,
         }
     }
@@ -1735,6 +1746,7 @@ impl Renderer {
         let Some(v) = self.targets(device, frame.view_id, frame.size, bloom, fx_on, refraction) else { return };
         queue.write_buffer(&v.globals, 0, bytemuck::bytes_of(&raw));
         queue.write_buffer(&v.post_buf, 0, bytemuck::bytes_of(&post));
+        upload_overlay(device, queue, v, &frame.overlay, (!data).then_some(s.exposure_ev));
         v.ready = true;
         v.history = Some((frame.clone(), rev));
         v.samples = sample;
@@ -1947,6 +1959,15 @@ impl Renderer {
                 pass.draw_indexed(range, 0, 0..instances);
             }
         }
+
+        // Overlay quads last, so the mesh's depth hides what is behind it
+        if uv_ts.is_none()
+            && let Some(overlay) = v.overlay.as_ref().filter(|_| v.overlay_vertices > 0)
+        {
+            pass.set_pipeline(&self.overlay_pipeline);
+            pass.set_vertex_buffer(0, overlay.slice(..));
+            pass.draw(0..v.overlay_vertices, 0..1);
+        }
     }
 
     /// Draw view `id` into the current pass at `rect` (target pixels: x, y, w, h).
@@ -2002,6 +2023,38 @@ fn drawable_ranges<'a>(
 
         Some((start..start + count, ts))
     })
+}
+
+/// A quad's two triangles, as corner indices
+const QUAD_TRIANGLES: [usize; 6] = [0, 1, 2, 0, 2, 3];
+
+/// Write `quads` into the view's overlay buffer, colors divided by the exposure only (undoing ACES makes saturated colors overshoot)
+fn upload_overlay(device: &wgpu::Device, queue: &wgpu::Queue, view: &mut ViewTargets, quads: &[OverlayQuad], exposure_ev: Option<f32>) {
+    let vertices: Vec<Vertex> = quads
+        .iter()
+        .flat_map(|quad| {
+            let [r, g, b] = exposure_ev.map_or(quad.color, |exposure_ev| crate::set_highlight::scene_color_showing(quad.color, exposure_ev, false));
+            let vertex = |corner: Vec3| Vertex { pos: corner.to_array(), nrm: [0.0; 3], tan: [r, g, b, quad.opacity], uv: [0.0; 2] };
+            QUAD_TRIANGLES.map(|corner| vertex(quad.corners[corner]))
+        })
+        .collect();
+    view.overlay_vertices = u32::try_from(vertices.len()).unwrap_or(0);
+    if vertices.is_empty() {
+        return;
+    }
+
+    let bytes: &[u8] = bytemuck::cast_slice(&vertices);
+    if view.overlay.as_ref().is_none_or(|buffer| buffer.size() < bytes.len() as u64) {
+        view.overlay = Some(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("tc_overlay"),
+            size: bytes.len() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+    }
+    if let Some(buffer) = &view.overlay {
+        queue.write_buffer(buffer, 0, bytes);
+    }
 }
 
 /// Globals `highlight`: the highlight's color and opacity, all zero without one. Data views skip exposure and tone mapping, so they take the color as it is
