@@ -94,7 +94,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit effect",
             [],
             None,
-            "{effect, visible?, blend?, opacity?, name?, level?, softness?, noise?, noiseScale?, offset?, invert?, value?, anchor?, anchorChannel?, inLow?, inHigh?, gamma?, outLow?, outHigh?, tolerance?, filter parameters (see effect.add.filter)}",
+            "{effect, visible?, blend?, opacity?, name?, filter?: id from filter.list (a filter effect only: swaps its type, keeping position, blend and opacity; its current id edits it in place), level?, softness?, noise?, noiseScale?, offset?, invert?, value?, anchor?, anchorChannel?, inLow?, inHigh?, gamma?, outLow?, outHigh?, tolerance?, filter parameters (see effect.add.filter)}",
             has_layer,
             set
         ),
@@ -416,55 +416,78 @@ fn histogram(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(if content { json!({"target": "content", "channel": channel.id(), "bins": counts}) } else { json!({"target": "mask", "bins": counts}) })
 }
 
+/// Edits effect `effect`: visibility, blending, name, its kind's parameters, or a filter's type
 fn set(s: &mut Session, p: &Value) -> Result<Value> {
-    let eid = effect_id(s, p, "effect.set")?;
-    let blend = blend_param("effect.set", p, "blend")?;
-    // A fill reading an anchor: `anchor` picks the anchor point, `anchorChannel` alone
-    // re-targets the current one.
-    let anchor = match s.doc.project.effect(eid) {
+    const CMD: &str = "effect.set";
+    let effect = effect_id(s, p, CMD)?;
+    let blend = blend_param(CMD, p, "blend")?;
+
+    // `anchor` picks a fill's anchor point, `anchorChannel` alone re-targets the current one
+    let anchor = match s.doc.project.effect(effect) {
         Some((owner, Effect { kind: EffectKind::Fill { source, .. }, .. })) => {
             let (current, channel) = match source {
                 Source::Anchor { anchor, channel } => (Some(*anchor), *channel),
                 _ => (None, Channel::Height),
             };
-            let channel_param = channel_param("effect.set", p, "anchorChannel")?;
+            let channel_param = channel_param(CMD, p, "anchorChannel")?;
             match u64p(p, "anchor").map(LayerId).or(current.filter(|_| channel_param.is_some())) {
-                Some(a) => Some(anchor_source(s, "effect.set", owner, a, channel_param.unwrap_or(channel))?),
+                Some(anchor) => Some(anchor_source(s, CMD, owner, anchor, channel_param.unwrap_or(channel))?),
                 None => None,
             }
         }
         _ => None,
     };
+
+    // Naming the filter the effect already is edits its parameters like a plain effect.set
+    let swapped = match strp(p, "filter") {
+        Some(filter) if crate::filter_lib::find(filter).is_some_and(|def| current_filter_id(s, effect) == Some(def.id)) => None,
+        Some(filter) => Some(swapped_filter(s, effect, filter, p)?),
+        None => None,
+    };
+    let swaps_filter = swapped.is_some();
+
     s.edit("Edit effect", |s| {
-        let e = s.doc.project.effect_mut(eid).ok_or_else(|| bad("effect.set", format!("no effect {}", eid.0)))?;
-        if let Some(v) = boolp(p, "visible") {
-            e.visible = v;
+        let edited = s.doc.project.effect_mut(effect).ok_or_else(|| bad(CMD, format!("no effect {}", effect.0)))?;
+        if let Some((kind, label)) = swapped {
+            if let EffectKind::Filter(old) = &edited.kind
+                && edited.name == old.label()
+            {
+                edited.name = label.to_string();
+            }
+            edited.kind = kind;
         }
-        if let Some(b) = blend {
-            e.blend = b;
+
+        if let Some(visible) = boolp(p, "visible") {
+            edited.visible = visible;
         }
-        if let Some(o) = f32p(p, "opacity") {
-            e.opacity = o.clamp(0.0, 1.0);
+        if let Some(blend) = blend {
+            edited.blend = blend;
         }
-        if let Some(n) = name_param(p) {
-            e.name = n.to_string();
+        if let Some(opacity) = f32p(p, "opacity") {
+            edited.opacity = opacity.clamp(0.0, 1.0);
         }
-        match &mut e.kind {
-            EffectKind::Generator(g) => generator_from(p, g),
-            EffectKind::Levels(l) => levels_from(p, l),
-            EffectKind::Filter(f) => crate::filter_lib::apply(p, f, "effect.set")?,
+        if let Some(name) = name_param(p) {
+            edited.name = name.to_string();
+        }
+
+        match &mut edited.kind {
+            EffectKind::Generator(generator) => generator_from(p, generator),
+            EffectKind::Levels(levels) => levels_from(p, levels),
+            // The swapped filter was built with the parameters already
+            EffectKind::Filter(_) if swaps_filter => {}
+            EffectKind::Filter(filter) => crate::filter_lib::apply(p, filter, CMD)?,
             EffectKind::Fill { source, .. } => {
-                if let Some(a) = anchor {
-                    *source = a;
-                } else if let Some(x) = f32p(p, "value")
+                if let Some(anchor) = anchor {
+                    *source = anchor;
+                } else if let Some(value) = f32p(p, "value")
                     && matches!(source, Source::Uniform(_) | Source::Anchor { .. })
                 {
-                    *source = Source::Uniform([x.clamp(0.0, 1.0); 3]);
+                    *source = Source::Uniform([value.clamp(0.0, 1.0); 3]);
                 }
             }
             EffectKind::ColorSelection { tolerance, .. } | EffectKind::Compare { tolerance, .. } => {
-                if let Some(x) = f32p(p, "tolerance") {
-                    *tolerance = x.clamp(0.0, 1.0);
+                if let Some(value) = f32p(p, "tolerance") {
+                    *tolerance = value.clamp(0.0, 1.0);
                 }
             }
             _ => {}
@@ -472,6 +495,38 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(())
     })?;
     Ok(Value::Null)
+}
+
+/// The library id of the filter effect `effect` is, if it is one
+fn current_filter_id(s: &Session, effect: LayerId) -> Option<&'static str> {
+    match &s.doc.project.effect(effect)?.1.kind {
+        EffectKind::Filter(filter) => crate::filter_lib::find(filter.label()).map(|def| def.id),
+        _ => None,
+    }
+}
+
+/// Filter `id` built with `p` and its label, to replace filter effect `effect`
+fn swapped_filter(s: &Session, effect: LayerId, id: &str, p: &Value) -> Result<(EffectKind, &'static str)> {
+    const CMD: &str = "effect.set";
+    let (owner, current) = s.doc.project.effect(effect).ok_or_else(|| bad(CMD, format!("no effect {}", effect.0)))?;
+    if !matches!(current.kind, EffectKind::Filter(_)) {
+        return Err(bad(CMD, format!("`filter` changes filter effects only, not {}", current.kind.name().to_ascii_lowercase())));
+    }
+
+    let def = crate::filter_lib::find(id).ok_or_else(|| bad(CMD, format!("unknown filter `{id}` (see filter.list)")))?;
+    let mut kind = crate::filter_lib::build(def.id, &Value::Null)?;
+    let EffectKind::Filter(filter) = &mut kind else {
+        return Err(bad(CMD, format!("{} is its own effect type: add it with effect.add.filter", def.label)));
+    };
+
+    let mask = s.doc.project.layer(owner)?.mask.as_ref();
+    let on_mask = mask.is_some_and(|mask| mask.effects.iter().any(|masked| masked.id == effect));
+    if on_mask && !def.mask {
+        return Err(bad(CMD, format!("{} goes on layer content, not on masks", def.label)));
+    }
+
+    crate::filter_lib::apply(p, filter, CMD)?;
+    Ok((kind, def.label))
 }
 
 /// The stack (a mask's or a layer's content effects) holding effect `eid`, and its position there.

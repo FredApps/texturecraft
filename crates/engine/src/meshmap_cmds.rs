@@ -20,7 +20,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Use image as mesh map",
             [],
             None,
-            "{ts?, map: mesh map id (normal_base, ambient_occlusion, curvature, id, height…), image: resource name} → {map, resolution} — resampled to the size of the set's other mesh maps (or its bake size); a normal map is read in the project's normal format. A UV-tiled set takes one image per tile, named alike with the tile number (`image: \"ao.1001.png\"` finds ao.1002.png…)",
+            "{ts?, map: mesh map id (normal, ambientOcclusion, curvature, id, height…), image: resource name} → {map, resolution} — resampled to the size of the set's other mesh maps (or its bake size); a normal map is read in the project's normal format. A UV-tiled set takes one image per tile, named alike with the tile number (`image: \"ao.1001.png\"` finds ao.1002.png…)",
             always,
             set
         ),
@@ -46,7 +46,10 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     let (cols, rows) = tiles.as_ref().map_or((1, 1), |(g, _)| (g.cols, g.rows));
     let (res, height) = match s.doc.baked.get(&ts).filter(|b| !b.maps.is_empty()) {
         Some(b) => (b.resolution, b.maps.keys().next().map_or(b.resolution, |m| b.height(*m))),
-        None => (set.bake.resolution.saturating_mul(cols), set.bake.resolution.saturating_mul(rows)),
+        None => {
+            let (width, height) = set.bake.common.output_size();
+            (width.saturating_mul(cols), height.saturating_mul(rows))
+        }
     };
     if res == 0 || height == 0 || u64::from(res) * u64::from(height) > texturecraft_bake::MAX_TEXELS || (tiles.is_none() && res > MAX_RESOLUTION) {
         return Err(bad(CMD, format!("mesh map size {res} × {height} is too large or empty")));
@@ -56,7 +59,7 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         None => resample(map.components(), (res, height), directx, |u, v| img.sample(u, v)),
         // An atlas texel reads the image of the tile its mesh UV falls in.
         Some((grid, imgs)) => resample(map.components(), (res, height), directx, |u, v| {
-            let uv = set.from_atlas(grid, [u, v]);
+            let uv = grid.from_atlas([u, v]);
             udim_at(uv).and_then(|t| imgs.get(&t)).map_or([0.0; 4], |img| img.sample(uv[0] - uv[0].floor(), uv[1] - uv[1].floor()))
         }),
     };
@@ -118,7 +121,7 @@ fn clear(s: &mut Session, p: &Value) -> Result<Value> {
     let ts = ts_param(s, p, CMD)?;
     let map = map_param(p, CMD)?;
     if !s.doc.baked.get(&ts).is_some_and(|b| b.maps.contains_key(&map)) {
-        return Err(bad(CMD, format!("texture set {ts} has no {} map", map.label())));
+        return Err(bad(CMD, format!("texture set {ts} has no {} map", map.id())));
     }
     s.edit("Clear mesh map", |s| {
         if let Some(b) = s.doc.baked.get_mut(&ts) {

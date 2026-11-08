@@ -1,9 +1,9 @@
 //! Pixel data owned by a document: painted layer channels, painted mask effects and baked mesh
 //! maps. Everything is copy-on-write, so cloning the store for undo is cheap.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
-use texturecraft_core::{BakedMap, Channel, ChannelKind, LayerId};
+use texturecraft_core::{Channel, ChannelKind, LayerId};
 use texturecraft_texel::{TileImage, from_u16, from_u16_signed};
 
 /// Painted data of one paint layer channel: premultiplied value(s) plus coverage, u16 per
@@ -56,38 +56,7 @@ pub fn decode(kind: ChannelKind, v: u16) -> f32 {
     if kind == ChannelKind::Signed { from_u16_signed(v) } else { from_u16(v) }
 }
 
-/// Baked mesh maps of one texture set (dense, row-major, `components()` floats per texel). The
-/// maps cover the texture set's texels at another density: `resolution` wide, and as tall as
-/// the set's aspect makes them (square for classic sets, the UV tile grid's aspect otherwise).
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct BakedMaps {
-    /// Width in texels.
-    pub resolution: u32,
-    pub maps: BTreeMap<BakedMap, std::sync::Arc<Vec<f32>>>,
-}
-
-impl BakedMaps {
-    /// Height in texels of map `m` (from its length).
-    pub fn height(&self, m: BakedMap) -> u32 {
-        self.maps.get(&m).map_or(0, |d| (d.len() / (self.resolution.max(1) as usize * m.components())) as u32)
-    }
-
-    /// Sample map `m` at texel (x, y) of an image `res` wide with the same aspect (nearest texel
-    /// of the bake).
-    pub fn sample(&self, m: BakedMap, x: u32, y: u32, res: u32) -> Option<[f32; 3]> {
-        let data = self.maps.get(&m)?;
-        let r = self.resolution.max(1) as u64;
-        let (bx, by) = ((x as u64 * r / res.max(1) as u64).min(r - 1), (y as u64 * r / res.max(1) as u64).min(self.height(m).max(1) as u64 - 1));
-        let comps = m.components();
-        let i = ((by * r + bx) as usize) * comps;
-        let s = data.get(i..i + comps)?;
-        Some(if comps == 3 { [s[0], s[1], s[2]] } else { [s[0]; 3] })
-    }
-
-    pub fn scalar(&self, m: BakedMap, x: u32, y: u32, res: u32) -> Option<f32> {
-        self.sample(m, x, y, res).map(|v| v[0])
-    }
-}
+pub use crate::baked_maps::BakedMaps;
 
 /// A decoded image resource sampled by fills (values in the file's encoding; see `srgb`).
 #[derive(Clone, Debug, PartialEq)]

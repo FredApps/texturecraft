@@ -1,4 +1,4 @@
-// GPU mesh-map baking: the ray casts of `texturecraft_bake::rays` (the CPU oracle) as compute
+// GPU mesh-map baking: the ray casts of `texturecraft_bake::tracing` (the CPU oracle) as compute
 // shaders, concatenated after rays.wgsl. `transfer_main` finds the closest high-poly hit of each
 // transfer ray; `hemisphere_main` casts a query's secondary rays (ambient occlusion and bent
 // normal, or thickness) in the same directions as `Hemisphere::direction`, spread over `lanes`
@@ -24,6 +24,10 @@ struct Params {
     root: u32,    // transfer: BVH root node of the high poly
     lanes: u32,   // hemisphere: threads per query, a power of two dividing the workgroup
     out: u32,     // first result row of this pass
+    min_distance: f32,
+    attenuation: u32,
+    ground_height: f32,
+    backface_mode: u32,
 };
 
 @group(0) @binding(0) var<uniform> P: Params;
@@ -36,12 +40,13 @@ struct Params {
 
 var<private> want_key: u32;
 var<private> skip_back: bool;
+var<private> backface_by_name: bool;
 
 fn accept(i: u32, d: vec3<f32>) -> bool {
     if (want_key != NONE && tris[i * 4u].w != want_key) {
         return false;
     }
-    if (skip_back) {
+    if (skip_back || (backface_by_name && tris[i * 4u + 1u].w != 0u)) {
         let p0 = tri_p(i, 0u);
         return dot(cross(tri_p(i, 1u) - p0, tri_p(i, 2u) - p0), d) <= 0.0;
     }
@@ -57,7 +62,8 @@ fn transfer_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let a = items[k * 2u];
     let b = items[k * 2u + 1u];
     want_key = b.w;
-    skip_back = false;
+    skip_back = (P.flags & IGNORE_BACKFACE) != 0u;
+    backface_by_name = false;
     let h = traverse_from(P.root, bitcast<vec3<f32>>(a.xyz), bitcast<vec3<f32>>(b.xyz), bitcast<f32>(a.w), false);
     var out = vec4<u32>(0u, 0u, 0u, NONE);
     if (h.idx != NONE) {
@@ -88,8 +94,9 @@ fn hemisphere_main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocati
     let o = bitcast<vec3<f32>>(r0.xyz) + geo * P.eps;
     let t = onb_t(axis);
     let b = onb_b(axis);
-    want_key = select(NONE, r2.w, occlusion && (P.flags & SAME_KEY) != 0u);
-    skip_back = occlusion && (P.flags & IGNORE_BACKFACE) != 0u;
+    want_key = select(NONE, r2.w, (P.flags & SAME_KEY) != 0u);
+    skip_back = P.backface_mode == 1u;
+    backface_by_name = P.backface_mode == 2u;
     var sum = 0.0;
     var bent = vec3<f32>(0.0);
     var n = 0u;
@@ -110,15 +117,26 @@ fn hemisphere_main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocati
         if (dot(d, geo) <= 0.0) {
             continue;
         }
-        let h = traverse_from(root, o, d, P.dmax, false);
-        let hit = h.idx != NONE;
+        let h = traverse_from(root, o + d * P.min_distance, d, max(0.0, P.dmax - P.min_distance), false);
+        var hit = h.idx != NONE;
+        var distance = select(P.dmax, h.t + P.min_distance, hit);
+        if ((P.flags & 8u) != 0u && d.y < -1e-8) {
+            let ground_distance = (P.ground_height - o.y) / d.y;
+            if (ground_distance >= P.min_distance && ground_distance <= P.dmax) {
+                distance = min(distance, ground_distance);
+                hit = true;
+            }
+        }
         if (occlusion) {
-            let f = h.t / P.dmax;
-            let v = select(0.0, 1.0 - f * f, hit);
+            let fraction = clamp((distance - P.min_distance) / max(P.dmax - P.min_distance, 1.1920929e-7), 0.0, 1.0);
+            var attenuation = 1.0;
+            if (P.attenuation == 1u) { attenuation = 1.0 - fraction; }
+            if (P.attenuation == 2u) { attenuation = 1.0 - fraction * fraction * (3.0 - 2.0 * fraction); }
+            let v = select(0.0, attenuation, hit);
             sum += v;
             bent += d * (1.0 - v);
         } else {
-            sum += select(P.dmax, h.t, hit);
+            sum += distance;
         }
         n += 1u;
     }
@@ -142,8 +160,8 @@ fn hemisphere_main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocati
         let l2 = dot(bent, bent);
         let bn = select(nrm, bent * inverseSqrt(l2), l2 > 1e-30);
         out = vec4<f32>(select(1.0, clamp(1.0 - sum / f32(n), 0.0, 1.0), n > 0u), bn);
-    } else if (n > 0u) {
-        out.x = clamp(sum / f32(n) / P.dmax, 0.0, 1.0);
+    } else {
+        out.x = select(P.dmax, sum / f32(n), n > 0u);
     }
     results[P.out + k] = bitcast<vec4<u32>>(out);
 }

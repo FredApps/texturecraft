@@ -48,20 +48,24 @@ fn paint_red_at(s: &mut Session, p: Vec3) {
 
 #[test]
 fn uv_tiles_are_detected_and_inspected() {
-    let mut s = session();
-    let set = execute(&mut s, "textureSet.inspect", &Value::Null).unwrap();
+    let mut session = session();
+    let set = execute(&mut session, "textureSet.inspect", &Value::Null).unwrap();
     assert_eq!(set["uvTiles"], json!([1001, 1002]));
     assert_eq!(set["size"], json!([2 * RES, RES]));
-    assert_eq!(set["tiles"], json!([{ "udim": 1001, "block": [0, 0], "resolution": RES }, { "udim": 1002, "block": [1, 0], "resolution": RES }]));
-    assert_eq!(s.caches[0].size, (2 * RES, RES));
-    // Explicit modes: classic on the UDIM plane, one tile on a 0..1 mesh.
-    execute(&mut s, "project.new", &json!({"mesh": "udim_plane", "resolution": RES, "uvTiles": false})).unwrap();
-    assert!(s.doc.project.texture_sets[0].uv_tiles.is_empty());
-    execute(&mut s, "project.new", &json!({"mesh": "plane", "resolution": RES})).unwrap();
-    assert!(s.doc.project.texture_sets[0].uv_tiles.is_empty(), "UVs in 0..1 stay classic");
-    execute(&mut s, "project.new", &json!({"mesh": "plane", "resolution": RES, "uvTiles": true})).unwrap();
-    assert_eq!(s.doc.project.texture_sets[0].uv_tiles, vec![1001]);
-    assert_eq!(s.caches[0].size, (RES, RES));
+    assert_eq!(
+        set["tiles"],
+        json!([{ "udim": 1001, "block": [0, 0], "resolution": RES, "bakeEnabled": true }, { "udim": 1002, "block": [1, 0], "resolution": RES, "bakeEnabled": true }])
+    );
+    assert_eq!(session.caches[0].size, (2 * RES, RES));
+
+    // Explicit modes: classic on the UDIM plane, one tile on a 0..1 mesh
+    execute(&mut session, "project.new", &json!({"mesh": "udim_plane", "resolution": RES, "uvTiles": false})).unwrap();
+    assert!(session.doc.project.texture_sets[0].uv_tiles.is_empty());
+    execute(&mut session, "project.new", &json!({"mesh": "plane", "resolution": RES})).unwrap();
+    assert!(session.doc.project.texture_sets[0].uv_tiles.is_empty(), "UVs in 0..1 stay classic");
+    execute(&mut session, "project.new", &json!({"mesh": "plane", "resolution": RES, "uvTiles": true})).unwrap();
+    assert_eq!(session.doc.project.texture_sets[0].uv_tiles, vec![1001]);
+    assert_eq!(session.caches[0].size, (RES, RES));
 }
 
 #[test]
@@ -142,7 +146,7 @@ fn mesh_maps_from_images_take_one_image_per_tile() {
         image::RgbaImage::from_pixel(4, 4, image::Rgba([v, v, v, 255])).write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png).unwrap();
         out
     };
-    let set = |s: &mut Session, image: &str| execute(s, "textureSet.meshMap.set", &json!({"map": "ambient_occlusion", "image": image}));
+    let set = |s: &mut Session, image: &str| execute(s, "textureSet.meshMap.set", &json!({"map": "ambientOcclusion", "image": image}));
     let left = s.import_resource_bytes("ao.1001.png", png(255)).unwrap();
     assert!(set(&mut s, &left).unwrap_err().to_string().contains("ao.1002.png"), "tile 1002 has no image yet");
     let plain = s.import_resource_bytes("ao.png", png(255)).unwrap();

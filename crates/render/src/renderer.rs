@@ -32,6 +32,7 @@ use texturecraft_texel::TILE;
 
 use crate::gpu_trace::{Checked, checked};
 use crate::ibl;
+use crate::set_highlight::SetHighlight;
 use crate::subdivide::{self, Vertex};
 
 pub const MSAA: u32 = 4;
@@ -76,6 +77,8 @@ struct GlobalsRaw {
     fwd: [f32; 4],
     disp: [f32; 4],
     refr: [f32; 4],
+    highlight: [f32; 4],
+    highlight_shift: [f32; 4],
 }
 
 /// The post pass uniform (see `Post` in post.wgsl).
@@ -95,6 +98,15 @@ struct BlitRaw {
     rect: [f32; 4],
     dst: [f32; 4],
 }
+
+/// Width of the highlighted set's edge lines, in pixels
+const HIGHLIGHT_WIDTH_PX: f32 = 1.5;
+
+/// Opacity of the highlighted set's edge lines
+const HIGHLIGHT_OPACITY: f32 = 0.9;
+
+/// Copies of each highlight line, shifted diagonally to the four corners of its extra width (`vs_wire_highlight`)
+const HIGHLIGHT_SHIFTS: u32 = 4;
 
 /// How the material is shaded (from the project's display settings and the view mode).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -134,6 +146,8 @@ pub struct Shade {
     pub grain: f32,
     /// Draw the mesh edges over the shaded 3D view (depth tested).
     pub wireframe_3d: bool,
+    /// One texture set's mesh edges in a highlight color over the 3D view (the set under a shelf drag)
+    pub highlight: Option<SetHighlight>,
     /// Specular/glossiness shading: base color is the diffuse color and the Specular channel the
     /// F0 color (roughness arrives as 1 - glossiness from the display conversion).
     pub spec_gloss: bool,
@@ -235,6 +249,7 @@ impl Default for Shade {
             sharpen: 0.0,
             grain: 0.0,
             wireframe_3d: false,
+            highlight: None,
             spec_gloss: false,
             parallax: false,
             taa: false,
@@ -513,6 +528,8 @@ pub struct Renderer {
     uv_pipeline: wgpu::RenderPipeline,
     wire_pipeline: wgpu::RenderPipeline,
     wire3d_pipeline: wgpu::RenderPipeline,
+    /// The highlighted set's mesh edges, wider and in the highlight color
+    highlight_pipeline: wgpu::RenderPipeline,
     bg_pipeline: wgpu::RenderPipeline,
     blit_pipeline: wgpu::RenderPipeline,
     post_pipeline: wgpu::RenderPipeline,
@@ -886,7 +903,9 @@ impl Renderer {
         let blend = Some(wgpu::BlendState::ALPHA_BLENDING);
         let wire_pipeline = pipeline(device, "tc_wire", &layout, &module, "vs_uv", &vb, hdr("fs_wire", blend), MSAA, always());
         let wire3d_depth = Some(depth_state(false, wgpu::CompareFunction::LessEqual));
-        let wire3d_pipeline = pipeline(device, "tc_wire3d", &layout, &module, "vs_wire3d", &vb, hdr("fs_wire3d", blend), MSAA, wire3d_depth);
+        let wire3d_pipeline = pipeline(device, "tc_wire3d", &layout, &module, "vs_wire3d", &vb, hdr("fs_wire3d", blend), MSAA, wire3d_depth.clone());
+        let highlight_pipeline =
+            pipeline(device, "tc_highlight", &layout, &module, "vs_wire_highlight", &vb, hdr("fs_wire_highlight", blend), MSAA, wire3d_depth);
         let bg_pipeline = pipeline(device, "tc_bg", &bg_layout, &module, "vs_bg", &[], hdr("fs_bg", None), MSAA, always());
         let blit_pipeline = pipeline(device, "tc_blit", &blit_layout, &util_module, "vs_blit", &[], Some(("fs_blit", target_format, None)), 1, None);
         let post_pipeline = pipeline(device, "tc_post", &fx_layout, &post_module, "vs_full", &[], Some(("fs_post", COLOR_FORMAT, None)), 1, None);
@@ -994,6 +1013,7 @@ impl Renderer {
             uv_pipeline,
             wire_pipeline,
             wire3d_pipeline,
+            highlight_pipeline,
             bg_pipeline,
             blit_pipeline,
             post_pipeline,
@@ -1531,13 +1551,7 @@ impl Renderer {
         visible: &'a [bool],
         only: Option<usize>,
     ) -> impl Iterator<Item = (std::ops::Range<u32>, &'a SetGpu)> + 'a {
-        ranges.iter().filter_map(move |&(start, count, material)| {
-            let ts = self.material_sets.get(material).copied().flatten()?;
-            if only.is_some_and(|o| o != ts) || !visible.get(ts).copied().unwrap_or(true) {
-                return None;
-            }
-            Some((start..start + count, self.sets.get(ts)?))
-        })
+        drawable_ranges(ranges, &self.material_sets, visible, only).filter_map(|(range, ts)| Some((range, self.sets.get(ts)?)))
     }
 
     /// Keep the key-light shadow map current; returns its view-projection. `light` points to
@@ -1707,6 +1721,8 @@ impl Renderer {
             fwd: [fwd.x, fwd.y, fwd.z, 0.0],
             disp,
             refr: [if refraction { 1.0 } else { 0.0 }, (BEHIND_LEVELS - 1) as f32, REFRACTION_DEPTH * radius, 0.0],
+            highlight: highlight_globals(s, data),
+            highlight_shift: highlight_shift(frame.size),
         };
         let flag = |b: bool| if b { 1.0 } else { 0.0 };
         let post = PostRaw {
@@ -1805,7 +1821,7 @@ impl Renderer {
 
     /// The scene without transmissive surfaces into `b` (MSAA resolved into mip 0), then its mips.
     fn behind_pass(&self, encoder: &mut wgpu::CommandEncoder, v: &ViewTargets, b: &Behind, globals_bg: &wgpu::BindGroup, frame: &Frame) {
-        self.draw_scene(encoder, v, &b.level0, globals_bg, frame, &self.opaque_pipeline, None, &self.refr_black);
+        self.draw_scene(encoder, v, &b.level0, globals_bg, frame, &self.opaque_pipeline, None, None, &self.refr_black);
         let Some(pipe) = self.mip_pipelines.get(&self.hdr_format) else { return };
         for (dst, bg) in &b.mips {
             fullscreen(encoder, "tc_behind_mip", dst, CLEAR, pipe, bg);
@@ -1869,10 +1885,11 @@ impl Renderer {
         };
         // Transmissive surfaces refract what the behind pass rendered this frame.
         let refr = v.behind.as_ref().filter(|_| frame.shade.refraction).map_or(&self.refr_black, |b| &b.bg);
-        self.draw_scene(encoder, v, resolve, globals_bg, frame, pipe, wire, refr);
+        let highlight = frame.shade.highlight.filter(|_| uv_ts.is_none()).map(|highlight| (&self.highlight_pipeline, highlight.set));
+        self.draw_scene(encoder, v, resolve, globals_bg, frame, pipe, wire, highlight, refr);
     }
 
-    /// One scene pass: background, then the mesh with `pipe` and the wireframe with `wire`.
+    /// One scene pass: background, then the mesh with `pipe`, the wireframe with `wire` and one set's highlighted edges with `highlight`
     #[allow(clippy::too_many_arguments)]
     fn draw_scene(
         &self,
@@ -1883,6 +1900,7 @@ impl Renderer {
         frame: &Frame,
         pipe: &wgpu::RenderPipeline,
         wire: Option<&wgpu::RenderPipeline>,
+        highlight: Option<(&wgpu::RenderPipeline, usize)>,
         refr: &wgpu::BindGroup,
     ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1912,15 +1930,21 @@ impl Renderer {
         };
         pass.set_bind_group(2, refr, &[]);
         let geo = self.geometry(m, frame);
-        // The wireframe draws the mesh's own edges (displaced in the vertex shader too).
-        for (pipe, vb, ib, ranges) in [(Some(pipe), &geo.vb, &geo.ib, &geo.draws), (wire, &m.geo.vb, &m.lines, &m.line_draws)] {
+        // The wireframe and the highlight draw the mesh's own edges (displaced in the vertex shader too)
+        let (highlight, highlight_set) = highlight.unzip();
+        let passes = [
+            (Some(pipe), &geo.vb, &geo.ib, &geo.draws, uv_ts, 1),
+            (wire, &m.geo.vb, &m.lines, &m.line_draws, uv_ts, 1),
+            (highlight, &m.geo.vb, &m.lines, &m.line_draws, highlight_set, HIGHLIGHT_SHIFTS),
+        ];
+        for (pipe, vb, ib, ranges, only, instances) in passes {
             let Some(pipe) = pipe else { continue };
             pass.set_pipeline(pipe);
             pass.set_vertex_buffer(0, vb.slice(..));
             pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-            for (range, set) in self.drawable(ranges, &frame.visible, uv_ts) {
+            for (range, set) in self.drawable(ranges, &frame.visible, only) {
                 pass.set_bind_group(1, &set.bind_group, &[]);
-                pass.draw_indexed(range, 0, 0..1);
+                pass.draw_indexed(range, 0, 0..instances);
             }
         }
     }
@@ -1961,6 +1985,39 @@ impl Renderer {
     pub fn drop_view(&mut self, id: u64) {
         self.views.remove(&id);
     }
+}
+
+/// Index ranges of `ranges` (first, count, material) whose texture set (from `material_sets`) is visible and is `only`, when given, with that set's index
+fn drawable_ranges<'a>(
+    ranges: &'a [(u32, u32, usize)],
+    material_sets: &'a [Option<usize>],
+    visible: &'a [bool],
+    only: Option<usize>,
+) -> impl Iterator<Item = (std::ops::Range<u32>, usize)> + 'a {
+    ranges.iter().filter_map(move |&(start, count, material)| {
+        let ts = material_sets.get(material).copied().flatten()?;
+        if only.is_some_and(|o| o != ts) || !visible.get(ts).copied().unwrap_or(true) {
+            return None;
+        }
+
+        Some((start..start + count, ts))
+    })
+}
+
+/// Globals `highlight`: the highlight's color and opacity, all zero without one. Data views skip exposure and tone mapping, so they take the color as it is
+fn highlight_globals(shade: &Shade, data: bool) -> [f32; 4] {
+    let Some(highlight) = shade.highlight else { return [0.0; 4] };
+
+    let [r, g, b] = if data { highlight.color } else { highlight.scene_color(shade.exposure_ev, shade.aces) };
+    [r, g, b, HIGHLIGHT_OPACITY]
+}
+
+/// Globals `highlight_shift`: how far each of the highlight's line copies moves sideways, in clip units of a `size` pixel target
+fn highlight_shift(size: [u32; 2]) -> [f32; 4] {
+    let half_extra_width = (HIGHLIGHT_WIDTH_PX - 1.0) * 0.5;
+    let clip_per_pixel = size.map(|pixels| 2.0 / pixels.max(1) as f32);
+
+    [half_extra_width * clip_per_pixel[0], half_extra_width * clip_per_pixel[1], 0.0, 0.0]
 }
 
 #[cfg(test)]
@@ -2024,6 +2081,25 @@ mod tests {
         prepare(&mut h);
         assert_eq!(base_width(&h), 1);
         assert!(!h.renderer.awaiting_gpu());
+    }
+
+    #[test]
+    fn the_highlight_draws_only_the_highlighted_sets_edges() {
+        let line_draws = [(0, 4, 0), (4, 6, 1), (10, 2, 2)];
+        let material_sets = [Some(0), Some(1), Some(2)];
+        let highlighted = |visible: &[bool]| drawable_ranges(&line_draws, &material_sets, visible, Some(1)).collect::<Vec<_>>();
+
+        assert_eq!(highlighted(&[true; 3]), vec![(4..10, 1)]);
+        assert_eq!(highlighted(&[true, false, true]), vec![], "a hidden set shows no highlight");
+    }
+
+    #[test]
+    fn a_data_view_takes_the_highlight_color_as_it_is() {
+        let color = [0.8, 0.25, 0.08];
+        let shade = Shade { highlight: Some(SetHighlight { set: 0, color }), exposure_ev: 1.0, ..Shade::default() };
+
+        assert_eq!(highlight_globals(&shade, true), [0.8, 0.25, 0.08, HIGHLIGHT_OPACITY]);
+        assert_ne!(highlight_globals(&shade, false)[..3], color, "the material view undoes exposure and tone mapping");
     }
 
     #[test]

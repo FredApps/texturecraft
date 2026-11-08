@@ -6,7 +6,7 @@
 //! | `mesh.<ext>` | the original imported mesh file (absent for built-in meshes, `Project.mesh = "builtin:<id>"`) |
 //! | `highpoly/<name>` | a high-definition mesh file for baking, in list order |
 //! | `cage/<name>` | the baking cage mesh file |
-//! | `skew.bin` | the skew correction map of the bake (magic `TCSK`, version, width, height, edge distance, edge contrast, per-triangle flag; then `width × height` f32 LE) |
+//! | `bake_paint/<ts>_<target>.bin` | cage or skew paint, stored as a one-component baked map |
 //! | `pixels/layer_<id>_<channelId>.bin` | painted pixels of a paint layer (or content paint effect) channel |
 //! | `pixels/mask_<id>.bin` | painted pixels of a mask paint effect |
 //! | `baked/<ts>_<mapId>.bin` | a baked mesh map of texture set `<ts>` |
@@ -23,7 +23,7 @@ use std::io::{Cursor, Read, Seek, Write};
 use std::sync::Arc;
 
 use texturecraft_compose::{BakedMaps, PixelStore};
-use texturecraft_core::{BakedMap, Channel, FORMAT_VERSION, LayerId, Project};
+use texturecraft_core::{BakePaintTarget, Channel, FORMAT_VERSION, LayerId, Project};
 use texturecraft_texel::{TILE_AREA, TileImage};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
@@ -34,7 +34,6 @@ const KIND: &str = "project file";
 const MAGIC: &[u8; 4] = b"TCTX";
 /// Version of the `.bin` layout.
 const BIN_VERSION: u32 = 1;
-const SKEW_MAGIC: &[u8; 4] = b"TCSK";
 const MAX_JSON: u64 = 256 << 20;
 const MAX_THUMBNAIL: u64 = 64 << 20;
 const MAX_RESOURCE: u64 = 512 << 20;
@@ -44,17 +43,9 @@ const MAX_TOTAL: u64 = 8 << 30;
 /// Largest image (texels) of a texture set or baked map: UV-tiled sets hold several tiles.
 const MAX_TEXELS: u64 = 1 << 28;
 
-/// The skew correction map of a bake, as stored (the baker's `SkewMap` without its type).
-#[derive(Clone, Debug, PartialEq)]
-pub struct SkewData {
-    pub width: u32,
-    pub height: u32,
-    /// `width * height` values, row 0 at the top.
-    pub values: Vec<f32>,
-    pub edge_distance: f32,
-    pub edge_contrast: f32,
-    pub per_triangle: bool,
-}
+mod bake_paint_data;
+mod recovery;
+pub use bake_paint_data::BakePaintData;
 
 /// Everything a project file holds.
 #[derive(Clone, Debug)]
@@ -70,11 +61,12 @@ pub struct ProjectFile {
     pub high_poly: Vec<(String, Vec<u8>)>,
     /// Baking cage mesh file: (file name, bytes).
     pub cage: Option<(String, Vec<u8>)>,
-    /// Skew correction of the bake rays.
-    pub skew: Option<SkewData>,
+    pub bake_paint: BTreeMap<(usize, BakePaintTarget), BakePaintData>,
     pub thumbnail: Option<Vec<u8>>,
     /// Imported resources (images used by fills, alphas, stencils), by name: original bytes.
     pub resources: BTreeMap<String, Vec<u8>>,
+    /// Import warnings for the caller's log; never saved in the archive
+    pub warnings: Vec<String>,
 }
 
 /// A resource name safe as a zip entry and a file name: `[A-Za-z0-9_.-]`, at most 120 chars.
@@ -180,19 +172,19 @@ fn write_project<W: Write + Seek>(out: W, pf: &ProjectFile) -> Result<()> {
         zip.start_file(unique_entry_name(dir, name, &mut used), deflate).map_err(zip_err)?;
         zip.write_all(bytes)?;
     }
-    if let Some(k) = pf.skew.as_ref().filter(|k| k.width > 0 && k.height > 0 && k.values.len() as u64 == u64::from(k.width) * u64::from(k.height)) {
-        zip.start_file("skew.bin", deflate).map_err(zip_err)?;
-        let mut b = SKEW_MAGIC.to_vec();
-        b.extend_from_slice(&BIN_VERSION.to_le_bytes());
-        for v in [k.width, k.height] {
-            b.extend_from_slice(&v.to_le_bytes());
+    for ((texture_set, target), map) in &pf.bake_paint {
+        if map.width == 0 || map.height == 0 || map.values.len() as u64 != u64::from(map.width) * u64::from(map.height) {
+            return Err(FormatError::Invalid("bake paint map dimensions do not match its values".into()));
         }
-        for v in [k.edge_distance, k.edge_contrast] {
-            b.extend_from_slice(&v.to_le_bytes());
+        let target_name = match target {
+            BakePaintTarget::Cage => "cage",
+            BakePaintTarget::Skew => "skew",
+        };
+        zip.start_file(format!("bake_paint/{texture_set}_{target_name}.bin"), deflate).map_err(zip_err)?;
+        zip.write_all(&header(map.width, map.height, 1, 0))?;
+        for value in &map.values {
+            zip.write_all(&value.to_le_bytes())?;
         }
-        b.push(u8::from(k.per_triangle));
-        b.extend(k.values.iter().flat_map(|v| v.to_le_bytes()));
-        zip.write_all(&b)?;
     }
     let mut layers: Vec<_> = pf.pixels.layers.iter().collect();
     layers.sort_by_key(|(k, _)| **k);
@@ -341,33 +333,6 @@ fn read_baked(r: &mut impl Read, comps: usize, budget: &mut Budget, what: &str) 
     Ok((w, h, bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()))
 }
 
-/// The skew map entry: header, then the values.
-fn read_skew(r: &mut impl Read, budget: &mut Budget, what: &str) -> Result<SkewData> {
-    let mut h = [0u8; 25];
-    read_exact(r, &mut h, what)?;
-    if h.get(..4) != Some(SKEW_MAGIC.as_slice()) {
-        return Err(malformed(KIND, format!("{what}: bad magic")));
-    }
-    let v = u32_at(&h, 1);
-    if v > BIN_VERSION {
-        return Err(FormatError::NewerVersion { found: v, supported: BIN_VERSION });
-    }
-    let (w, ht) = (u32_at(&h, 2), u32_at(&h, 3));
-    let (edge_distance, edge_contrast) = (f32::from_bits(u32_at(&h, 4)), f32::from_bits(u32_at(&h, 5)));
-    let per_triangle = h.get(24).is_some_and(|b| *b != 0);
-    if w == 0 || ht == 0 || u64::from(w) * u64::from(ht) > MAX_TEXELS {
-        return Err(malformed(KIND, format!("{what}: bad size {w}×{ht}")));
-    }
-    let len = (w as usize) * (ht as usize);
-    budget.take(len as u64 * 4)?;
-    let mut bytes = vec![0u8; len * 4];
-    read_exact(r, &mut bytes, what)?;
-    expect_end(r, what)?;
-    let values: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
-    // A map with a stray number is dropped by the caller's validation; here only the shape is checked.
-    Ok(SkewData { width: w, height: ht, values, edge_distance, edge_contrast, per_triangle })
-}
-
 /// Texture set holding a paint layer, a content effect or a mask effect id.
 fn texture_set_of(project: &Project, id: LayerId) -> Option<usize> {
     let owner = if project.layers.contains_key(&id) { id } else { project.effect(id)?.0 };
@@ -379,6 +344,7 @@ fn load<R: Read + Seek>(reader: R) -> Result<ProjectFile> {
     if zip.len() > MAX_ENTRIES {
         return Err(FormatError::TooLarge(format!("project file has more than {MAX_ENTRIES} entries")));
     }
+
     let mut budget = Budget(0);
     let json = read_all(&mut zip.by_name("project.json").map_err(zip_err)?, MAX_JSON, &mut budget, "project.json")?;
     #[derive(serde::Deserialize)]
@@ -389,7 +355,8 @@ fn load<R: Read + Seek>(reader: R) -> Result<ProjectFile> {
     if v.format_version > FORMAT_VERSION {
         return Err(FormatError::NewerVersion { found: v.format_version, supported: FORMAT_VERSION });
     }
-    let project: Project = serde_json::from_slice(&json).map_err(|e| malformed(KIND, format!("project.json: {e}")))?;
+
+    let (project, mut recovered) = recovery::read_project(&json).map_err(|e| malformed(KIND, format!("project.json: {e}")))?;
     project.validate()?;
     let too_large = |t: &texturecraft_core::TextureSet| u64::from(t.size().0) * u64::from(t.size().1) > MAX_TEXELS;
     if let Some(ts) = project.texture_sets.iter().find(|t| t.resolution == 0 || t.resolution > MAX_IMAGE_SIZE || too_large(t)) {
@@ -402,11 +369,13 @@ fn load<R: Read + Seek>(reader: R) -> Result<ProjectFile> {
         mesh: None,
         high_poly: Vec::new(),
         cage: None,
-        skew: None,
+        bake_paint: BTreeMap::new(),
         thumbnail: None,
         resources: BTreeMap::new(),
+        warnings: Vec::new(),
         project,
     };
+
     for i in 0..zip.len() {
         let mut f = zip.by_index(i).map_err(zip_err)?;
         let name = f.name().map_err(zip_err)?.into_owned();
@@ -417,19 +386,33 @@ fn load<R: Read + Seek>(reader: R) -> Result<ProjectFile> {
             if res_name.is_empty() || sanitize_resource_name(res_name) != res_name {
                 return Err(malformed(KIND, format!("bad resource name {name}")));
             }
+
             let bytes = read_all(&mut f, MAX_RESOURCE, &mut budget, &name)?;
             pf.resources.insert(res_name.to_string(), bytes);
         } else if let Some((dir, file)) = name.split_once('/').filter(|(d, _)| *d == "highpoly" || *d == "cage") {
             if file.is_empty() || sanitize_resource_name(file) != file {
                 return Err(malformed(KIND, format!("bad mesh name {name}")));
             }
+
             let entry = (file.to_string(), read_all(&mut f, crate::mesh_import::MAX_MESH_FILE_BYTES, &mut budget, &name)?);
             match dir {
                 "cage" => pf.cage = Some(entry),
                 _ => pf.high_poly.push(entry),
             }
-        } else if name == "skew.bin" {
-            pf.skew = Some(read_skew(&mut f, &mut budget, &name)?);
+        } else if let Some(rest) = name.strip_prefix("bake_paint/").and_then(|name| name.strip_suffix(".bin")) {
+            let (texture_set, target) = rest.split_once('_').ok_or_else(|| malformed(KIND, format!("bad entry {name}")))?;
+            let texture_set: usize = texture_set.parse().map_err(|_| malformed(KIND, format!("bad entry {name}")))?;
+            if texture_set >= pf.project.texture_sets.len() {
+                return Err(malformed(KIND, format!("unknown texture set in {name}")));
+            }
+
+            let target = match target {
+                "cage" => BakePaintTarget::Cage,
+                "skew" => BakePaintTarget::Skew,
+                _ => return Err(malformed(KIND, format!("unknown bake paint target in {name}"))),
+            };
+            let (width, height, values) = read_baked(&mut f, 1, &mut budget, &name)?;
+            pf.bake_paint.insert((texture_set, target), BakePaintData { width, height, values });
         } else if let Some(ext) = name.strip_prefix("mesh.").filter(|e| !e.contains('/')) {
             let bytes = read_all(&mut f, crate::mesh_import::MAX_MESH_FILE_BYTES, &mut budget, &name)?;
             pf.mesh = Some((ext.to_string(), bytes));
@@ -437,22 +420,29 @@ fn load<R: Read + Seek>(reader: R) -> Result<ProjectFile> {
             let (id, chan) = rest.split_once('_').ok_or_else(|| malformed(KIND, format!("bad entry name {name}")))?;
             let id = LayerId(id.parse().map_err(|_| malformed(KIND, format!("bad entry name {name}")))?);
             let c = Channel::ALL.into_iter().find(|c| c.id() == chan).ok_or_else(|| malformed(KIND, format!("unknown channel in {name}")))?;
-            // Pixels of layers that are no longer in any stack are dropped.
+            // Drop pixels of layers that are no longer in any stack
             let Some(size) = size_of(id) else { continue };
+
             let img = read_tiles(&mut f, size, c.components() + 1, &mut budget, &name)?;
             pf.pixels.layers.insert((id, c), img);
         } else if let Some(rest) = name.strip_prefix("pixels/mask_").and_then(|r| r.strip_suffix(".bin")) {
             let id = LayerId(rest.parse().map_err(|_| malformed(KIND, format!("bad entry name {name}")))?);
             let Some(size) = size_of(id) else { continue };
+
             let img = read_tiles(&mut f, size, 2, &mut budget, &name)?;
             pf.pixels.masks.insert(id, img);
         } else if let Some(rest) = name.strip_prefix("baked/").and_then(|r| r.strip_suffix(".bin")) {
             let (ts, map) = rest.split_once('_').ok_or_else(|| malformed(KIND, format!("bad entry name {name}")))?;
             let ts: usize = ts.parse().map_err(|_| malformed(KIND, format!("bad entry name {name}")))?;
-            let m = BakedMap::ALL.into_iter().find(|m| m.id() == map).ok_or_else(|| malformed(KIND, format!("unknown baked map in {name}")))?;
+            let Some(m) = recovery::baked_map(map) else {
+                recovered = true;
+                continue;
+            };
+
             if ts >= pf.project.texture_sets.len() {
                 continue;
             }
+
             let (res, height, data) = read_baked(&mut f, m.components(), &mut budget, &name)?;
             let maps = pf.baked.entry(ts).or_default();
             if maps.maps.is_empty() {
@@ -462,8 +452,17 @@ fn load<R: Read + Seek>(reader: R) -> Result<ProjectFile> {
             }
             maps.maps.insert(m, Arc::new(data));
         }
-        // Other entries (from newer minor revisions) are ignored.
+        // Ignore other entries from newer minor revisions
     }
+
+    pf.project.format_version = FORMAT_VERSION;
+
+    if recovered {
+        pf.warnings.push(
+            "Warning: Some project settings or mesh maps could not be imported. TextureCraft recovered what it could, using defaults where needed.".into(),
+        );
+    }
+
     Ok(pf)
 }
 

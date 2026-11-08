@@ -9,6 +9,7 @@ use crate::TextureCraftApp;
 use crate::i18n::tr;
 use crate::state::{Mode, ViewLayout};
 use crate::theme::Tokens;
+use crate::toolbar::{MAX_BRUSH_SIZE, MIN_BRUSH_SIZE};
 
 /// One menu entry. `label == "-"` is a separator; `sub` names a submenu group.
 #[derive(Clone, Copy, Debug)]
@@ -61,13 +62,16 @@ pub const CATALOG: &[Item] = &[
     it("Mode", "Painting", "ui.mode.paint", Some("F9")),
     it("Mode", "Rendering (path traced)", "ui.mode.render", Some("F10")),
     sub("Window", "Views", "Assets", "ui.view.assets", None),
+    sub("Window", "Views", "Common Settings", "ui.view.bakeSettings", None),
     sub("Window", "Views", "Display Settings", "ui.view.display", None),
     sub("Window", "Views", "History", "ui.view.history", None),
     sub("Window", "Views", "Layers", "ui.view.layers", None),
     sub("Window", "Views", "Log", "ui.view.log", None),
+    sub("Window", "Views", "Mesh Map Bakers", "ui.view.meshMapBakers", None),
+    sub("Window", "Views", "Mesh Map Settings", "ui.view.bakeMaps", None),
     sub("Window", "Views", "Properties", "ui.view.properties", None),
     sub("Window", "Views", "Shader Settings", "ui.view.shader", None),
-    sub("Window", "Views", "Texture Set List", "ui.view.textureSetList", None),
+    sub("Window", "Views", "Texture Sets", "ui.view.textureSetList", None),
     sub("Window", "Views", "Texture Set Settings", "ui.view.textureSetSettings", None),
     sub("Window", "Save UI Layout", "Save current layout...", "ui.layout.save", None),
     it("Window", "Load UI Layout", "ui.layout.load", None),
@@ -106,6 +110,14 @@ fn is_ui(id: &str) -> bool {
 
 /// Whether an item can run now.
 pub fn enabled(app: &TextureCraftApp, id: &str) -> bool {
+    if let Some(panel) = crate::docking::view_panel(id) {
+        return panel.available_in(app.ui.mode);
+    }
+
+    if app.ui.mode != Mode::Painting && (id.starts_with("tool.") || id.starts_with("viewport.quickMask")) {
+        return false;
+    }
+
     if is_ui(id) {
         return true;
     }
@@ -119,6 +131,10 @@ pub fn implemented(id: &str) -> bool {
 
 /// Invoke a menu item (menus, shortcuts, palette, control channel `ui.menu.invoke`).
 pub fn invoke(app: &mut TextureCraftApp, ctx: &egui::Context, id: &str) {
+    if !enabled(app, id) {
+        return;
+    }
+
     if matches!(id, "ui.newProject" | "file.open" | "file.close" | "project.sample")
         && crate::windows::ask_to_save(app, crate::state::Unsaved::Command(id.into()))
     {
@@ -289,43 +305,56 @@ fn effect_command<'a>(app: &TextureCraftApp, id: &'a str) -> &'a str {
     }
 }
 
+/// Runs the commands bound to the keys pressed this frame, outside text fields and key capture
 pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
-    if crate::keymap::capturing(ctx) || (ctx.memory(|m| m.focused().is_some()) && ctx.egui_wants_keyboard_input()) {
+    if crate::keymap::capturing(ctx) || (ctx.memory(|memory| memory.focused().is_some()) && ctx.egui_wants_keyboard_input()) {
         return;
     }
-    ctx.input_mut(|i| {
-        let keys: Vec<_> = i.events.iter().filter_map(|e| clipboard_key(e, i.modifiers)).collect();
-        i.events.extend(keys);
+
+    ctx.input_mut(|input| {
+        let keys: Vec<_> = input.events.iter().filter_map(|event| clipboard_key(event, input.modifiers)).collect();
+        input.events.extend(keys);
     });
-    if !ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))) {
+
+    if !ctx.input(|input| input.events.iter().any(|event| matches!(event, egui::Event::Key { pressed: true, .. }))) {
         return;
     }
-    let active = crate::keymap::active(&app.ui.keymap);
-    let mut fire: Vec<&str> = Vec::new();
-    ctx.input_mut(|i| {
-        for (id, sc) in &active {
-            if i.consume_shortcut(sc) {
-                fire.push(*id);
+
+    // Escape closes an open popup first, before the Properties popup or the stroke
+    let popup_open = egui::Popup::is_any_open(ctx);
+
+    let active_shortcuts = crate::keymap::active(&app.ui.keymap);
+    let mut commands_to_invoke: Vec<&str> = Vec::new();
+    ctx.input_mut(|input| {
+        for (id, shortcut) in &active_shortcuts {
+            if input.consume_shortcut(shortcut) {
+                commands_to_invoke.push(*id);
             }
         }
-        // Brush size and hardness: [ and ].
-        let size_down = i.consume_key(Modifiers::NONE, Key::OpenBracket);
-        let size_up = i.consume_key(Modifiers::NONE, Key::CloseBracket);
-        if size_down || size_up {
-            let f = if size_up { 1.15 } else { 1.0 / 1.15 };
-            app.session.tool.brush.size = (app.session.tool.brush.size * f).clamp(0.0005, 0.25);
+
+        // [ and ] shrink and grow the brush by this factor per press
+        const BRACKET_SIZE_STEP: f32 = 1.15;
+        let size_down = input.consume_key(Modifiers::NONE, Key::OpenBracket);
+        let size_up = input.consume_key(Modifiers::NONE, Key::CloseBracket);
+        if app.ui.mode == Mode::Painting && (size_down || size_up) {
+            let scale = if size_up { BRACKET_SIZE_STEP } else { 1.0 / BRACKET_SIZE_STEP };
+            app.session.tool.brush.size = (app.session.tool.brush.size * scale).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
         }
-        if i.consume_key(Modifiers::NONE, Key::Escape) {
+
+        if !popup_open && app.properties_popup.is_some() && input.consume_key(Modifiers::NONE, Key::Escape) {
+            app.properties_popup = None;
+        } else if app.ui.mode == Mode::Painting && !popup_open && input.consume_key(Modifiers::NONE, Key::Escape) {
             app.session.cancel_stroke();
             app.session.tool.path.points.clear();
             app.session.tool.path.editing = None;
         }
     });
-    for id in fire {
+
+    for id in commands_to_invoke {
         if matches!(id, "layer.copy" | "layer.cut")
-            && let Some(layer) = app.session.selected_layer().and_then(|l| app.session.doc.project.layers.get(&l))
+            && let Some(layer) = app.session.selected_layer().and_then(|layer| app.session.doc.project.layers.get(&layer))
         {
-            // Ctrl+V reaches the app only while the system clipboard holds text or an image.
+            // Ctrl+V reaches the app only while the system clipboard holds text or an image
             ctx.copy_text(layer.name.clone());
         }
         invoke(app, ctx, effect_command(app, id));

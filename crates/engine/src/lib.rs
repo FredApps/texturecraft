@@ -8,8 +8,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
-pub mod auto_rebake;
-pub mod bake_cmds;
+pub mod bake;
 pub mod brush_preset_cmds;
 pub mod camera_cmds;
 pub mod commands;
@@ -23,6 +22,9 @@ pub mod layer_cmds;
 pub mod layer_ops;
 pub mod link_cmds;
 pub mod mask_cmds;
+pub mod mask_preview;
+mod mask_preview_camera;
+mod mask_preview_pixel;
 pub mod material_lib;
 pub mod materials;
 pub mod materialx_cmds;
@@ -46,14 +48,13 @@ pub mod tool_cmds;
 pub mod uv_tile_cmds;
 pub mod view_cmds;
 
-pub use bake_cmds::{BakeMesh, BakeMeshes, BakeTask};
+pub use bake::{BakeMesh, BakeMeshes, BakeTask};
 pub use commands::{CommandSpec, command_specs, execute, find};
 pub use path_tool::PathState;
 pub use project_cmds::sample_session;
 pub use session::{CloneFrom, CloneSource, Document, FillMode, Session, SetCache, StackTarget, StencilState, Tool, ToolState, ViewMode};
 pub use set_cmds::{ResizeOutput, ResizeTask};
 
-pub use texturecraft_bake as bake;
 pub use texturecraft_compose as compose;
 pub use texturecraft_core as core;
 pub use texturecraft_formats as formats;

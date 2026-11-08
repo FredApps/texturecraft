@@ -23,9 +23,13 @@ impl DilationMap {
     /// [`DilationMap::new`] that never pads across the borders of `block × block` squares (the
     /// UV tiles of an atlas); 0 means one block.
     pub fn in_blocks(covered: &[bool], width: u32, height: u32, max_dist: Option<u32>, block: u32) -> DilationMap {
+        Self::in_rectangular_blocks(covered, width, height, max_dist, (block, block))
+    }
+
+    pub fn in_rectangular_blocks(covered: &[bool], width: u32, height: u32, max_dist: Option<u32>, block: (u32, u32)) -> DilationMap {
         let n = (width as usize).saturating_mul(height as usize);
         let mut src = vec![NONE; n];
-        let bsz = if block == 0 { u32::MAX } else { block };
+        let bsz = (if block.0 == 0 { u32::MAX } else { block.0 }, if block.1 == 0 { u32::MAX } else { block.1 });
         let is_covered = |i: usize| covered.get(i).copied().unwrap_or(false);
         // Breadth first, one distance at a time; only island borders seed it (interior texels
         // have nothing to spread to, so the result is the same at a fraction of the work).
@@ -89,12 +93,12 @@ impl DilationMap {
 
 /// The 8-neighbours of texel `i` of a `w × h` image inside the image and inside its `bsz`
 /// square block.
-fn neighbours(i: usize, w: u32, h: u32, bsz: u32) -> impl Iterator<Item = usize> {
+fn neighbours(i: usize, w: u32, h: u32, bsz: (u32, u32)) -> impl Iterator<Item = usize> {
     let (wu, x, y) = (w as usize, (i % w.max(1) as usize) as u32, (i / w.max(1) as usize) as u32);
-    let left = x > 0 && x % bsz != 0;
-    let right = x + 1 < w && (x + 1) % bsz != 0;
-    let up = y > 0 && y % bsz != 0;
-    let down = y + 1 < h && (y + 1) % bsz != 0;
+    let left = x > 0 && x % bsz.0 != 0;
+    let right = x + 1 < w && (x + 1) % bsz.0 != 0;
+    let up = y > 0 && y % bsz.1 != 0;
+    let down = y + 1 < h && (y + 1) % bsz.1 != 0;
     [
         (left, i.wrapping_sub(1)),
         (right, i + 1),
@@ -198,5 +202,21 @@ mod tests {
         let mut data = [3u16; 16];
         m.apply(&mut data, 1);
         assert_eq!(data, [3u16; 16]);
+    }
+}
+
+#[cfg(test)]
+mod rectangular_test {
+    use super::*;
+    #[test]
+    fn rectangular_tiles_keep_padding_within_both_axes() {
+        let mut covered = vec![false; 8 * 6];
+        covered[2 * 8 + 3] = true;
+        let padding = DilationMap::in_rectangular_blocks(&covered, 8, 6, None, (4, 3));
+        for y in 0..6 {
+            for x in 0..8 {
+                assert_eq!(padding.source(x, y).is_some(), x < 4 && y < 3);
+            }
+        }
     }
 }

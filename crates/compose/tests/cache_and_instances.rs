@@ -90,7 +90,18 @@ fn heavy_stack(f: &mut Fixture) -> LayerId {
 }
 
 fn inputs<'a>(f: &'a Fixture, ts: usize, images: &'a texturecraft_compose::ImageStore, baked: &'a texturecraft_compose::BakedMaps) -> Inputs<'a> {
-    Inputs { project: &f.project, ts, mesh: &f.mesh, gbuf: &f.gbuf, pixels: &f.pixels, baked, preview: None, images, bounds: f.mesh.bounds() }
+    Inputs {
+        project: &f.project,
+        ts,
+        mesh: &f.mesh,
+        gbuf: &f.gbuf,
+        pixels: &f.pixels,
+        baked,
+        block_scales: f.project.texture_sets[ts].block_scales(),
+        preview: None,
+        images,
+        bounds: f.mesh.bounds(),
+    }
 }
 
 fn run(f: &Fixture, ts: usize, tiles: &[(u32, u32)], below: Option<&mut BelowCache>) -> Composite {

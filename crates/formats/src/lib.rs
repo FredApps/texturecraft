@@ -47,7 +47,7 @@ pub use mesh_import::{HighPolyMesh, ImportedMesh, MeshFile, MeshReport, import_h
 #[cfg(not(target_arch = "wasm32"))]
 pub use presets::load_preset;
 pub use presets::{builtin_preset, builtin_presets, preset_from_json, preset_to_json};
-pub use project_file::{ProjectFile, SkewData, load_project_bytes, sanitize_resource_name, save_project_bytes};
+pub use project_file::{BakePaintData, ProjectFile, load_project_bytes, sanitize_resource_name, save_project_bytes};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use export::write_files;

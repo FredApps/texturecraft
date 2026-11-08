@@ -132,7 +132,7 @@ impl Session {
     fn material_files(&mut self, opts: ExportOptions, tiled: bool, materials: usize) -> Result<Vec<Vec<ExportedFile>>> {
         let opts = ExportOptions { atlas: true, ..opts };
         (0..materials)
-            .map(|m| match self.doc.project.texture_sets.iter().position(|t| t.material == m) {
+            .map(|m| match self.texture_set_of_material(m) {
                 Some(ts) if tiled || self.doc.project.texture_sets.get(ts).is_some_and(|t| t.tile_grid().is_none()) => self.export_files(&[ts], &opts),
                 _ => Ok(Vec::new()),
             })
@@ -174,20 +174,25 @@ impl Session {
             (Some((ext, bytes)), None) => read_stored_mesh(&pf.project, ext, bytes)?.mesh,
             (None, None) => return Err(EngineError::Other("the project has no mesh".into())),
         };
+
         check_materials(&pf.project, &mesh)?;
         let source = pf.mesh.clone();
         let resources = pf.resources.into_iter().map(|(k, v)| (k, std::sync::Arc::new(v))).collect();
-        let mut s = Session::new(Document { project: pf.project, pixels: pf.pixels, baked: pf.baked, resources }, mesh, source)?;
+        let mut s =
+            Session::new(Document { bake_paint: Default::default(), project: pf.project, pixels: pf.pixels, baked: pf.baked, resources }, mesh, source)?;
+
         s.sync_images();
         s.load_bake_meshes(pf.high_poly, pf.cage);
-        s.load_skew(pf.skew);
+        s.load_bake_paint(pf.bake_paint);
+        s.log.extend(pf.warnings);
+
         Ok(s)
     }
 
     /// The project as a `ProjectFile` (for saving).
     pub fn project_file(&self) -> ProjectFile {
         let mut pixels = self.doc.pixels.clone();
-        // Drop pixel images whose size no longer matches their texture set (never unloadable).
+        // Drop pixel images whose size no longer matches their texture set
         let size_of = |id: texturecraft_core::LayerId| {
             self.doc.project.locate(id).and_then(|(ts, _, _)| self.doc.project.texture_sets.get(ts)).map(TextureSet::size).or_else(|| {
                 self.doc
@@ -200,6 +205,7 @@ impl Session {
         };
         pixels.layers.retain(|(id, _), img| size_of(*id) == Some((img.width(), img.height())));
         pixels.masks.retain(|id, img| size_of(*id) == Some((img.width(), img.height())));
+
         let (high_poly, cage) = self.saved_bake_meshes();
         ProjectFile {
             project: self.doc.project.clone(),
@@ -208,9 +214,10 @@ impl Session {
             mesh: self.mesh_source.clone(),
             high_poly,
             cage,
-            skew: self.saved_skew(),
+            bake_paint: self.saved_bake_paint(),
             thumbnail: None,
             resources: self.doc.resources.iter().map(|(k, v)| (k.clone(), v.as_ref().clone())).collect(),
+            warnings: Vec::new(),
         }
     }
 
@@ -441,6 +448,7 @@ impl Session {
         let mut next = Session::new(doc, mesh, source)?;
         next.log.extend(warnings);
         next.path = self.path.clone();
+        next.modified = true;
         let preserved = preserve_strokes.then(|| crate::preserve::preserve_strokes(self, &mut next));
         self.switch_to(next);
         Ok(preserved.map_or(Value::Null, |n| json!({ "preserved": n })))
@@ -602,6 +610,16 @@ fn close(s: &mut Session, _: &Value) -> Result<Value> {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reimporting_a_saved_project_marks_it_modified() {
+        let obj = b"v -1 -1 0\nv 1 -1 0\nv 1 1 0\nvt 0 0\nvt 1 0\nvt 1 1\nf 1/1 2/2 3/3\n";
+        let original = Session::from_mesh_bytes("mesh.obj", obj, 128, "mesh").unwrap();
+        let mut saved = Session::from_project_bytes(&original.to_project_bytes().unwrap()).unwrap();
+        assert!(!saved.modified);
+        crate::execute(&mut saved, "file.reimportMesh", &Value::Null).unwrap();
+        assert!(saved.modified, "reimport must trigger the unsaved-changes prompt");
+    }
 
     #[test]
     fn export_mesh_writes_obj_by_default_and_textured_glb() {

@@ -1,20 +1,19 @@
 # Releasing TextureCraft
 
-The recipe is craftrules' [release playbook](release-playbook.md); this page covers what is
+The recipe is the [release playbook](release-playbook.md); this page covers what is
 specific to TextureCraft. The pipeline is [`.github/workflows/release.yml`](../.github/workflows/release.yml).
 
 ## Release manager checklist
 
 The steps below are the release manager's; agents never create the `release` branch, tags or
-GitHub Releases. The shared runbook with copy-paste `gh` commands is craftrules
-`release/cut-a-release.md`.
+GitHub Releases. Follow the checklist below and the linked release playbook.
 
 ### 1. One-time repository setup (org admin)
 
 Status on 2026-10-23: `storytold/texturecraft` has the `release` environment (deployable from
 `release` only) and the `release` ruleset (steps 1 and 2 below). Still to do before the first run:
 the secrets (step 3) and the runner group (step 4); the `release` branch is created by the first
-release push. An org admin runs craftrules `release/signing-setup.md` steps 1-2 for this repo:
+release push. An org admin completes the following setup for this repo:
 
 1. Create the **`release` environment**, with deployment branches limited to `release`.
 2. Add the **ruleset on `refs/heads/release`** (restrict creations, updates and deletions, block
@@ -38,15 +37,21 @@ release push. An org admin runs craftrules `release/signing-setup.md` steps 1-2 
 
 ### 2. Set the version
 
-On `main`:
+Start from an up-to-date `main` and create a version-bump branch:
 
 ```sh
+git switch main
+git pull --ff-only
+git switch -c bump-version-0.2.0
 cargo xtask version                 # prints the current version
 cargo xtask version set 0.2.0       # or 0.2.0-rc.1 for a pre-release
 ```
 
 `set` rewrites `[workspace.package] version` in the root `Cargo.toml` (the single source of truth)
-and refreshes `Cargo.lock`. Commit, push, and wait for CI on `main` to pass.
+and refreshes `Cargo.lock`. Commit the version bump on that branch, push the branch, and open
+a pull request into `main`. Wait for the applicable checks to pass and for review, then merge
+the pull request. Do not push changes directly to `main`. Wait for CI on the merged `main`
+commit to pass before cutting the release below.
 
 ### 3. Cut the release
 
@@ -160,7 +165,7 @@ unsigned artifact and a `::warning::`, never a failed build.
 ## Icons
 
 `assets/app-icon/texturecraft.svg` is the engraved zebra (the owner's original drawing, vectorised
-to three colours, craftrules `standards/icon-design.md`); `texturecraft-small.svg` is a lighter
+to three colours); `texturecraft-small.svg` is a lighter
 trace for the hicolor scalable icon. `packaging/icons.sh` renders everything else with resvg and
 `cargo xtask ico|icns`: the hicolor PNGs (16-512 px) and scalable SVG, `texturecraft-1024.png`,
 `texturecraft.ico` and `texturecraft.icns`. The outputs are committed; rerun it after changing the

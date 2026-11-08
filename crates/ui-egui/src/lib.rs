@@ -7,19 +7,30 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod bake_mode;
 pub mod control;
 pub mod dock;
 pub mod docking;
 pub mod export_templates;
+mod filter_slot;
 pub mod fonts;
 pub mod gpu;
 pub mod i18n;
 pub mod keymap;
+mod mask_preview_image;
+mod mask_shape;
 pub mod menus;
 pub mod parity;
+mod preview_image;
+mod preview_request;
+mod preview_worker;
 pub mod profile;
+pub mod properties_popup;
 pub mod render_mode;
+mod resource_picker;
+mod resource_picker_item;
 pub mod shelf;
+pub mod shelf_preview;
 pub mod state;
 pub mod theme;
 pub mod thumbs;
@@ -29,6 +40,7 @@ pub mod viewport;
 pub mod web_files;
 pub mod widgets;
 pub mod windows;
+mod worker_preview;
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -51,8 +63,6 @@ pub struct BakeJob {
     pub queue: Vec<usize>,
     pub current: Option<(usize, Arc<Progress>, std::sync::mpsc::Receiver<texturecraft_engine::Result<texturecraft_engine::bake::BakeOutput>>)>,
     pub total: usize,
-    /// Bake only this map (an Auto-rebake); None bakes every ticked map.
-    pub only: Option<texturecraft_engine::core::BakedMap>,
 }
 
 /// A MaterialCraft material re-cooking on a worker thread (one per layer at a time).
@@ -76,6 +86,8 @@ pub struct Toast {
 
 pub struct TextureCraftApp {
     pub session: Session,
+    /// A smooth move to a saved camera in progress.
+    camera_glide: Option<CameraGlide>,
     pub ui: UiState,
     pub gpu: Option<gpu::GpuLink>,
     pub control: Option<std::sync::mpsc::Receiver<ControlRequest>>,
@@ -103,6 +115,8 @@ pub struct TextureCraftApp {
     pub last_paint_point: Option<texturecraft_engine::geom::glam::Vec2>,
     /// The decal layer the next click in the 3D view places.
     pub placing_decal: Option<texturecraft_engine::core::LayerId>,
+    /// The Properties popup a right click in a view opens.
+    pub properties_popup: Option<properties_popup::PropertiesPopup>,
     /// The wgpu state (screenshots read the renderer's targets).
     pub render_state: Option<eframe::egui_wgpu::RenderState>,
     /// CJK fallback fonts for the UI language.
@@ -126,7 +140,7 @@ impl TextureCraftApp {
         theme::install(&cc.egui_ctx);
         // Bakes cast their rays on a GPU device of their own (created on the first bake).
         #[cfg(not(target_arch = "wasm32"))]
-        texturecraft_engine::bake_cmds::install_gpu_tracer(Arc::new(texturecraft_render::gpu_bake::GpuBaker::new()));
+        texturecraft_engine::bake::install_gpu_tracer(Arc::new(texturecraft_render::gpu_bake::GpuBaker::new()));
         let gpu = cc.wgpu_render_state.as_ref().map(|rs| gpu::init(rs, &cc.egui_ctx));
         // The first run speaks the OS (or browser) language.
         let ui = cc.storage.and_then(|s| eframe::get_value::<UiState>(s, "ui")).unwrap_or_else(|| {
@@ -136,6 +150,7 @@ impl TextureCraftApp {
         });
         let next_autosave = ui.prefs.autosave_minutes as f64 * 60.0;
         let mut app = TextureCraftApp {
+            camera_glide: None,
             session,
             ui,
             gpu,
@@ -155,6 +170,7 @@ impl TextureCraftApp {
             render: render_mode::RenderView::default(),
             last_paint_point: None,
             placing_decal: None,
+            properties_popup: None,
             render_state: cc.wgpu_render_state.clone(),
             fonts: fonts::UiFonts::default(),
             banner: None,
@@ -184,8 +200,16 @@ impl TextureCraftApp {
 
     /// Run an engine command, reporting errors as toasts. Returns the result on success.
     pub fn run(&mut self, id: &str, params: Value) -> Option<Value> {
+        // Going to a saved camera glides there; the control channel and CLI jump straight away.
+        let glide_from = (id.starts_with("camera.select") || id.starts_with("camera.bookmark")).then_some(self.session.camera);
         match texturecraft_engine::execute(&mut self.session, id, &params) {
-            Ok(v) => Some(v),
+            Ok(v) => {
+                if let Some(from) = glide_from.filter(|f| *f != self.session.camera) {
+                    self.camera_glide = Some(CameraGlide { from, to: self.session.camera, start: self.last_time });
+                    self.session.camera = from;
+                }
+                Some(v)
+            }
             Err(e) => {
                 self.toast(e.to_string(), true);
                 None
@@ -209,7 +233,7 @@ impl TextureCraftApp {
             return;
         }
         let total = sets.len();
-        self.bake = Some(BakeJob { queue: sets, current: None, total, only: None });
+        self.bake = Some(BakeJob { queue: sets, current: None, total });
     }
 
     /// Re-cook MaterialCraft material layer `layer` in the background. While one cook of the layer
@@ -263,21 +287,20 @@ impl TextureCraftApp {
 
     fn poll_bake(&mut self, ctx: &egui::Context) {
         let Some(job) = self.bake.as_mut() else { return };
+
         ctx.request_repaint_after(std::time::Duration::from_millis(50));
-        if let Some((ts, _, rx)) = &job.current {
-            match rx.try_recv() {
-                Ok(Ok(out)) => {
-                    let ts = *ts;
+        if let Some((set_index, _, receiver)) = &job.current {
+            match receiver.try_recv() {
+                Ok(Ok(output)) => {
+                    let set_index = *set_index;
                     job.current = None;
-                    if let Err(e) = self.session.apply_bake(ts, out) {
-                        self.session.bake_abandoned([ts]);
-                        self.toast(e.to_string(), true);
+                    if let Err(error) = self.session.apply_bake(set_index, output) {
+                        self.toast(error.to_string(), true);
                     }
                 }
-                Ok(Err(e)) => {
-                    let msg = e.to_string();
+                Ok(Err(error)) => {
                     self.cancel_bake();
-                    self.toast(msg, true);
+                    self.toast(error.to_string(), true);
                     return;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => return,
@@ -289,57 +312,33 @@ impl TextureCraftApp {
             }
         }
         let Some(job) = self.bake.as_mut() else { return };
-        if job.current.is_none() {
-            if job.queue.is_empty() {
-                self.bake = None;
-                self.toast(i18n::tr("Mesh maps baked"), false);
-                return;
-            }
-            let (ts, only) = (job.queue.remove(0), job.only);
-            self.session.begin_bake(ts);
-            match self.session.bake_task_for(ts, only) {
-                Ok(task) => {
-                    let progress = Arc::new(Progress::new());
-                    let p = progress.clone();
-                    let rx = spawn_worker("texturecraft-bake", move || task.run(&p));
-                    if let Some(job) = self.bake.as_mut() {
-                        job.current = Some((ts, progress, rx));
-                    }
-                }
-                Err(e) => {
-                    self.session.bake_abandoned([ts]);
-                    self.toast(e.to_string(), true);
+
+        if job.queue.is_empty() {
+            self.bake = None;
+            self.toast(i18n::tr("Mesh maps baked"), false);
+            return;
+        }
+        let set_index = job.queue.remove(0);
+        match self.session.bake_task(set_index) {
+            Ok(task) => {
+                let progress = Arc::new(Progress::new());
+                let worker_progress = progress.clone();
+                let receiver = spawn_worker("texturecraft-bake", move || task.run(&worker_progress));
+                if let Some(job) = self.bake.as_mut() {
+                    job.current = Some((set_index, progress, receiver));
                 }
             }
+            Err(error) => self.toast(error.to_string(), true),
         }
     }
 
-    /// Auto-rebake: when the chosen map's bake inputs changed, bake it again in the background
-    /// (one set after another, only that map), unless a bake or a stroke is running.
-    fn drive_auto_rebake(&mut self) {
-        // The web build runs a bake on the page's own thread, which would freeze the browser: there
-        // Auto-rebake is left to the manual command (`bake.autoRebake.run`).
-        if cfg!(target_arch = "wasm32") {
-            return;
-        }
-        if self.bake.is_some() || self.session.stroke_active() || self.session.auto_rebake.map.is_none() {
-            return;
-        }
-        let due = self.session.auto_rebake_due();
-        if !due.is_empty() {
-            let total = due.len();
-            self.bake = Some(BakeJob { queue: due, current: None, total, only: self.session.auto_rebake.map });
-        }
-    }
-
-    /// Stops the bake job (also after an error). The set being baked and the queued ones wait for
-    /// their next bake input change before Auto-rebake tries them again.
+    /// Cancel the active bake and discard queued sets
     pub fn cancel_bake(&mut self) {
         let Some(job) = self.bake.take() else { return };
-        if let Some((_, p, _)) = &job.current {
-            p.cancel.store(true, Ordering::Relaxed);
+
+        if let Some((_, progress, _)) = job.current {
+            progress.cancel.store(true, Ordering::Relaxed);
         }
-        self.session.bake_abandoned(job.current.map(|(ts, ..)| ts).into_iter().chain(job.queue));
     }
 
     /// Resize texture set `ts` to `resolution` on a worker thread (the document changes when
@@ -444,6 +443,40 @@ impl TextureCraftApp {
     }
 }
 
+/// A smooth move of the viewport camera (see [`TextureCraftApp::run`]).
+struct CameraGlide {
+    from: texturecraft_engine::geom::OrbitCamera,
+    to: texturecraft_engine::geom::OrbitCamera,
+    start: f64,
+}
+
+const GLIDE_SECONDS: f64 = 0.35;
+
+impl TextureCraftApp {
+    /// Advance the camera glide by one frame.
+    fn step_camera_glide(&mut self, ctx: &egui::Context) {
+        let Some(g) = &self.camera_glide else { return };
+        let t = ((self.last_time - g.start) / GLIDE_SECONDS).clamp(0.0, 1.0) as f32;
+        let e = t * t * (3.0 - 2.0 * t);
+        let (a, b) = (g.from, g.to);
+        let mix = |x: f32, y: f32| x + (y - x) * e;
+        let mut c = b;
+        c.target = a.target.lerp(b.target, e);
+        c.yaw = mix(a.yaw, b.yaw);
+        c.pitch = mix(a.pitch, b.pitch);
+        c.distance = mix(a.distance, b.distance);
+        c.fov = mix(a.fov, b.fov);
+        // Orthographic switches at the end (the projections cannot be blended).
+        c.ortho = if t >= 1.0 { b.ortho } else { a.ortho };
+        self.session.camera = c;
+        self.session.revision = self.session.revision.wrapping_add(1);
+        if t >= 1.0 {
+            self.camera_glide = None;
+        }
+        ctx.request_repaint();
+    }
+}
+
 impl eframe::App for TextureCraftApp {
     /// The browser never tells eframe the page is closing, so save often there.
     fn auto_save_interval(&self) -> std::time::Duration {
@@ -468,6 +501,7 @@ impl eframe::App for TextureCraftApp {
             theme::apply(ctx, style.0, style.1);
             self.styled = Some(style);
         }
+        self.step_camera_glide(ctx);
         control::poll(self, ctx);
         web_files::poll(self);
         let dropped = ctx.input(|i| i.raw.dropped_files.clone());
@@ -475,7 +509,6 @@ impl eframe::App for TextureCraftApp {
             web_files::dropped(self, ctx, f);
         }
         self.poll_bake(ctx);
-        self.drive_auto_rebake();
         self.poll_resize(ctx);
         self.poll_link_cooks(ctx);
         // The library shelf rescans when the window comes back (MaterialCraft may have sent a material).
@@ -514,14 +547,12 @@ impl eframe::App for TextureCraftApp {
         if !self.ui.hide_ui {
             titlebar::show(self, ui);
             banner(self, ui);
-            toolbar::top_bar(self, ui);
             toolbar::status_bar(self, ui);
             toolbar::tool_shelf(self, ui);
-            // Bake settings take the Assets slot; a side panel only when Assets is closed.
-            if self.ui.mode == state::Mode::Baking && !self.ui.dock.is_open(docking::Panel::Assets) {
-                windows::bake_left(self, ui);
+            self.ui.sync_mode_dock();
+            if self.ui.mode != state::Mode::Baking {
+                toolbar::rail(self, ui);
             }
-            toolbar::rail(self, ui);
         }
         let hide = self.ui.hide_ui;
         let tk = theme::Tokens::get(&ctx);

@@ -232,13 +232,33 @@ fn default_export_dir() -> String {
     }
 }
 
+/// The split layout starts with the 3D and 2D views at equal width
+fn default_split_ratio() -> f32 {
+    0.5
+}
+/// The bake layout's version: saved bake docks from an older one load as `Dock::for_baking`
+const BAKE_LAYOUT_VERSION: u32 = 1;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UiState {
     pub mode: Mode,
     pub layout: ViewLayout,
+    /// The 3D view's share of the viewport width in the split layout
+    #[serde(default = "default_split_ratio")]
+    pub split_ratio: f32,
     /// The docked, tabbed and floating panels around the viewport.
     #[serde(default)]
     pub dock: Dock,
+    #[serde(default = "Dock::for_baking")]
+    pub(crate) inactive_mode_dock: Dock,
+    #[serde(default)]
+    pub(crate) dock_is_baking: bool,
+    /// The bake layout version the bake dock was saved with; 0 before versions existed.
+    #[serde(default)]
+    pub(crate) bake_layout_version: u32,
+    /// The mesh map whose settings Mesh Map Settings shows; `None` follows the first enabled map.
+    #[serde(default)]
+    pub(crate) selected_baked_map: Option<BakedMap>,
     /// Window ▸ Hide UI (Tab): only the viewport.
     pub hide_ui: bool,
     pub windows: Windows,
@@ -273,31 +293,34 @@ pub struct UiState {
     /// Custom keyboard shortcuts (item id → "Ctrl+Shift+E", "" = none) over the defaults.
     #[serde(default)]
     pub keymap: Keymap,
-    /// The baker whose parameters bake mode shows (None: the common parameters).
-    #[serde(default)]
-    pub bake_baker: Option<BakedMap>,
     /// The brush that paints the skew correction map in the 2D view of bake mode.
     #[serde(default)]
-    pub skew_brush: SkewBrush,
-}
-
-/// Settings of the skew correction brush (radius in UV units).
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct SkewBrush {
-    pub on: bool,
-    pub radius: f32,
-    /// 1 turns the rays onto the base normal, 0 erases.
-    pub value: f32,
-    pub hardness: f32,
-}
-
-impl Default for SkewBrush {
-    fn default() -> Self {
-        SkewBrush { on: false, radius: 0.03, value: 1.0, hardness: 0.5 }
-    }
+    pub bake_paint_brush: crate::bake_mode::BakePaintBrush,
 }
 
 impl UiState {
+    /// Replace an outdated or unreadable saved bake dock by the bake layout, then give the mode its dock
+    pub(crate) fn sync_mode_dock(&mut self) {
+        self.reset_outdated_bake_dock();
+
+        let baking = self.mode == Mode::Baking;
+        if baking != self.dock_is_baking {
+            std::mem::swap(&mut self.dock, &mut self.inactive_mode_dock);
+            self.dock_is_baking = baking;
+        }
+    }
+
+    /// Replace a bake dock saved with an older bake layout, or one that could not be read, by the bake default
+    fn reset_outdated_bake_dock(&mut self) {
+        let bake_dock = if self.dock_is_baking { &mut self.dock } else { &mut self.inactive_mode_dock };
+        if self.bake_layout_version >= BAKE_LAYOUT_VERSION && !bake_dock.replaced_unreadable() {
+            return;
+        }
+
+        *bake_dock = Dock::for_baking();
+        self.bake_layout_version = BAKE_LAYOUT_VERSION;
+    }
+
     /// Take `layout`'s panels, windows and view settings, keeping this state's dialogs, export
     /// settings and recent files.
     pub fn adopt_layout(&mut self, layout: UiState) {
@@ -317,7 +340,12 @@ impl Default for UiState {
         UiState {
             mode: Mode::Painting,
             layout: ViewLayout::Split,
+            split_ratio: default_split_ratio(),
             dock: Dock::default(),
+            inactive_mode_dock: Dock::for_baking(),
+            dock_is_baking: false,
+            bake_layout_version: BAKE_LAYOUT_VERSION,
+            selected_baked_map: None,
             hide_ui: false,
             windows: Windows::default(),
             uv_zoom: 1.0,
@@ -336,8 +364,7 @@ impl Default for UiState {
             export: ExportUi::default(),
             recent: Vec::new(),
             keymap: Keymap::new(),
-            bake_baker: None,
-            skew_brush: SkewBrush::default(),
+            bake_paint_brush: crate::bake_mode::BakePaintBrush::default(),
         }
     }
 }
@@ -368,6 +395,74 @@ mod tests {
         let chosen = std::env::temp_dir().join("tc-data");
         assert_eq!(crate::data_folder(&format!(" {} ", chosen.display())), chosen);
         assert_eq!(Prefs::default().data_folder, "", "the default is no choice");
+    }
+
+    #[test]
+    fn a_bake_dock_saved_before_the_bake_layout_version_loads_the_current_bake_layout() {
+        let old_bake_dock = serde_json::json!({"version": 2, "layout": {"root": {"Split": {"axis": "Horizontal", "size": {"FixedFirst": 320.0},
+            "first": {"Tabs": {"panels": ["TextureSetList", "BakeSettings", "BakeMaps"], "active": 0}},
+            "second": {"Tabs": {"panels": ["Viewport"], "active": 0}}}}, "floating": []}});
+        for dock_is_baking in [false, true] {
+            let mut painting_dock = Dock::default();
+            painting_dock.close(crate::docking::Panel::Assets);
+            let (bake_field, painting_field) = if dock_is_baking { ("dock", "inactive_mode_dock") } else { ("inactive_mode_dock", "dock") };
+            let mut saved = serde_json::to_value(UiState::default()).unwrap();
+            let fields = saved.as_object_mut().unwrap();
+            fields.remove("bake_layout_version");
+            fields.insert("dock_is_baking".into(), serde_json::json!(dock_is_baking));
+            fields.insert("mode".into(), serde_json::to_value(if dock_is_baking { Mode::Baking } else { Mode::Painting }).unwrap());
+            fields.insert(bake_field.into(), old_bake_dock.clone());
+            fields.insert(painting_field.into(), serde_json::to_value(&painting_dock).unwrap());
+
+            let mut ui: UiState = serde_json::from_value(saved).unwrap();
+            let loaded_bake_dock = if dock_is_baking { &ui.dock } else { &ui.inactive_mode_dock };
+            assert!(!loaded_bake_dock.is_open(crate::docking::Panel::MeshMapBakers), "the old layout loads without the bakers list");
+
+            ui.sync_mode_dock();
+            let (bake_dock, painting) = if dock_is_baking { (&ui.dock, &ui.inactive_mode_dock) } else { (&ui.inactive_mode_dock, &ui.dock) };
+            assert_eq!(*bake_dock, Dock::for_baking());
+            assert_eq!(*painting, painting_dock, "the painting layout is kept");
+
+            let mut reloaded: UiState = serde_json::from_value(serde_json::to_value(&ui).unwrap()).unwrap();
+            reloaded.sync_mode_dock();
+            assert_eq!(reloaded, ui, "a current layout is not reset again");
+        }
+    }
+
+    /// The app's own settings store: eframe keeps `UiState` as RON text under a key
+    #[derive(Default)]
+    struct MemoryStorage(std::collections::HashMap<String, String>);
+
+    impl eframe::Storage for MemoryStorage {
+        fn get_string(&self, key: &str) -> Option<String> {
+            self.0.get(key).cloned()
+        }
+
+        fn set_string(&mut self, key: &str, value: String) {
+            self.0.insert(key.to_string(), value);
+        }
+
+        fn remove_string(&mut self, key: &str) {
+            self.0.remove(key);
+        }
+
+        fn flush(&mut self) {}
+    }
+
+    #[test]
+    fn the_bake_layout_survives_a_restart_whichever_mode_was_open() {
+        for mode in [Mode::Painting, Mode::Baking] {
+            let mut ui = UiState { mode, ..UiState::default() };
+            ui.sync_mode_dock();
+            let mut storage = MemoryStorage::default();
+            eframe::set_value(&mut storage, "ui", &ui);
+
+            let mut restarted: UiState = eframe::get_value(&storage, "ui").unwrap();
+            restarted.sync_mode_dock();
+            let bake_dock = if mode == Mode::Baking { &restarted.dock } else { &restarted.inactive_mode_dock };
+            assert_eq!(*bake_dock, Dock::for_baking(), "{mode:?}");
+            assert!(bake_dock.is_open(crate::docking::Panel::MeshMapBakers), "{mode:?}");
+        }
     }
 
     #[test]

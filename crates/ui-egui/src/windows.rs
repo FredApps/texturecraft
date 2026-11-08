@@ -1,12 +1,10 @@
-//! Floating windows, the dockable panel bodies (display, shader, history, log) and the bake mode
-//! panels.
+//! Floating windows and dockable display, shader, history and log panels
 
 use egui::{Color32, RichText, Ui, vec2};
 use egui_phosphor::regular as ic;
 use serde_json::json;
-use texturecraft_engine::bake_cmds;
+use texturecraft_engine::core::ToneMapping;
 use texturecraft_engine::core::project::ENV_RESOURCE_PREFIX;
-use texturecraft_engine::core::{BakeMatch, BakeSettings, BakedMap, DirectionMode, PositionMode, RayDistribution, RaySettings, SelfOcclusion, ToneMapping};
 use texturecraft_engine::geom::primitives::BUILTINS;
 use texturecraft_render::ibl::ENVIRONMENTS;
 
@@ -26,9 +24,6 @@ pub fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     crate::windows::export(app, ctx);
     #[cfg(target_arch = "wasm32")]
     export_mesh(app, ctx);
-    if app.ui.mode == Mode::Baking {
-        bake_bar(app, ctx);
-    }
     unsaved(app, ctx);
 }
 
@@ -45,48 +40,59 @@ pub(crate) fn ask_to_save(app: &mut TextureCraftApp, then: crate::state::Unsaved
 /// (in the browser, Save downloads the project).
 fn unsaved(app: &mut TextureCraftApp, ctx: &egui::Context) {
     use crate::state::Unsaved;
+
     if ctx.input(|i| i.viewport().close_requested()) && ask_to_save(app, Unsaved::Quit) {
         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
     }
-    let Some(then) = app.ui.windows.unsaved.clone() else { return };
+    let Some(pending) = app.ui.windows.unsaved.clone() else { return };
+
     let mut open = true;
-    let mut save = None;
+    let mut save_first = None;
     let mut cancel = false;
-    let name: [(&str, &dyn std::fmt::Display); 1] = [("name", &app.session.doc.project.name)];
-    let question =
-        if then == Unsaved::Quit { trf("Save the changes to {name} before closing?", &name) } else { trf("Save the changes to {name} first?", &name) };
+    let question_args: [(&str, &dyn std::fmt::Display); 1] = [("name", &app.session.doc.project.name)];
+    let question = if pending == Unsaved::Quit {
+        trf("Save the changes to {name} before closing?", &question_args)
+    } else {
+        trf("Save the changes to {name} first?", &question_args)
+    };
     dialog("unsaved", tr("Unsaved changes"), &mut open).show(ctx, |ui| {
         ui.label(question);
         ui.add_space(8.0);
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.add(primary_button(ui, tr("Save"))).clicked() {
-                save = Some(true);
-            }
-            if ui.button(tr("Don't save")).clicked() {
-                save = Some(false);
-            }
-            if ui.button(tr("Cancel")).clicked() {
-                cancel = true;
-            }
+
+        // One row keeps the window to its contents; a bare right-to-left layout fills the screen height
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(primary_button(ui, tr("Save"))).clicked() {
+                    save_first = Some(true);
+                }
+                if ui.button(tr("Don't save")).clicked() {
+                    save_first = Some(false);
+                }
+                if ui.button(tr("Cancel")).clicked() {
+                    cancel = true;
+                }
+            });
         });
     });
     if !open || cancel {
         app.ui.windows.unsaved = None;
     }
-    match save {
+
+    match save_first {
         Some(true) => {
             file_action(app, ctx, "file.save");
         }
-        // Going ahead anyway: the changes are let go.
+        // Going ahead anyway: the changes are let go
         Some(false) => app.session.modified = false,
         None => return,
     }
-    // A cancelled or failed save keeps the project and this dialog open.
+
+    // A cancelled or failed save keeps the project and this dialog open
     if app.session.modified {
         return;
     }
     app.ui.windows.unsaved = None;
-    match then {
+    match pending {
         Unsaved::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
         Unsaved::Command(id) => crate::menus::invoke(app, ctx, &id),
         #[cfg(not(target_arch = "wasm32"))]
@@ -620,8 +626,7 @@ fn settings(app: &mut TextureCraftApp, ctx: &egui::Context) {
     app.ui.windows.settings = open;
 }
 
-/// Browser File › Export Mesh: pick the download format (the desktop picks it in the save
-/// dialog).
+/// Browser File › Export Mesh: pick the download format
 #[cfg(target_arch = "wasm32")]
 fn export_mesh(app: &mut TextureCraftApp, ctx: &egui::Context) {
     let formats = [
@@ -632,18 +637,20 @@ fn export_mesh(app: &mut TextureCraftApp, ctx: &egui::Context) {
     if !app.ui.windows.export_mesh {
         return;
     }
+
     let mut open = true;
     let mut picked = None;
     dialog("export_mesh", tr("Export mesh"), &mut open).show(ctx, |ui| {
         ui.label(caption(tr("Download as")));
-        for (ext, label, hint) in formats {
-            if ui.add_sized(vec2(220.0, 24.0), egui::Button::new(label)).on_hover_text(hint).clicked() {
-                picked = Some(ext);
+        for (extension, label, hint) in formats {
+            if ui.add_sized(vec2(220.0, ui.spacing().interact_size.y), egui::Button::new(label)).on_hover_text(hint).clicked() {
+                picked = Some(extension);
             }
         }
     });
-    if let Some(ext) = picked {
-        crate::web_files::export_mesh(app, ext);
+
+    if let Some(extension) = picked {
+        crate::web_files::export_mesh(app, extension);
         open = false;
     }
     app.ui.windows.export_mesh = open;
@@ -675,317 +682,6 @@ pub(crate) fn log(app: &mut TextureCraftApp, ui: &mut Ui) {
         for l in &app.session.log {
             ui.label(RichText::new(l).monospace());
         }
-    });
-}
-
-// ---------------------------------------------------------------------------------------------
-// Bake mode ("Bake Mesh Maps": texture sets, bakers, common and per-map parameters)
-
-pub fn bake_left(app: &mut TextureCraftApp, ui: &mut Ui) {
-    let tk = Tokens::get(ui.ctx());
-    egui::Panel::left("bake_left").resizable(true).default_size(320.0).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| {
-        crate::theme::card(
-            ui,
-            &tk,
-            egui::Margin { left: crate::theme::GUTTER, right: 0, top: crate::theme::GUTTER, bottom: crate::theme::GUTTER },
-            egui::Margin::symmetric(8, 6),
-            |ui| bake_body(app, ui),
-        );
-    });
-}
-
-/// The bake settings, scrollable (the Assets dock slot shows them in bake mode).
-pub fn bake_body(app: &mut TextureCraftApp, ui: &mut Ui) {
-    egui::ScrollArea::vertical().id_salt("bake_body").auto_shrink([false; 2]).show(ui, |ui| bake_panel(app, ui));
-}
-
-fn bake_panel(app: &mut TextureCraftApp, ui: &mut Ui) {
-    ui.label(caption(tr("Texture set list")));
-    for i in 0..app.session.set_count() {
-        let Some(t) = app.session.doc.project.texture_sets.get(i) else { continue };
-        let (name, res, mut on) = (t.name.clone(), t.bake.resolution, t.bake.enabled);
-        ui.horizontal(|ui| {
-            if ui.checkbox(&mut on, "").on_hover_text(tr("Bake with \"Bake selected textures\"")).changed() {
-                app.run("bake.settings", json!({ "ts": i, "enabled": on }));
-            }
-            if ui.selectable_label(i == app.session.ts(), format!("{name}  ({res}x{res})")).clicked() {
-                app.run("textureSet.select", json!({ "ts": i }));
-            }
-        });
-    }
-    ui.separator();
-    let ts = app.session.ts();
-    let Some(before) = app.session.doc.project.texture_sets.get(ts).map(|t| t.bake.clone()) else { return };
-    let mut b = before.clone();
-    let mut selected = app.ui.bake_baker;
-    ui.label(caption(tr("Mesh map bakers")));
-    if ui.selectable_label(selected.is_none(), format!("{}  {}", ic::GEAR, tr("Common parameters"))).clicked() {
-        selected = None;
-    }
-    for m in BakedMap::ALL {
-        ui.horizontal(|ui| {
-            let mut on = b.maps.contains(&m);
-            if ui.checkbox(&mut on, "").changed() {
-                if on {
-                    b.maps.insert(m);
-                } else {
-                    b.maps.remove(&m);
-                }
-            }
-            if ui.selectable_label(selected == Some(m), tr(m.label())).clicked() {
-                selected = Some(m);
-            }
-        });
-    }
-    app.ui.bake_baker = selected;
-    ui.separator();
-    match selected {
-        None => common_params(app, ui, &mut b),
-        Some(m) => {
-            let mut auto = app.session.auto_rebake.map == Some(m);
-            if ui
-                .checkbox(&mut auto, tr("Auto-rebake"))
-                .on_hover_text(tr("Bake this map again by itself when its bake settings, the low poly or the high polys change"))
-                .changed()
-            {
-                app.run("bake.autoRebake", if auto { json!({ "map": m.id() }) } else { json!({ "off": true }) });
-            }
-            map_params(ui, m, &mut b)
-        }
-    }
-    if b.direction == [0.0; 3] {
-        b.direction = before.direction;
-    }
-    if b != before {
-        let mut p = bake_cmds::settings_params(&b);
-        p["ts"] = ts.into();
-        app.run("bake.settings", p);
-    }
-}
-
-fn hint(ui: &mut Ui, text: &str) {
-    let tk = Tokens::get(ui.ctx());
-    ui.label(RichText::new(text).color(tk.text_dim).size(11.0));
-}
-
-fn common_params(app: &mut TextureCraftApp, ui: &mut Ui, b: &mut BakeSettings) {
-    let tk = Tokens::get(ui.ctx());
-    ui.label(caption(tr("Common parameters")));
-    combo(ui, tr("Output size"), format!("{}", b.resolution), |ui| {
-        for r in [256u32, 512, 1024, 2048, 4096, 8192] {
-            ui.selectable_value(&mut b.resolution, r, format!("{r}"));
-        }
-    });
-    combo(
-        ui,
-        tr("Antialiasing"),
-        match b.antialiasing {
-            2 => tr("Subsampling 2x2"),
-            4 => tr("Subsampling 4x4"),
-            8 => tr("Subsampling 8x8"),
-            _ => tr("None"),
-        },
-        |ui| {
-            for (v, l) in [(1u32, tr("None")), (2, tr("Subsampling 2x2")), (4, tr("Subsampling 4x4")), (8, tr("Subsampling 8x8"))] {
-                ui.selectable_value(&mut b.antialiasing, v, l);
-            }
-        },
-    );
-    let mut dil = b.dilation as f32;
-    if slider(ui, tr("Dilation width"), &mut dil, 0.0..=64.0, 0).changed() {
-        b.dilation = dil as u32;
-    }
-
-    ui.add_space(6.0);
-    ui.label(RichText::new(tr("High definition meshes")).strong().color(tk.text_strong));
-    let ctx = ui.ctx().clone();
-    let highs: Vec<(String, usize)> = app.session.bake_meshes.high.iter().map(|h| (h.name.clone(), h.mesh.triangle_count())).collect();
-    let mut remove = None;
-    for (i, (name, tris)) in highs.iter().enumerate() {
-        ui.horizontal(|ui| {
-            ui.label(trf("{name}  ({n} triangles)", &[("name", name), ("n", tris)]));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if icon_button(ui, ic::TRASH, tr("Remove"), false, 18.0).clicked() {
-                    remove = Some(i);
-                }
-            });
-        });
-    }
-    if highs.is_empty() {
-        hint(ui, tr("None: the low poly is its own high poly."));
-    }
-    if let Some(i) = remove {
-        app.run("bake.highPoly.remove", json!({ "index": i }));
-    }
-    if ui.button(format!("{}  {}", ic::PLUS, tr("Add high definition meshes"))).clicked() {
-        crate::web_files::import_bake_mesh(app, &ctx, false);
-    }
-    ui.checkbox(&mut b.use_low_as_high, tr("Use low poly mesh as high poly mesh"));
-    choice(ui, tr("Match"), &mut b.matching, &[(BakeMatch::Always, tr("Always")), (BakeMatch::ByMeshName, tr("By mesh name"))]);
-    if b.matching == BakeMatch::ByMeshName {
-        for (label, suffix) in [(tr("Low poly mesh suffix"), &mut b.low_suffix), (tr("High poly mesh suffix"), &mut b.high_suffix)] {
-            ui.horizontal(|ui| {
-                ui.label(label);
-                ui.add(egui::TextEdit::singleline(suffix).desired_width(80.0));
-            });
-        }
-    }
-    slider(ui, tr("Max frontal distance"), &mut b.max_frontal, 0.0..=0.2, 3);
-    slider(ui, tr("Max rear distance"), &mut b.max_rear, 0.0..=0.2, 3);
-    hint(ui, tr("Relative to the bounding box diagonal."));
-    ui.checkbox(&mut b.average_normals, tr("Average normals"));
-
-    ui.add_space(6.0);
-    let cage = app.session.bake_meshes.cage.as_ref().map(|c| c.name.clone());
-    ui.horizontal(|ui| {
-        ui.label(trf("Cage: {name}", &[("name", &cage.as_deref().unwrap_or(tr("none")))]));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if cage.is_some() && icon_button(ui, ic::TRASH, tr("Remove the cage"), false, 18.0).clicked() {
-                app.run("bake.cage.clear", json!({}));
-            }
-            if icon_button(ui, ic::FOLDER_OPEN, tr("Load a cage (the low poly, inflated)"), false, 18.0).clicked() {
-                crate::web_files::import_bake_mesh(app, &ctx, true);
-            }
-        });
-    });
-
-    ui.add_space(6.0);
-    skew_section(app, ui);
-
-    ui.add_space(6.0);
-    if ui.button(tr("Apply to all texture sets")).on_hover_text(tr("Copy these bake settings to every texture set")).clicked() {
-        let mut p = bake_cmds::settings_params(b);
-        p["ts"] = "all".into();
-        if let Some(o) = p.as_object_mut() {
-            o.remove("enabled");
-        }
-        app.run("bake.settings", p);
-    }
-}
-
-/// Skew correction: paint a map over the UV atlas that turns the bake rays onto the base normal.
-fn skew_section(app: &mut TextureCraftApp, ui: &mut Ui) {
-    ui.label(caption(tr("Skew correction")));
-    let has = app.session.bake_meshes.skew.is_some();
-    let mut brush = app.ui.skew_brush;
-    ui.checkbox(&mut brush.on, tr("Paint skew in the 2D view"))
-        .on_hover_text(tr("Drag in the 2D view to paint where the bake rays turn onto the base normal; paint with a value of 0 to erase"));
-    if brush.on {
-        slider(ui, tr("Radius"), &mut brush.radius, 0.002..=0.2, 3);
-        slider(ui, tr("Value"), &mut brush.value, 0.0..=1.0, 2);
-        slider(ui, tr("Hardness"), &mut brush.hardness, 0.0..=1.0, 2);
-    }
-    if brush.on && !app.ui.skew_brush.on && app.ui.layout == crate::state::ViewLayout::Only3D {
-        app.ui.layout = crate::state::ViewLayout::Split;
-    }
-    app.ui.skew_brush = brush;
-    if has && ui.button(tr("Remove skew correction")).clicked() {
-        app.run("bake.skew.clear", json!({}));
-    }
-}
-
-/// A combo box picking one of `options` (value, label).
-fn choice<T: Copy + PartialEq>(ui: &mut Ui, label: &str, value: &mut T, options: &[(T, &str)]) {
-    let shown = options.iter().find(|(v, _)| v == value).map_or("", |(_, l)| *l);
-    combo(ui, label, shown, |ui| {
-        for (v, l) in options {
-            ui.selectable_value(value, *v, *l);
-        }
-    });
-}
-
-/// Ray count and length of a secondary-ray map; its cone too when `cone`.
-fn ray_params(ui: &mut Ui, r: &mut RaySettings, cone: bool) {
-    let mut rays = r.rays as f32;
-    if slider(ui, tr("Secondary rays"), &mut rays, 4.0..=256.0, 0).changed() {
-        r.rays = rays as u32;
-    }
-    slider(ui, tr("Max occluder distance"), &mut r.max_distance, 0.01..=1.0, 2);
-    if cone {
-        slider(ui, tr("Spread angle"), &mut r.spread, 0.0..=180.0, 0);
-    }
-}
-
-fn map_params(ui: &mut Ui, m: BakedMap, b: &mut BakeSettings) {
-    ui.label(caption(tr(m.label())));
-    match m {
-        BakedMap::AmbientOcclusion => {
-            ray_params(ui, &mut b.ao, true);
-            choice(ui, tr("Distribution"), &mut b.ao.distribution, &[(RayDistribution::Cosine, tr("Cosine")), (RayDistribution::Uniform, tr("Uniform"))]);
-            ui.checkbox(&mut b.ao_ignore_backface, tr("Ignore backface"));
-            choice(
-                ui,
-                tr("Self occlusion"),
-                &mut b.ao_self_occlusion,
-                &[(SelfOcclusion::Always, tr("Always")), (SelfOcclusion::SameMeshName, tr("Only same mesh name"))],
-            );
-        }
-        BakedMap::Thickness => ray_params(ui, &mut b.thickness, true),
-        BakedMap::BentNormal => {
-            ray_params(ui, &mut b.bent_normal, false);
-            hint(ui, tr("Bent normal rays follow the ambient occlusion's occluder settings."));
-        }
-        BakedMap::Curvature => {
-            slider(ui, tr("Strength"), &mut b.curvature_strength, 0.1..=4.0, 2);
-            ui.checkbox(&mut b.curvature_from_normal, tr("From normal map"));
-            if b.curvature_from_normal {
-                let mut radius = b.curvature_radius as f32;
-                if slider(ui, tr("Sampling radius"), &mut radius, 0.0..=16.0, 0).changed() {
-                    b.curvature_radius = radius as u32;
-                }
-                hint(ui, tr("0 picks a radius from the output size."));
-            }
-            hint(ui, tr("From normal map: curvature of the baked normal map's detail instead of the mesh."));
-        }
-        BakedMap::WorldDirection => {
-            for (axis, v) in ["X", "Y", "Z"].iter().zip(b.direction.iter_mut()) {
-                slider(ui, &trf("Direction {axis}", &[("axis", axis)]), v, -1.0..=1.0, 2);
-            }
-            choice(
-                ui,
-                tr("Encoding"),
-                &mut b.direction_mode,
-                &[(DirectionMode::Signed, tr("Signed (-1..1)")), (DirectionMode::Positive, tr("Positive (0..1)"))],
-            );
-            hint(ui, tr("White where the surface faces the direction, black where it faces away."));
-        }
-        BakedMap::Position => {
-            choice(
-                ui,
-                tr("Normalization"),
-                &mut b.position_mode,
-                &[(PositionMode::BoundingBox, tr("Bounding box")), (PositionMode::BoundingSphere, tr("Bounding sphere"))],
-            );
-            hint(ui, tr("Position normalized to the low poly's bounding box or sphere."));
-        }
-        BakedMap::Normal => hint(ui, tr("Tangent-space normals of the high definition meshes.")),
-        BakedMap::WorldNormal => hint(ui, tr("World-space normals of the high poly (or the low poly).")),
-        BakedMap::Id => hint(ui, tr("One color per mesh part.")),
-        BakedMap::Height => hint(ui, tr("High poly height between the max rear (black) and max frontal (white) distances.")),
-        BakedMap::Opacity => hint(ui, tr("White where the high poly covers the low poly, times its alpha.")),
-        BakedMap::ColorMap => hint(ui, tr("Base colors (textures, factors) and vertex colors of the high definition meshes.")),
-    }
-}
-
-fn bake_bar(app: &mut TextureCraftApp, ctx: &egui::Context) {
-    egui::Area::new(egui::Id::unique("bake_bar")).anchor(egui::Align2::CENTER_BOTTOM, vec2(0.0, -40.0)).show(ctx, |ui| {
-        ui.horizontal(|ui| {
-            if let Some(p) = app.bake_progress() {
-                ui.add(egui::ProgressBar::new(p).desired_width(220.0).show_percentage());
-                if ui.button(tr("Cancel")).clicked() {
-                    app.cancel_bake();
-                }
-            } else {
-                let sets: Vec<usize> = app.session.doc.project.texture_sets.iter().enumerate().filter(|(_, t)| t.bake.enabled).map(|(i, _)| i).collect();
-                let label = trf("Bake selected textures ({n})", &[("n", &sets.len())]);
-                if ui.add_enabled(!sets.is_empty(), primary_button(ui, &label)).clicked() {
-                    app.start_bake(sets);
-                }
-            }
-            if ui.button(tr("Return to painting mode")).clicked() {
-                app.ui.mode = Mode::Painting;
-            }
-        });
     });
 }
 
