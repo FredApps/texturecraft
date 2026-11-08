@@ -386,22 +386,39 @@ pub fn tool_shelf(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
     });
 }
 
+/// Width of the icon rail beside the dock
+const RAIL_WIDTH: f32 = 38.0;
+
+/// Size of the rail's icons
+const RAIL_ICON_SIZE: f32 = 26.0;
+
+/// Gap between the rail's icons
+const RAIL_ICON_GAP: f32 = 4.0;
+
+/// Padding inside the rail's card around its icons, as the tool shelf's
+const RAIL_CARD_PADDING: egui::Margin = egui::Margin::symmetric(3, 6);
+
+/// The icon rail: Export, then the rail panels that are not in the dock, each opening its popup
 pub fn rail(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
-    let tk = Tokens::get(ui.ctx());
-    egui::Panel::right("rail").resizable(false).exact_size(38.0).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| {
-        card(ui, &tk, egui::Margin { left: 0, right: GUTTER, top: GUTTER, bottom: GUTTER }, egui::Margin::symmetric(3, 6), |ui| {
-            ui.spacing_mut().item_spacing.y = 4.0;
-            if icon_button(ui, ic::EXPORT, &tip(&app.ui.keymap, tr("Export textures"), "ui.export"), app.ui.windows.export, 26.0).clicked() {
+    let tokens = Tokens::get(ui.ctx());
+    egui::Panel::right("rail").resizable(false).exact_size(RAIL_WIDTH).show_separator_line(false).frame(egui::Frame::NONE).show(ui, |ui| {
+        card(ui, &tokens, egui::Margin { left: 0, right: GUTTER, top: GUTTER, bottom: GUTTER }, RAIL_CARD_PADDING, |ui| {
+            ui.spacing_mut().item_spacing.y = RAIL_ICON_GAP;
+            crate::rail_popup::begin_rail(ui.ctx(), ui.max_rect());
+            if icon_button(ui, ic::EXPORT, &tip(&app.ui.keymap, tr("Export textures"), "ui.export"), app.ui.windows.export, RAIL_ICON_SIZE).clicked() {
                 app.ui.windows.export = !app.ui.windows.export;
             }
-            for (panel, icon, id) in [
-                (Panel::TextureSetSettings, ic::STACK, "ui.view.textureSetSettings"),
-                (Panel::Display, ic::MONITOR, "ui.view.display"),
-                (Panel::Shader, ic::SLIDERS_HORIZONTAL, "ui.view.shader"),
-                (Panel::History, ic::CLOCK_COUNTER_CLOCKWISE, "ui.view.history"),
-            ] {
-                if icon_button(ui, icon, &tip(&app.ui.keymap, tr(panel.name()), id), app.ui.dock.is_visible(panel), 26.0).clicked() {
-                    app.ui.dock.toggle(panel);
+
+            // A panel in the dock, docked or floating, leaves the rail until it is closed there
+            for (panel, icon, id) in crate::rail_popup::RAIL_PANELS {
+                if app.ui.dock.is_open(panel) {
+                    continue;
+                }
+
+                let response = icon_button(ui, icon, &tip(&app.ui.keymap, tr(panel.name()), id), app.ui.rail_panel == Some(panel), RAIL_ICON_SIZE);
+                crate::rail_popup::remember_icon(ui.ctx(), panel, response.rect);
+                if response.clicked() {
+                    crate::rail_popup::toggle(app, panel);
                 }
             }
         });

@@ -129,7 +129,7 @@ pub fn implemented(id: &str) -> bool {
     is_ui(id) || texturecraft_engine::find(id).is_some()
 }
 
-/// Invoke a menu item (menus, shortcuts, palette, control channel `ui.menu.invoke`).
+/// Invoke a menu item (menus, shortcuts, palette, control channel `ui.menu.invoke`)
 pub fn invoke(app: &mut TextureCraftApp, ctx: &egui::Context, id: &str) {
     if !enabled(app, id) {
         return;
@@ -140,15 +140,21 @@ pub fn invoke(app: &mut TextureCraftApp, ctx: &egui::Context, id: &str) {
     {
         return;
     }
+
     if let Some(panel) = crate::docking::view_panel(id) {
-        app.ui.dock.toggle(panel);
+        if crate::rail_popup::is_rail_panel(panel) {
+            crate::rail_popup::toggle(app, panel);
+        } else {
+            app.ui.dock.toggle(panel);
+        }
         return;
     }
+
     match id {
         "ui.newProject" => app.ui.windows.new_project = true,
         "ui.export" => app.ui.windows.export = true,
         "ui.quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-        "ui.projectConfig" => app.ui.dock.focus(crate::docking::Panel::Display),
+        "ui.projectConfig" => crate::rail_popup::open(app, crate::docking::Panel::Display),
         "ui.settings" => app.ui.windows.settings = true,
         "ui.mode.bake" => app.ui.mode = Mode::Baking,
         "ui.mode.paint" => app.ui.mode = Mode::Painting,
@@ -320,7 +326,7 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
         return;
     }
 
-    // Escape closes an open popup first, before the Properties popup or the stroke
+    // Escape closes an open popup first, then the Properties popup, the rail's popup or the stroke
     let popup_open = egui::Popup::is_any_open(ctx);
 
     let active_shortcuts = crate::keymap::active(&app.ui.keymap);
@@ -343,6 +349,8 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
 
         if !popup_open && app.properties_popup.is_some() && input.consume_key(Modifiers::NONE, Key::Escape) {
             app.properties_popup = None;
+        } else if !popup_open && app.ui.rail_panel.is_some() && input.consume_key(Modifiers::NONE, Key::Escape) {
+            app.ui.rail_panel = None;
         } else if app.ui.mode == Mode::Painting && !popup_open && input.consume_key(Modifiers::NONE, Key::Escape) {
             app.session.cancel_stroke();
             app.session.tool.path.points.clear();
