@@ -75,9 +75,33 @@ fn drag(harness: &mut Harness<'_, TextureCraftApp>, from: Pos2, to: Pos2) {
     harness.run_steps(SETTLE_FRAMES);
 }
 
-/// The popup's title: the panel's name left of the rail
+/// The popup's Close button, left of the rail (the window's own Close sits above the rail)
+fn popup_close_button(harness: &Harness<'_, TextureCraftApp>) -> Option<egui::Rect> {
+    harness
+        .get_all_by_role(Role::Button)
+        .find(|button| button.rect().max.x < RAIL_LEFT_EDGE && button.accesskit_node().label().as_deref() == Some("Close"))
+        .map(|button| button.rect())
+}
+
+/// The title of the popup open on the panel named `name`: that name, level with the popup's Close button
+fn open_popup_title(harness: &Harness<'_, TextureCraftApp>, name: &str) -> Option<egui::Rect> {
+    let close = popup_close_button(harness)?;
+    harness
+        .get_all_by_label(name)
+        .map(|node| node.rect())
+        .find(|title| title.right() < close.left() && (close.top()..=close.bottom()).contains(&title.center().y))
+}
+
 fn popup_title(harness: &Harness<'_, TextureCraftApp>, name: &str) -> egui::Rect {
-    harness.get_all_by_label(name).map(|node| node.rect()).find(|rect| rect.max.x < RAIL_LEFT_EDGE).expect("the popup's title")
+    open_popup_title(harness, name).expect("the popup's title")
+}
+
+fn popup_shows(harness: &Harness<'_, TextureCraftApp>, name: &str) -> bool {
+    open_popup_title(harness, name).is_some()
+}
+
+fn popup_closed(harness: &Harness<'_, TextureCraftApp>) -> bool {
+    popup_close_button(harness).is_none()
 }
 
 #[test]
@@ -85,17 +109,17 @@ fn the_rail_shows_one_panel_at_a_time() {
     let mut harness = app();
 
     click_rail(&mut harness, "Shader Settings");
-    assert_eq!(harness.state().ui.rail_panel, Some(Panel::Shader));
+    assert!(popup_shows(&harness, "Shader Settings"));
     assert!(harness.query_by_label(SHADER_SETTING).is_some());
 
     click_rail(&mut harness, "Display Settings");
-    assert_eq!(harness.state().ui.rail_panel, Some(Panel::Display));
+    assert!(popup_shows(&harness, "Display Settings"));
     assert!(harness.query_by_label(SHADER_SETTING).is_none(), "opening Display Settings closed Shader Settings");
     assert!(harness.query_by_label(DISPLAY_SETTING).is_some());
     assert!(!harness.state().ui.dock.is_open(Panel::Shader), "the rail's panels are not dock windows");
 
     click_rail(&mut harness, "Display Settings");
-    assert_eq!(harness.state().ui.rail_panel, None, "its own icon closes it");
+    assert!(popup_closed(&harness), "its own icon closes it");
 }
 
 #[test]
@@ -115,17 +139,17 @@ fn the_close_button_a_press_outside_and_escape_close_it() {
     click_rail(&mut harness, "Display Settings");
     harness.get_by_role_and_label(Role::Button, "Close").click();
     harness.run_steps(SETTLE_FRAMES);
-    assert_eq!(harness.state().ui.rail_panel, None, "Close");
+    assert!(popup_closed(&harness), "Close");
 
     click_rail(&mut harness, "Log");
     harness.get_by_label("Assets").click();
     harness.run_steps(SETTLE_FRAMES);
-    assert_eq!(harness.state().ui.rail_panel, None, "a press outside");
+    assert!(popup_closed(&harness), "a press outside");
 
     click_rail(&mut harness, "Log");
     harness.key_press(egui::Key::Escape);
     harness.run_steps(SETTLE_FRAMES);
-    assert_eq!(harness.state().ui.rail_panel, None, "Escape");
+    assert!(popup_closed(&harness), "Escape");
 }
 
 #[test]
@@ -135,12 +159,12 @@ fn dragging_the_title_out_floats_the_panel_and_frees_the_rail() {
     click_rail(&mut harness, "History");
     let title = popup_title(&harness, "History").center();
     drag(&mut harness, title, title + INTO_THE_VIEWPORT);
-    assert_eq!(harness.state().ui.rail_panel, None);
+    assert!(popup_closed(&harness));
     assert!(harness.state().ui.dock.is_visible(Panel::History), "History floats on its own");
     assert!(rail_icon(&harness, "History").is_none(), "a panel in the dock has no rail icon");
 
     click_rail(&mut harness, "Shader Settings");
-    assert_eq!(harness.state().ui.rail_panel, Some(Panel::Shader));
+    assert!(popup_shows(&harness, "Shader Settings"));
     assert!(harness.state().ui.dock.is_visible(Panel::History), "History stays open beside the rail's panel");
 }
 
@@ -165,7 +189,7 @@ fn a_panel_closed_in_the_dock_returns_to_the_rail() {
     harness.state_mut().ui.dock.close(Panel::TextureSetSettings);
     harness.run_steps(SETTLE_FRAMES);
     click_rail(&mut harness, "Texture Set Settings");
-    assert_eq!(harness.state().ui.rail_panel, Some(Panel::TextureSetSettings));
+    assert!(popup_shows(&harness, "Texture Set Settings"));
 }
 
 #[test]
@@ -175,13 +199,13 @@ fn window_views_open_the_rail_panels_popup() {
     let ctx = harness.ctx.clone();
     texturecraft_ui_egui::menus::invoke(harness.state_mut(), &ctx, "ui.view.shader");
     harness.run_steps(SETTLE_FRAMES);
-    assert_eq!(harness.state().ui.rail_panel, Some(Panel::Shader));
+    assert!(popup_shows(&harness, "Shader Settings"));
     assert!(!harness.state().ui.dock.is_open(Panel::Shader));
 
     // Project configuration opens Display Settings, in its popup too
     texturecraft_ui_egui::menus::invoke(harness.state_mut(), &ctx, "ui.projectConfig");
     harness.run_steps(SETTLE_FRAMES);
-    assert_eq!(harness.state().ui.rail_panel, Some(Panel::Display));
+    assert!(popup_shows(&harness, "Display Settings"));
 }
 
 #[test]
