@@ -1,7 +1,7 @@
 //! The 3D viewport and the 2D UV view: navigation, painting input, brush cursor and the GPU
 //! callbacks that render them.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use egui::emath::GuiRounding as _;
 use egui::{Color32, PointerButton, Pos2, Rect, Sense, Stroke, Ui, pos2, vec2};
@@ -15,6 +15,7 @@ use texturecraft_render::{Frame, SetHighlight, Shade, ViewKind};
 use crate::TextureCraftApp;
 use crate::gpu::ViewCallback;
 use crate::i18n::{tr, trf};
+use crate::path_hit::PathHit;
 use crate::state::ViewLayout;
 use crate::theme::Tokens;
 use crate::toolbar::{MAX_BRUSH_SIZE, MIN_BRUSH_SIZE};
@@ -576,7 +577,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     let viewport = app.session.viewport;
     let show = |app: &TextureCraftApp, point: Vec3| project(app, rect, point);
     if painting && path_tool {
-        path_input(app, ui, &response, false, |app, pointer| app.session.pick(local(pointer), viewport).map(|hit| hit.pos), show);
+        path_input(app, ui, &response, (rect, false), |app, pointer| app.session.pick(local(pointer), viewport).map(|hit| hit.pos), show);
     } else if painting {
         let pressure = pen_pressure(ui);
         if response.drag_started_by(PointerButton::Primary) || response.clicked_by(PointerButton::Primary) {
@@ -630,6 +631,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         && !navigating
         && response.hovered()
         && brush_tool(app.session.tool.tool)
+        && (app.session.tool.tool != Tool::Path || adjusting)
         && let Some(hover_pos) = if adjusting { ui.input(|input| input.pointer.press_origin()) } else { response.hover_pos() }
         && let Some(hit) = app.session.pick(local(hover_pos), app.session.viewport)
     {
@@ -646,7 +648,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
             && !path_tool
             && let Some(from) = app.last_paint_point
         {
-            rubber_band(ui, rect, pos2(rect.left() + from.x, rect.top() + from.y), hover_pos);
+            rubber_band(ui, rect, &[pos2(rect.left() + from.x, rect.top() + from.y), hover_pos]);
         }
     }
 
@@ -897,11 +899,42 @@ fn project(app: &TextureCraftApp, rect: Rect, p: Vec3) -> Option<Pos2> {
     Some(pos2(rect.left() + (n.x * 0.5 + 0.5) * rect.width(), rect.top() + (0.5 - n.y * 0.5) * rect.height()))
 }
 
-/// Control point grab radius (points).
+/// Control point and curve grab radius (points)
 const HANDLE_GRAB: f32 = 8.0;
+/// Opacity of the selected layer's other stored paths
+const PATH_STORED_OPACITY: f32 = 0.55;
+/// Opacity of a curve where the mesh hides it
+const PATH_HIDDEN_OPACITY: f32 = 0.5;
+/// A control point counts as hidden when the surface under it is this much closer (relative)
+const PATH_HIDDEN_DEPTH: f32 = 0.01;
+/// The Path tool's pointer glyph size (points)
+const PATH_CURSOR_SIZE: f32 = 18.0;
+/// A path's line and the dark outline under it (points)
+const PATH_LINE_WIDTH: f32 = 1.4;
+const PATH_OUTLINE_WIDTH: f32 = 3.0;
+/// Where the view hint sits from the view's bottom left corner, and its text size (points)
+const PATH_HINT_OFFSET: egui::Vec2 = vec2(56.0, -12.0);
+const PATH_HINT_FONT_SIZE: f32 = 12.0;
+/// The pen pointer's drop shadow, and the space before its insert plus (points)
+const PATH_CURSOR_SHADOW_OFFSET: egui::Vec2 = vec2(1.0, 1.0);
+const PATH_CURSOR_PLUS_GAP: f32 = 1.0;
+/// Dash and gap lengths of a line still to be painted (points)
+const RUBBER_BAND_DASH: f32 = 6.0;
+const RUBBER_BAND_GAP: f32 = 4.0;
+/// The insert plus beside the pen pointer, relative to the pen's size
+const PATH_CURSOR_PLUS_SCALE: f32 = 0.6;
+/// Space kept right of the view hint, and its narrowest wrap width (points)
+const PATH_HINT_MARGIN: f32 = 8.0;
+const PATH_HINT_MIN_WIDTH: f32 = 80.0;
+/// How much a control point marker grows under the pointer, and when selected (points)
+const PATH_POINT_HOVER_GROWTH: f32 = 1.5;
+const PATH_POINT_SELECTED_GROWTH: f32 = 0.5;
+/// Control point marker radius (points)
+const PATH_POINT_RADIUS: f32 = 3.0;
+/// Curve sampling step on screen (points)
+const PATH_SCREEN_STEP: f32 = 3.0;
 
-/// Path tool keys: Enter applies the path, Backspace removes its last point (Esc, handled with
-/// the global shortcuts, cancels it).
+/// Path tool keys: Enter applies the path, Backspace removes the selected (or last) point; Esc is a global shortcut
 fn path_keys(app: &mut TextureCraftApp, ui: &Ui) {
     if app.ui.mode != crate::state::Mode::Painting
         || app.session.tool.tool != Tool::Path
@@ -915,19 +948,123 @@ fn path_keys(app: &mut TextureCraftApp, ui: &Ui) {
         app.run("tool.path", json!({"commit": true}));
     }
     if back {
-        app.session.tool.path.points.pop();
+        app.session.path_checkpoint();
+        app.session.tool.path.remove_selected();
     }
 }
 
-/// Path tool input in a view (`uv`: the 2D view). Pressing on a control point drags it,
-/// elsewhere adds a point (and drags it); clicking the first point of an open path closes it.
-/// `place` maps a pointer position to a path point (None off the surface), `show` a path point
-/// to the screen.
+/// The selected layer's stored paths except the edited one: (path sublayer, index, path)
+fn other_paths(app: &TextureCraftApp) -> Vec<(texturecraft_engine::core::LayerId, usize, texturecraft_engine::PathState)> {
+    let s = &app.session;
+    let Some(layer) = s.selected_layer().and_then(|id| s.doc.project.layer(id).ok()) else { return Vec::new() };
+    let effects = layer.content_effects.iter().chain(layer.mask.iter().flat_map(|m| m.effects.iter()));
+    effects
+        .flat_map(|e| s.stored_path_states(e.id).into_iter().enumerate().map(move |(i, path)| (e.id, i, path)))
+        .filter(|(e, i, _)| s.tool.path.editing != Some((*e, *i)))
+        .collect()
+}
+
+/// The screen curve through `points` per segment, each starting on its first point
+fn screen_segments(points: &[Pos2], closed: bool) -> Vec<Vec<Pos2>> {
+    let pts: Vec<Vec2> = points.iter().map(|p| Vec2::new(p.x, p.y)).collect();
+    texturecraft_engine::paint::spline_segments(&pts, closed, PATH_SCREEN_STEP)
+        .into_iter()
+        .zip(points)
+        .map(|(samples, first)| std::iter::once(*first).chain(samples.into_iter().map(|v| pos2(v.x, v.y))).collect())
+        .collect()
+}
+
+/// A path's curve in a view per segment: screen position and whether the mesh leaves it visible (None off the mesh or screen)
+type ScreenCurve = Vec<Vec<Option<(Pos2, bool)>>>;
+
+/// A 3D path's curve on the mesh, per segment ([`texturecraft_engine::Session::path_surface`])
+type SurfaceCurve = Arc<Vec<Vec<Option<Vec3>>>>;
+
+/// The nearest segment of `curve` within grab distance of `at`, with the nearest position on it
+fn segment_near(curve: &ScreenCurve, at: Pos2) -> Option<(usize, Pos2)> {
+    let nearest = |segment: &Vec<Option<(Pos2, bool)>>| {
+        segment.windows(2).filter_map(|w| Some(closest_on_line(w[0]?.0, w[1]?.0, at))).min_by(|a, b| a.distance(at).total_cmp(&b.distance(at)))
+    };
+    curve
+        .iter()
+        .enumerate()
+        .filter_map(|(i, segment)| nearest(segment).map(|p| (i, p)))
+        .filter(|(_, p)| p.distance(at) < HANDLE_GRAB)
+        .min_by(|a, b| a.1.distance(at).total_cmp(&b.1.distance(at)))
+}
+
+/// `path`'s curve in a view; a 3D curve lies where its paint lands, and without `depth_test` (hit tests) every sample counts as visible
+fn curve_on_screen(
+    app: &TextureCraftApp,
+    ui: &Ui,
+    (rect, uv, depth_test): (Rect, bool, bool),
+    path: &texturecraft_engine::PathState,
+    stored: Option<(texturecraft_engine::core::LayerId, usize)>,
+    show: &impl Fn(&TextureCraftApp, Vec3) -> Option<Pos2>,
+) -> ScreenCurve {
+    if uv {
+        let Some(points) = path.points.iter().map(|p| show(app, *p)).collect::<Option<Vec<_>>>() else { return Vec::new() };
+        return screen_segments(&points, path.closed).into_iter().map(|segment| segment.into_iter().map(|at| Some((at, true))).collect()).collect();
+    }
+    let s = &app.session;
+    let surface = stored
+        .and_then(|(eid, index)| stored_surface(app, ui, eid, index))
+        .unwrap_or_else(|| Arc::new(s.path_surface(&path.points, path.closed, s.camera, s.viewport)));
+    surface
+        .iter()
+        .map(|segment| segment.iter().map(|p| p.and_then(|p| show(app, p).map(|at| (at, !depth_test || path_point_visible(app, rect, p, at))))).collect())
+        .collect()
+}
+
+/// [`texturecraft_engine::Session::stored_path_surface`], kept until the path or the mesh changes
+fn stored_surface(app: &TextureCraftApp, ui: &Ui, eid: texturecraft_engine::core::LayerId, index: usize) -> Option<SurfaceCurve> {
+    let key = (app.session.mesh_id, app.session.paths(eid)?.get(index)?.clone());
+    let id = egui::Id::unique(("path_surface", eid.0, index));
+    if let Some((cached, surface)) = ui.data(|d| d.get_temp::<((u64, texturecraft_engine::core::PathShape), SurfaceCurve)>(id))
+        && cached == key
+    {
+        return Some(surface);
+    }
+    let surface = Arc::new(app.session.stored_path_surface(eid, index)?);
+    ui.data_mut(|d| d.insert_temp(id, (key, surface.clone())));
+    Some(surface)
+}
+
+/// The point of the segment `a`–`b` nearest to `p`
+fn closest_on_line(a: Pos2, b: Pos2, p: Pos2) -> Pos2 {
+    let ab = b - a;
+    let t = if ab.length_sq() > 0.0 { ((p - a).dot(ab) / ab.length_sq()).clamp(0.0, 1.0) } else { 0.0 };
+    a + ab * t
+}
+
+/// What `at` is over in a view (`uv`: the 2D view); `show` maps a path point to the screen
+fn path_hit(app: &TextureCraftApp, ui: &Ui, (rect, uv): (Rect, bool), at: Pos2, show: &impl Fn(&TextureCraftApp, Vec3) -> Option<Pos2>) -> PathHit {
+    let path = &app.session.tool.path;
+    if path.uv == uv {
+        if let Some(i) = path.points.iter().position(|p| show(app, *p).is_some_and(|s| s.distance(at) < HANDLE_GRAB)) {
+            return PathHit::Point(i);
+        }
+        if let Some((i, on)) = segment_near(&curve_on_screen(app, ui, (rect, uv, false), path, path.editing, show), at) {
+            return PathHit::Curve(i, on);
+        }
+    }
+    for (eid, i, other) in other_paths(app) {
+        if other.uv == uv
+            && (other.points.iter().any(|p| show(app, *p).is_some_and(|s| s.distance(at) < HANDLE_GRAB))
+                || segment_near(&curve_on_screen(app, ui, (rect, uv, false), &other, Some((eid, i)), show), at).is_some())
+        {
+            return PathHit::Stored(eid, i);
+        }
+    }
+    PathHit::Miss
+}
+
+/// Path tool presses in a view: select and drag a point, insert on the curve, open another path, close on the first point, or add a point
 fn path_input(
     app: &mut TextureCraftApp,
     ui: &Ui,
     resp: &egui::Response,
-    uv: bool,
+    (rect, uv): (Rect, bool),
     place: impl Fn(&TextureCraftApp, Pos2) -> Option<Vec3>,
     show: impl Fn(&TextureCraftApp, Vec3) -> Option<Pos2>,
 ) {
@@ -937,24 +1074,48 @@ fn path_input(
         && let Some(at) = ui.input(|i| i.pointer.press_origin()).or(resp.interact_pointer_pos())
     {
         let path = &app.session.tool.path;
-        let near = if path.uv == uv { path.points.iter().position(|p| show(app, *p).is_some_and(|s| s.distance(at) < HANDLE_GRAB)) } else { None };
-        match near {
-            Some(0) if clicked && !path.closed && path.points.len() >= 3 => app.session.tool.path.closed = true,
-            Some(i) => ui.data_mut(|d| {
-                d.insert_temp(drag_id, i);
-            }),
-            None => match place(app, at) {
+        let (closed, len) = (path.closed, path.points.len());
+        let hit = path_hit(app, ui, (rect, uv), at, &show);
+        if !matches!(hit, PathHit::Stored(..)) {
+            app.session.path_checkpoint();
+        }
+
+        let grab = match hit {
+            PathHit::Point(0) if clicked && !closed && len >= 3 => {
+                app.session.tool.path.closed = true;
+                None
+            }
+            PathHit::Point(i) => {
+                app.session.tool.path.selected = Some(i);
+                Some(i)
+            }
+            PathHit::Stored(eid, index) => {
+                app.run("path.edit", json!({"effect": eid.0, "index": index}));
+                None
+            }
+            hit => match place(app, if let PathHit::Curve(_, on) = hit { on } else { at }) {
                 Some(p) => {
-                    app.session.tool.path.push(p, uv);
-                    let last = app.session.tool.path.points.len().saturating_sub(1);
-                    ui.data_mut(|d| {
-                        d.insert_temp(drag_id, last);
-                    });
+                    let path = &mut app.session.tool.path;
+                    match hit {
+                        PathHit::Curve(i, _) => path.insert(i + 1, p),
+                        _ => {
+                            path.push(p, uv);
+                            path.selected = path.points.len().checked_sub(1);
+                            path.selected
+                        }
+                    }
                 }
-                None => app.toast(tr("Place path points on the mesh"), false),
+                None => {
+                    app.toast(tr("Place path points on the mesh"), false);
+                    None
+                }
             },
+        };
+        if let Some(i) = grab {
+            ui.data_mut(|d| d.insert_temp(drag_id, i));
         }
     }
+
     if resp.dragged_by(PointerButton::Primary)
         && let Some(i) = ui.data(|d| d.get_temp::<usize>(drag_id))
         && let Some(p) = resp.interact_pointer_pos().and_then(|pos| place(app, pos))
@@ -962,45 +1123,134 @@ fn path_input(
     {
         *q = p;
     }
+
     if !resp.is_pointer_button_down_on() {
         ui.data_mut(|d| d.remove::<usize>(drag_id));
     }
 }
 
-/// The path being edited: its curve, control points (the first one in the accent color) and,
-/// while open, a dashed preview of the next segment.
-fn path_overlay(app: &TextureCraftApp, ui: &Ui, rect: Rect, resp: &egui::Response, uv: bool, show: impl Fn(&TextureCraftApp, Vec3) -> Option<Pos2>) {
-    let tk = Tokens::get(ui.ctx());
-    let p = ui.painter_at(rect);
-    let path = &app.session.tool.path;
-    let hint = tr("Path: click adds a point, drag moves it, Enter applies, Esc cancels");
-    p.text(rect.left_bottom() + vec2(56.0, -12.0), egui::Align2::LEFT_BOTTOM, hint, egui::FontId::proportional(12.0), tk.viewport_text);
-    if path.uv != uv {
-        return;
-    }
-    let handles: Vec<Pos2> = path.points.iter().filter_map(|q| show(app, *q)).collect();
-    let pts: Vec<Vec2> = handles.iter().map(|h| Vec2::new(h.x, h.y)).collect();
-    let curve: Vec<Pos2> = texturecraft_engine::paint::spline(&pts, path.closed, 3.0).into_iter().map(|v| pos2(v.x, v.y)).collect();
-    let color = if path.closed && path.fill { tk.viewport_accent } else { Color32::from_white_alpha(230) };
-    p.add(egui::Shape::line(curve.clone(), Stroke::new(3.0, Color32::from_black_alpha(140))));
-    p.add(egui::Shape::line(curve, Stroke::new(1.4, color)));
-    let hover = resp.hover_pos();
-    if !path.closed
-        && let (Some(last), Some(to)) = (handles.last(), hover)
-    {
-        rubber_band(ui, rect, *last, to);
-    }
-    for (i, h) in handles.iter().enumerate() {
-        let r = if hover.is_some_and(|m| m.distance(*h) < HANDLE_GRAB) { 5.5 } else { 4.0 };
-        p.circle(*h, r, if i == 0 { tk.viewport_accent } else { Color32::WHITE }, Stroke::new(1.5, Color32::from_black_alpha(180)));
+/// Is path point `p` (on screen at `at`) in front of the mesh in the 3D view `rect`?
+fn path_point_visible(app: &TextureCraftApp, rect: Rect, p: Vec3, at: Pos2) -> bool {
+    let eye = app.session.camera.eye();
+    let local = Vec2::new(at.x - rect.left(), at.y - rect.top());
+    app.session.pick(local, app.session.viewport).is_none_or(|hit| hit.pos.distance(eye) >= p.distance(eye) * (1.0 - PATH_HIDDEN_DEPTH))
+}
+
+/// Draw `curve` in `color` over a dark outline, as a faint line where the mesh hides it
+fn draw_path_curve(painter: &egui::Painter, curve: &ScreenCurve, color: Color32) {
+    let draw = |run: &mut Vec<Pos2>, shown: bool| {
+        if run.len() > 1 {
+            // Hidden parts are a ghost line: no outline, half strength
+            if shown {
+                painter.add(egui::Shape::line(run.clone(), Stroke::new(PATH_OUTLINE_WIDTH, Color32::from_black_alpha(140))));
+            }
+            painter.add(egui::Shape::line(
+                std::mem::take(run),
+                Stroke::new(PATH_LINE_WIDTH, if shown { color } else { color.gamma_multiply(PATH_HIDDEN_OPACITY) }),
+            ));
+        }
+        run.clear();
+    };
+    for segment in curve {
+        // Runs of samples the view shows (or hides) alike, joined at the sample where that changes
+        let (mut run, mut shown) = (Vec::new(), true);
+        for sample in segment {
+            match *sample {
+                Some((at, visible)) => {
+                    if visible != shown && !run.is_empty() {
+                        run.push(at);
+                        draw(&mut run, shown);
+                    }
+                    shown = visible;
+                    run.push(at);
+                }
+                None => draw(&mut run, shown),
+            }
+        }
+        draw(&mut run, shown);
     }
 }
 
-/// Dashed preview of a straight segment.
-fn rubber_band(ui: &Ui, rect: Rect, from: Pos2, to: Pos2) {
-    let p = ui.painter_at(rect);
-    p.add(egui::Shape::dashed_line(&[from, to], Stroke::new(2.5, Color32::from_black_alpha(120)), 6.0, 4.0));
-    p.add(egui::Shape::dashed_line(&[from, to], Stroke::new(1.0, Color32::from_white_alpha(200)), 6.0, 4.0));
+/// The layer's other paths (lit under the pointer), then the edited path with its points, the next segment's preview and the pen cursor
+fn path_overlay(app: &TextureCraftApp, ui: &Ui, rect: Rect, resp: &egui::Response, uv: bool, show: impl Fn(&TextureCraftApp, Vec3) -> Option<Pos2>) {
+    let tk = Tokens::get(ui.ctx());
+    let painter = ui.painter_at(rect);
+    let hint = tr("Path: click adds a point, click the curve inserts one, drag moves it, Enter applies, Esc cancels");
+    // Wrapped to the view: the hint is longer than a narrow split view
+    let at = rect.left_bottom() + PATH_HINT_OFFSET;
+    let wrap = (rect.right() - at.x - PATH_HINT_MARGIN).max(PATH_HINT_MIN_WIDTH);
+    let hint = painter.layout(hint.to_string(), egui::FontId::proportional(PATH_HINT_FONT_SIZE), tk.viewport_text, wrap);
+    painter.galley(at - vec2(0.0, hint.size().y), hint, tk.viewport_text);
+
+    let hover = resp.hover_pos();
+    let hit = hover.map(|at| (at, path_hit(app, ui, (rect, uv), at, &show)));
+    for (eid, i, other) in other_paths(app).iter().filter(|(_, _, other)| other.uv == uv) {
+        let curve = curve_on_screen(app, ui, (rect, uv, true), other, Some((*eid, *i)), &show);
+        // The path a click opens lights up
+        let opened = matches!(hit, Some((_, PathHit::Stored(e, n))) if (e, n) == (*eid, *i));
+        draw_path_curve(&painter, &curve, if opened { Color32::WHITE } else { Color32::WHITE.gamma_multiply(PATH_STORED_OPACITY) });
+    }
+
+    let path = &app.session.tool.path;
+    if path.uv == uv {
+        draw_path_curve(&painter, &curve_on_screen(app, ui, (rect, uv, true), path, path.editing, &show), tk.viewport_accent);
+        let handles: Vec<Pos2> = path.points.iter().filter_map(|q| show(app, *q)).collect();
+        if !path.closed
+            && !handles.is_empty()
+            && let Some((to, PathHit::Miss)) = hit
+        {
+            let mut next = handles.clone();
+            next.push(to);
+            if let Some(segment) = screen_segments(&next, false).last() {
+                rubber_band(ui, rect, segment);
+            }
+        }
+
+        for (i, handle) in handles.iter().enumerate() {
+            // Small markers: the curve is what the user is shaping
+            let hovered = hover.is_some_and(|m| m.distance(*handle) < HANDLE_GRAB);
+            let radius = if hovered { PATH_POINT_RADIUS + PATH_POINT_HOVER_GROWTH } else { PATH_POINT_RADIUS };
+            if path.selected == Some(i) {
+                painter.circle(*handle, radius + PATH_POINT_SELECTED_GROWTH, tk.viewport_accent, Stroke::new(1.0, Color32::from_black_alpha(160)));
+            } else {
+                painter.circle(*handle, radius, Color32::from_black_alpha(110), Stroke::new(1.0, Color32::from_white_alpha(if hovered { 230 } else { 150 })));
+            }
+        }
+    }
+
+    if let Some((at, hit)) = hit
+        && !ui.input(|i| i.modifiers.command)
+    {
+        if let PathHit::Curve(_, on) = hit {
+            // Where the click inserts its point
+            painter.circle(on, PATH_POINT_RADIUS, Color32::from_black_alpha(60), Stroke::new(1.0, Color32::from_white_alpha(110)));
+        }
+        path_cursor(ui, &painter, at, matches!(hit, PathHit::Curve(..)));
+    }
+}
+
+/// The Path tool's pointer: a pen with its nib at `at`, and a plus when a click inserts a point
+fn path_cursor(ui: &Ui, painter: &egui::Painter, at: Pos2, insert: bool) {
+    ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+    let glyph = |icon: &str, size: f32, color: Color32| painter.layout_no_wrap(icon.to_string(), egui::FontId::proportional(size), color);
+    for (offset, color) in [(PATH_CURSOR_SHADOW_OFFSET, Color32::from_black_alpha(200)), (egui::Vec2::ZERO, Color32::WHITE)] {
+        // The pen's nib is the bottom left corner of the drawn glyph
+        let pen = glyph(egui_phosphor::regular::PEN_NIB, PATH_CURSOR_SIZE, color);
+        let origin = at + offset - pen.mesh_bounds.left_bottom().to_vec2();
+        let right = origin + pen.mesh_bounds.right_bottom().to_vec2();
+        painter.galley(origin, pen, color);
+        if insert {
+            let plus = glyph(egui_phosphor::regular::PLUS, PATH_CURSOR_SIZE * PATH_CURSOR_PLUS_SCALE, color);
+            painter.galley(right + vec2(PATH_CURSOR_PLUS_GAP, 0.0) - plus.mesh_bounds.left_top().to_vec2(), plus, color);
+        }
+    }
+}
+
+/// Dashed preview of a line still to be painted
+fn rubber_band(ui: &Ui, rect: Rect, line: &[Pos2]) {
+    let painter = ui.painter_at(rect);
+    painter.add(egui::Shape::dashed_line(line, Stroke::new(2.5, Color32::from_black_alpha(120)), RUBBER_BAND_DASH, RUBBER_BAND_GAP));
+    painter.add(egui::Shape::dashed_line(line, Stroke::new(1.0, Color32::from_white_alpha(200)), RUBBER_BAND_DASH, RUBBER_BAND_GAP));
 }
 
 /// V held with the Clone tool in painting mode: clicks set the clone source.
@@ -1214,7 +1464,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     // Painting in UV space
     let painting = app.ui.mode == crate::state::Mode::Painting && app.properties_popup.is_none() && !alt && !adjusting && !v_held;
     if painting && path_tool {
-        path_input(app, ui, &response, true, |_, pointer| Some(to_uv(pointer).extend(0.0)), show);
+        path_input(app, ui, &response, (rect, true), |_, pointer| Some(to_uv(pointer).extend(0.0)), show);
     } else if painting {
         let pressure = pen_pressure(ui);
         if response.drag_started_by(PointerButton::Primary) || response.clicked_by(PointerButton::Primary) {

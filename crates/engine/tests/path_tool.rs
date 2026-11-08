@@ -37,7 +37,7 @@ fn path_stroke_paints_along_the_curve() {
     let r = execute(&mut s, "tool.path", &json!({"points": [[140, 210], [200, 180], [260, 210]]})).unwrap();
     assert_eq!(r["points"], 3);
     assert_eq!(s.tool.tool, texturecraft_engine::Tool::Path);
-    assert!(!red_at(&s, 200.0, 180.0), "nothing painted before commit");
+    assert!(red_at(&s, 200.0, 180.0), "the path is previewed before it is applied");
     let r = execute(&mut s, "tool.path", &json!({"commit": true})).unwrap();
     assert!(r["committed"]["stamps"].as_u64().unwrap() > 10, "{r}");
     assert_eq!(r["points"], 0, "commit clears the path");
@@ -46,11 +46,11 @@ fn path_stroke_paints_along_the_curve() {
     }
     assert!(!red_at(&s, 200.0, 240.0), "below the curve");
     assert!(!red_at(&s, 200.0, 130.0), "above the curve");
-    // One undo step.
+    // One undo step
     execute(&mut s, "edit.undo", &Value::Null).unwrap();
     s.update();
     assert!(!red_at(&s, 200.0, 180.0));
-    // Errors: no points, points off the mesh.
+    // Errors: no points, points off the mesh
     assert!(execute(&mut s, "tool.path", &json!({"commit": true})).is_err());
     assert!(execute(&mut s, "tool.path", &json!({"points": [[2, 2]]})).is_err());
 }
@@ -277,4 +277,166 @@ fn each_path_and_each_edit_of_one_is_its_own_undo_step() {
     execute(&mut s, "edit.undo", &Value::Null).unwrap();
     s.update();
     assert!(red_at(&s, 200.0, 230.0), "undo brings back the first edit");
+}
+
+/// The pixels of every path sublayer of the selected layer, comparable
+fn path_pixels(s: &Session) -> Vec<String> {
+    let ids: Vec<u64> = path_sublayers(s).into_iter().map(|(id, _)| id).collect();
+    let mut v: Vec<String> = s.doc.pixels.layers.iter().filter(|((id, _), _)| ids.contains(&id.0)).map(|(k, img)| format!("{k:?}{img:?}")).collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn placing_points_previews_the_path_with_no_undo_step_until_it_is_applied() {
+    let points = json!([[140, 210], [200, 180], [260, 210]]);
+    let mut direct = session(primitives::sphere(1.0, 48, 24));
+    execute(&mut direct, "tool.path", &json!({"points": points, "commit": true})).unwrap();
+
+    let mut s = session(primitives::sphere(1.0, 48, 24));
+    let start = s.history_labels();
+    execute(&mut s, "tool.path", &json!({"points": [[140, 280], [260, 280]]})).unwrap();
+    assert!(red_at(&s, 200.0, 280.0));
+    execute(&mut s, "tool.path", &json!({"points": points})).unwrap();
+    assert!(red_at(&s, 200.0, 180.0) && !red_at(&s, 200.0, 280.0), "the preview follows the points");
+    assert_eq!(s.history_labels(), start, "no undo step while placing");
+    execute(&mut s, "tool.path", &json!({"commit": true})).unwrap();
+    assert_eq!(s.history_labels().len(), start.len() + 1, "applying is one undo step");
+    assert_eq!(s.undo_label(), Some("Path"));
+    assert_eq!(path_pixels(&s), path_pixels(&direct), "the same pixels as applying without a preview");
+
+    // Cancelling removes the preview
+    execute(&mut s, "tool.path", &json!({"points": [[140, 260], [200, 250], [260, 260]]})).unwrap();
+    assert!(red_at(&s, 200.0, 250.0));
+    execute(&mut s, "tool.path", &json!({"clear": true})).unwrap();
+    s.update();
+    assert!(!red_at(&s, 200.0, 250.0) && red_at(&s, 200.0, 180.0));
+    assert_eq!(s.history_labels().len(), start.len() + 1);
+}
+
+#[test]
+fn undo_while_placing_removes_the_preview_only() {
+    let mut s = session(primitives::sphere(1.0, 48, 24));
+    execute(&mut s, "tool.path", &json!({"points": [[140, 210], [200, 180], [260, 210]], "commit": true})).unwrap();
+    let steps = s.history_labels().len();
+    execute(&mut s, "tool.path", &json!({"points": [[140, 260], [200, 250], [260, 260]]})).unwrap();
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    s.update();
+    assert!(!red_at(&s, 200.0, 250.0), "the preview is gone");
+    assert!(red_at(&s, 200.0, 180.0), "the applied path stays");
+    assert_eq!(s.history_labels().len(), steps);
+    assert!(s.tool.path.points.is_empty() && s.tool.path.editing.is_none());
+}
+
+#[test]
+fn another_change_while_placing_makes_the_path_its_own_step_first() {
+    let mut s = session(primitives::sphere(1.0, 48, 24));
+    let steps = s.history_labels().len();
+    execute(&mut s, "tool.path", &json!({"points": [[140, 210], [200, 180], [260, 210]]})).unwrap();
+    execute(&mut s, "layer.add.paint", &Value::Null).unwrap();
+    let labels = s.history_labels();
+    assert_eq!(labels.len(), steps + 2);
+    assert_eq!(labels.get(steps).map(String::as_str), Some("Path"));
+    // Undoing the other change keeps the path; undoing again removes it
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    s.update();
+    assert!(red_at(&s, 200.0, 180.0));
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    s.update();
+    assert!(!red_at(&s, 200.0, 180.0));
+}
+
+#[test]
+fn editing_another_path_while_placing_applies_the_new_one() {
+    let mut s = session(primitives::sphere(1.0, 48, 24));
+    let r = execute(&mut s, "tool.path", &json!({"points": [[140, 210], [200, 180], [260, 210]], "commit": true})).unwrap();
+    let eid = r["committed"]["effect"].as_u64().unwrap();
+    execute(&mut s, "tool.path", &json!({"points": [[140, 260], [200, 250], [260, 260]]})).unwrap();
+    execute(&mut s, "path.edit", &json!({"effect": eid, "index": 0})).unwrap();
+    assert_eq!(path_sublayers(&s), vec![(eid, 2)], "the new path was applied");
+    assert_eq!(s.undo_label(), Some("Path"));
+    assert_eq!(s.tool.path.editing, Some((texturecraft_engine::core::LayerId(eid), 0)));
+}
+
+#[test]
+fn the_next_path_starts_open_after_a_closed_one() {
+    let mut s = session(primitives::sphere(1.0, 48, 24));
+    execute(&mut s, "tool.path", &json!({"points": [[140, 210], [200, 180], [260, 210]], "closed": true, "commit": true})).unwrap();
+    assert!(!s.tool.path.closed, "applying a closed path leaves the tool open for the next one");
+    execute(&mut s, "tool.path", &json!({"points": [[140, 260], [200, 250], [260, 260]], "closed": true})).unwrap();
+    execute(&mut s, "tool.path", &json!({"clear": true})).unwrap();
+    assert!(!s.tool.path.closed, "cancelling does too");
+}
+
+/// A short path's repaint marks under 1/N of a 1024-texel set's 256 tiles
+const SHORT_PATH_TILE_SHARE_DIVISOR: usize = 4;
+
+/// Move the middle point of the Path tool's curve down to viewport row `y` and repaint, returning the (dirty, all) tile counts
+fn move_middle_point(s: &mut Session, y: f32) -> (usize, usize) {
+    s.tool.path.points[1] = s.pick(Vec2::new(200.0, y), s.viewport).unwrap().pos;
+    assert!(s.path_live().unwrap());
+    (s.caches[0].dirty.len(), s.caches[0].covered_tiles.len())
+}
+
+#[test]
+fn moving_a_point_recomposites_only_the_paths_tiles() {
+    // 1024 texels: 256 tiles, so a short path covers few of them
+    let mut s = Session::new_project("t", primitives::sphere(1.0, 48, 24), "builtin:test", None, 1024).unwrap();
+    s.viewport = Vec2::new(400.0, 400.0);
+    (s.camera.yaw, s.camera.pitch) = (0.0, 0.0);
+    execute(&mut s, "tool.brush", &json!({"size": 6})).unwrap();
+    execute(&mut s, "tool.path", &json!({"points": [[140, 210], [200, 180], [260, 210]]})).unwrap();
+    s.update();
+
+    let (dirty, all) = move_middle_point(&mut s, 190.0);
+    assert!(dirty > 0 && dirty * SHORT_PATH_TILE_SHARE_DIVISOR < all, "a new path: {dirty} of {all} tiles to recomposite");
+    s.update();
+
+    let r = execute(&mut s, "tool.path", &json!({"commit": true})).unwrap();
+    execute(&mut s, "path.edit", &json!({"effect": r["committed"]["effect"], "index": 0})).unwrap();
+    s.update();
+    // Another row than the applied one, so the edit changes the path
+    let (dirty, all) = move_middle_point(&mut s, 200.0);
+    assert!(dirty > 0 && dirty * SHORT_PATH_TILE_SHARE_DIVISOR < all, "an applied path being edited: {dirty} of {all} tiles to recomposite");
+}
+
+#[test]
+fn another_change_ends_the_point_undo_of_an_edited_path() {
+    let mut s = session(primitives::sphere(1.0, 48, 24));
+    let r = execute(&mut s, "tool.path", &json!({"points": [[140, 210], [200, 180], [260, 210]], "commit": true})).unwrap();
+    let eid = texturecraft_engine::core::LayerId(r["committed"]["effect"].as_u64().unwrap());
+    execute(&mut s, "path.edit", &json!({"effect": eid.0, "index": 0})).unwrap();
+    s.path_checkpoint();
+    s.tool.path.points[1] = s.pick(Vec2::new(200.0, 230.0), s.viewport).unwrap().pos;
+    assert!(s.path_live().unwrap());
+    let moved: Vec<[f32; 3]> = s.tool.path.points.iter().map(|p| p.to_array()).collect();
+    let layers = s.doc.project.layers.len();
+
+    execute(&mut s, "layer.add.paint", &Value::Null).unwrap();
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    assert_eq!(s.doc.project.layers.len(), layers, "undo removes the new layer");
+    assert_eq!(s.paths(eid).unwrap()[0].points, moved, "the path keeps its moved point");
+}
+
+#[test]
+fn placing_a_path_ends_redo() {
+    let mut s = session(primitives::sphere(1.0, 48, 24));
+    execute(&mut s, "tool.path", &json!({"points": [[140, 210], [200, 180], [260, 210]], "commit": true})).unwrap();
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    assert!(s.can_redo());
+    execute(&mut s, "tool.path", &json!({"points": [[140, 260], [200, 250], [260, 260]]})).unwrap();
+    assert!(!s.can_redo(), "redo would throw the path being placed away");
+}
+
+#[test]
+fn switching_texture_sets_applies_the_path_being_placed() {
+    let mut s = texturecraft_engine::sample_session(256, 64).unwrap();
+    execute(&mut s, "layer.add.paint", &Value::Null).unwrap();
+    let steps = s.history_labels().len();
+    execute(&mut s, "tool.path", &json!({"uvPoints": [[0.2, 0.5], [0.5, 0.45], [0.8, 0.5]]})).unwrap();
+
+    execute(&mut s, "textureSet.select", &json!({"ts": 1})).unwrap();
+    assert_eq!(s.history_labels().len(), steps + 1);
+    assert_eq!(s.undo_label(), Some("Path"));
+    assert!(s.tool.path.points.is_empty() && s.tool.path.editing.is_none(), "the path no longer paints into the other set");
 }

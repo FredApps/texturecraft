@@ -30,6 +30,7 @@ pub mod materials;
 pub mod materialx_cmds;
 pub mod meshmap_cmds;
 pub mod painting;
+mod path_draft;
 pub mod path_tool;
 // Mesh reimport reads files: native only.
 #[cfg(not(target_arch = "wasm32"))]

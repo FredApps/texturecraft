@@ -341,8 +341,7 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
             app.properties_popup = None;
         } else if app.ui.mode == Mode::Painting && input.consume_key(Modifiers::NONE, Key::Escape) {
             app.session.cancel_stroke();
-            app.session.tool.path.points.clear();
-            app.session.tool.path.editing = None;
+            app.session.cancel_path();
         }
     });
 

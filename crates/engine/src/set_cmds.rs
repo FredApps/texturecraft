@@ -77,6 +77,12 @@ pub(crate) fn ts_param(s: &Session, p: &Value, cmd: &str) -> Result<usize> {
 fn select(s: &mut Session, p: &Value) -> Result<Value> {
     let ts = u64p(p, "ts").map(|t| t as usize).filter(|t| *t < s.set_count()).ok_or_else(|| bad("textureSet.select", "valid `ts` index required"))?;
     s.cancel_stroke();
+
+    // Paths paint into the active set
+    if ts != s.ts() {
+        s.finish_path()?;
+    }
+
     s.active_set = ts;
     s.target = StackTarget::Content;
     s.revision = s.revision.wrapping_add(1);

@@ -7,45 +7,59 @@
 //! (`path.edit`, live while the points, brush or material change) or removed (`path.remove`).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use texturecraft_compose::{PaintTarget, PixelStore};
 use texturecraft_core::{Channel, Effect, EffectKind, LayerId, Mask, MaskBackground, PathShape};
 use texturecraft_geom::glam::{Vec2, Vec3};
 use texturecraft_geom::{OrbitCamera, surface_at};
-use texturecraft_paint::{BrushSettings, Lasso, fill_coverage, spline};
+use texturecraft_paint::{BrushSettings, Lasso, PickCtx, fill_coverage, pick, spline, spline_segments};
+use texturecraft_texel::TileImage;
 
 use crate::commands::{CommandSpec, always, bad, boolp, has_layer, u64p};
+use crate::path_draft::PathDraft;
 use crate::session::{StackTarget, Tool};
 use crate::tool_cmds::{points_param, set_tool, viewport_of};
-use crate::{EngineError, Result, Session, cmd};
+use crate::{Document, EngineError, Result, Session, cmd};
 
 /// Control points kept at most.
 pub const MAX_PATH_POINTS: usize = 4096;
+/// The undo step that adds a new path
+pub(crate) const NEW_PATH_LABEL: &str = "Path";
 /// Curve sampling step in viewport pixels (3D view) and texture units (2D view).
 const STEP_PX: f32 = 2.0;
 const STEP_UV: f32 = 0.001;
+/// A stored path's viewport is clamped to this range (pixels per side) before painting from it
+const MIN_PAINT_VIEWPORT_PX: f32 = 16.0;
+const MAX_PAINT_VIEWPORT_PX: f32 = 16384.0;
+/// Sampling step of a 3D path's curve on the mesh for the views, in its paint viewport pixels
+const SURFACE_STEP_PX: f32 = 4.0;
 const MIN_PROJECTIVE_W: f32 = 1e-6;
 // Allow ray hits to differ slightly from transformed texel positions
 const RAY_HIT_RELATIVE_TOLERANCE: f32 = 0.001;
 
-/// The curve being edited with the Path tool.
+/// The curve being edited with the Path tool
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct PathState {
-    /// Control points: surface positions (3D view) or texture coordinates with z = 0 (2D view).
+    /// Control points: surface positions (3D view) or texture coordinates with z = 0 (2D view)
     pub points: Vec<Vec3>,
-    /// The points are texture coordinates (placed in the 2D view).
+    /// The points are texture coordinates (placed in the 2D view)
     pub uv: bool,
-    /// The curve loops back to its first point.
+    /// The curve loops back to its first point
     pub closed: bool,
-    /// A closed path fills its interior instead of stroking the curve.
+    /// A closed path fills its interior instead of stroking the curve
     pub fill: bool,
-    /// The stored path being edited: (path sublayer, index). Changes repaint it live.
+    /// The stored path being edited: (path sublayer, index). Changes repaint it live
     #[serde(default)]
     pub editing: Option<(LayerId, usize)>,
-    /// This edit has already repainted: later changes join its undo step, not an earlier edit's.
+    /// This edit has already repainted: later changes join its undo step, not an earlier edit's
     #[serde(default)]
     pub edited: bool,
+    /// The selected control point (drawn in the accent color; Backspace or Remove point removes it)
+    #[serde(default)]
+    pub selected: Option<usize>,
 }
 
 impl PathState {
@@ -57,6 +71,42 @@ impl PathState {
         }
         if self.points.len() < MAX_PATH_POINTS {
             self.points.push(p);
+        }
+    }
+
+    /// Insert a control point before point `at` (on the segment ending there) and select it; None when it can't
+    pub fn insert(&mut self, at: usize, p: Vec3) -> Option<usize> {
+        if at > self.points.len() || self.points.len() >= MAX_PATH_POINTS {
+            return None;
+        }
+
+        self.points.insert(at, p);
+        self.selected = Some(at);
+        self.selected
+    }
+
+    /// The same curve (points, open or closed, filled, view) as `other`
+    fn same_curve(&self, other: &PathState) -> bool {
+        (&self.points, self.closed, self.fill, self.uv) == (&other.points, other.closed, other.fill, other.uv)
+    }
+
+    /// Empty the tool for the next path: no points, open, nothing selected or edited
+    pub fn clear(&mut self) {
+        self.points.clear();
+        self.closed = false;
+        self.selected = None;
+        self.editing = None;
+        self.edited = false;
+    }
+
+    /// Remove the selected control point, or the last one when none is selected
+    pub fn remove_selected(&mut self) {
+        let at = self.selected.take().filter(|i| *i < self.points.len()).or(self.points.len().checked_sub(1));
+        if let Some(i) = at {
+            self.points.remove(i);
+        }
+        if self.closed && self.points.len() < 3 {
+            self.closed = false;
         }
     }
 }
@@ -121,20 +171,21 @@ fn path(s: &mut Session, p: &Value) -> Result<Value> {
     if s.tool.tool != Tool::Path {
         set_tool(s, Tool::Path)?;
     }
-    let vp = viewport_of(s, p);
+    let viewport = viewport_of(s, p);
     if boolp(p, "clear") == Some(true) {
-        s.tool.path.points.clear();
-        s.tool.path.editing = None;
+        s.cancel_path();
     }
+
     let placed = match (points_param(CMD, p, "points")?, points_param(CMD, p, "uvPoints")?) {
-        (Some(pts), _) => Some((
-            pts.iter()
+        (Some(pixels), _) => Some((
+            pixels
+                .iter()
                 .enumerate()
-                .map(|(i, q)| s.pick(*q, vp).map(|h| h.pos).ok_or_else(|| bad(CMD, format!("point {i} misses the mesh"))))
+                .map(|(i, pixel)| s.pick(*pixel, viewport).map(|hit| hit.pos).ok_or_else(|| bad(CMD, format!("point {i} misses the mesh"))))
                 .collect::<Result<Vec<_>>>()?,
             false,
         )),
-        (None, Some(pts)) => Some((pts.iter().map(|q| q.clamp(Vec2::ZERO, Vec2::ONE).extend(0.0)).collect(), true)),
+        (None, Some(uvs)) => Some((uvs.iter().map(|uv| uv.clamp(Vec2::ZERO, Vec2::ONE).extend(0.0)).collect(), true)),
         (None, None) => None,
     };
     if let Some((points, uv)) = placed {
@@ -151,19 +202,21 @@ fn path(s: &mut Session, p: &Value) -> Result<Value> {
         s.tool.path.fill = v;
     }
     s.revision = s.revision.wrapping_add(1);
+
     let committed = if boolp(p, "commit") == Some(true) {
-        let r = s.commit_path(vp)?;
+        let report = s.commit_path(viewport)?;
         s.update();
-        r
+        report
     } else {
         if s.path_live()? {
             s.update();
         }
         Value::Null
     };
-    let st = &s.tool.path;
-    let editing = st.editing.map(|(e, i)| json!({ "effect": e.0, "index": i }));
-    Ok(json!({ "points": st.points.len(), "uv": st.uv, "closed": st.closed, "fill": st.fill, "editing": editing, "committed": committed }))
+
+    let path = &s.tool.path;
+    let editing = path.editing.map(|(e, i)| json!({ "effect": e.0, "index": i }));
+    Ok(json!({ "points": path.points.len(), "uv": path.uv, "closed": path.closed, "fill": path.fill, "editing": editing, "committed": committed }))
 }
 
 /// The `effect` and `index` params naming a stored path, with the path.
@@ -181,12 +234,15 @@ fn edit_path(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "path.edit";
     let (eid, index, shape) = path_ref(s, CMD, p)?;
     let paint = read_paint(&shape)?;
+
+    s.finish_path()?;
     set_tool(s, Tool::Path)?;
     s.tool.brush = paint.brush;
     s.tool.values = paint.values;
     s.tool.enabled = paint.enabled;
     s.tool.mask_value = paint.mask_value;
     s.tool.path = PathState { editing: Some((eid, index)), ..state_of(&shape) };
+    s.path_steps = Default::default();
     s.target = StackTarget::Effect(eid);
     Ok(json!({ "effect": eid.0, "index": index, "points": s.tool.path.points.len() }))
 }
@@ -216,10 +272,46 @@ fn read_paint(shape: &PathShape) -> Result<PathPaint> {
     Ok(paint)
 }
 
-/// The Path tool state showing a stored path (finite points only, at most [`MAX_PATH_POINTS`]).
+/// The Path tool state showing a stored path (finite points only, at most [`MAX_PATH_POINTS`])
 fn state_of(shape: &PathShape) -> PathState {
     let points = shape.points.iter().filter(|p| p.iter().all(|v| v.is_finite())).take(MAX_PATH_POINTS).map(|p| Vec3::from_array(*p)).collect();
-    PathState { points, uv: shape.uv, closed: shape.closed, fill: shape.fill, editing: None, edited: false }
+    PathState { points, uv: shape.uv, closed: shape.closed, fill: shape.fill, ..PathState::default() }
+}
+
+/// Tiles (x, y) where sublayer `eid`'s pixels differ between `before` and `after` (copy-on-write: an unchanged tile is the same allocation)
+fn changed_tiles(before: &PixelStore, after: &PixelStore, eid: LayerId) -> BTreeSet<(u32, u32)> {
+    let (before_images, after_images) = (sublayer_images(before, eid), sublayer_images(after, eid));
+    let channels: BTreeSet<Option<Channel>> = before_images.keys().chain(after_images.keys()).copied().collect();
+
+    let mut tiles = BTreeSet::new();
+    for channel in channels {
+        let (before_image, after_image) = (before_images.get(&channel), after_images.get(&channel));
+        let Some(image) = before_image.or(after_image) else { continue };
+        for ty in 0..image.tiles_y() {
+            for tx in 0..image.tiles_x() {
+                let same = match (before_image.and_then(|i| i.tile_handle(tx, ty)), after_image.and_then(|i| i.tile_handle(tx, ty))) {
+                    (None, None) => true,
+                    (Some(before_tile), Some(after_tile)) => Arc::ptr_eq(before_tile, after_tile),
+                    _ => false,
+                };
+                if !same {
+                    tiles.insert((tx, ty));
+                }
+            }
+        }
+    }
+    tiles
+}
+
+/// Sublayer `eid`'s images by channel (None: its mask image)
+fn sublayer_images(pixels: &PixelStore, eid: LayerId) -> BTreeMap<Option<Channel>, &TileImage> {
+    let layers = pixels.layers.iter().filter(|((id, _), _)| *id == eid).map(|((_, channel), image)| (Some(*channel), image));
+    layers.chain(pixels.masks.get(&eid).map(|mask| (None, mask))).collect()
+}
+
+/// The camera and viewport a stored path paints through (the views draw its curve the same way)
+fn paint_view(shape: &PathShape, paint: &PathPaint) -> (OrbitCamera, Vec2) {
+    (paint.camera, Vec2::from_array(shape.viewport).max(Vec2::splat(MIN_PAINT_VIEWPORT_PX)).min(Vec2::splat(MAX_PAINT_VIEWPORT_PX)))
 }
 
 /// NDC (y up) to viewport pixels (origin top-left).
@@ -237,6 +329,11 @@ impl Session {
         }
         let aspect = viewport.x.max(1.0) / viewport.y.max(1.0);
         path.points.iter().map(|p| self.camera.project(*p, aspect).map(|n| to_pixels(n.truncate(), viewport))).collect()
+    }
+
+    /// The stored paths of path sublayer `eid` as Path tool states, for the views to draw
+    pub fn stored_path_states(&self, eid: LayerId) -> Vec<PathState> {
+        self.paths(eid).unwrap_or_default().iter().map(state_of).collect()
     }
 
     /// The stored paths of path sublayer `eid` (None if it isn't one).
@@ -261,12 +358,32 @@ impl Session {
         }
     }
 
-    /// Store the Path tool's curve (a new path in the selected path sublayer, or in a new one;
-    /// or the path being edited) and repaint the sublayer, as one undo step. Clears the tool.
+    /// Store the Path tool's curve (new, or the path being edited) and repaint its sublayer as one undo step, then clear the tool
     pub fn commit_path(&mut self, viewport: Vec2) -> Result<Value> {
         let shape = self.path_shape(self.camera, viewport);
+        if let Some(draft) = self.path_draft.take() {
+            match self.tool.path.editing {
+                // The preview is what applying paints: keep its pixels
+                Some((eid, index)) if self.paths(eid).and_then(|v| v.get(index)) == Some(&shape) => {
+                    self.push_step(NEW_PATH_LABEL, draft.base, false);
+                    self.target = StackTarget::Effect(eid);
+                    self.tool.path.clear();
+                    let mut out = draft.painted;
+                    out["effect"] = json!(eid.0);
+                    out["index"] = json!(index);
+                    return Ok(out);
+                }
+                // Otherwise it paints again from the document before the preview
+                _ => {
+                    let preview = std::mem::replace(&mut self.doc, draft.base);
+                    self.changed_without_history(&preview);
+                    self.tool.path.editing = None;
+                }
+            }
+        }
+
         let editing = self.tool.path.editing;
-        let label = editing.map_or("Path".to_string(), |(_, i)| format!("Edit path {}", i + 1));
+        let label = editing.map_or(NEW_PATH_LABEL.to_string(), |(_, i)| format!("Edit path {}", i + 1));
         let out = self.edit_merging(&label, editing.is_some() && self.tool.path.edited, |s| {
             let (eid, index) = match editing {
                 Some(at) => at,
@@ -274,29 +391,34 @@ impl Session {
             };
             s.put_path(eid, index, shape)
         })?;
+
         if let Some(eid) = out.get("effect").and_then(Value::as_u64) {
             self.target = StackTarget::Effect(LayerId(eid));
         }
-        self.tool.path.points.clear();
-        self.tool.path.editing = None;
+        self.tool.path.clear();
         Ok(out)
     }
 
-    /// While a stored path is edited, repaint its sublayer when the tool's points, brush or
-    /// material changed (orbiting or resizing the view alone doesn't), merged into one undo
-    /// step. Cheap when nothing changed; the UI calls it every frame. Returns whether it
-    /// repainted.
+    /// Repaint the edited path (one merged undo step) or a new path's preview (no step) when its points, brush or material changed; called every frame
     pub fn path_live(&mut self) -> Result<bool> {
-        let Some((eid, index)) = self.tool.path.editing else { return Ok(false) };
-        let Some(stored) = self.paths(eid).and_then(|v| v.get(index)).cloned() else {
-            self.stop_path_edit();
-            return Ok(false);
+        let stored = match self.tool.path.editing {
+            Some((eid, index)) => match self.paths(eid).and_then(|v| v.get(index)).cloned() {
+                Some(shape) => Some((eid, index, shape)),
+                None => {
+                    self.stop_path_edit();
+                    return Ok(false);
+                }
+            },
+            None => None,
         };
+
         let path = &self.tool.path;
         if self.tool.tool != Tool::Path || self.stroke.is_some() || path.points.is_empty() || (path.closed && path.fill && path.points.len() < 3) {
             return Ok(false);
         }
-        // Typed comparison: the stored settings went through JSON (f64), maybe a save and load.
+        let Some((eid, index, stored)) = stored else { return self.start_path_draft() };
+
+        // Typed comparison: the stored settings went through JSON (f64), maybe a save and load
         let unchanged = read_paint(&stored).is_ok_and(|p| {
             let now = self.path_shape(p.camera, Vec2::from_array(stored.viewport));
             (&now.points, now.uv, now.closed, now.fill) == (&stored.points, stored.uv, stored.closed, stored.fill) && read_paint(&now).is_ok_and(|n| n == p)
@@ -304,17 +426,109 @@ impl Session {
         if unchanged {
             return Ok(false);
         }
+
         let shape = self.path_shape(self.camera, self.viewport);
-        self.edit_merging(&format!("Edit path {}", index + 1), self.tool.path.edited, |s| s.put_path(eid, index, shape))?;
-        self.tool.path.edited = true;
+        let (painted, before) = self.repaint_path(eid, index, shape)?;
+        match &mut self.path_draft {
+            Some(draft) => draft.painted = painted,
+            None => {
+                // The path's own repaint keeps its point changes undoable, unlike other steps
+                let steps = std::mem::take(&mut self.path_steps);
+                self.push_step(&format!("Edit path {}", index + 1), before, self.tool.path.edited);
+                self.path_steps = steps;
+                self.tool.path.edited = true;
+            }
+        }
         Ok(true)
     }
 
-    /// Stop editing a stored path (its changes are already applied) and clear the tool.
-    pub fn stop_path_edit(&mut self) {
-        if self.tool.path.editing.take().is_some() {
-            self.tool.path.points.clear();
+    /// Paint a new path's first preview where [`Session::commit_path`] would add it, keeping the document before it for apply and cancel
+    fn start_path_draft(&mut self) -> Result<bool> {
+        let base = self.doc.clone();
+        let shape = self.path_shape(self.camera, self.viewport);
+        let placed = self.path_effect().and_then(|eid| {
+            let index = self.paths(eid).map_or(0, <[_]>::len);
+            self.put_path(eid, index, shape).map(|painted| ((eid, index), painted))
+        });
+        match placed {
+            Ok((at, painted)) => {
+                // Placing a path is a new action: what was undone before can't be redone over it
+                self.redo.clear();
+                self.tool.path.editing = Some(at);
+                self.changed_without_history(&base);
+                self.path_draft = Some(PathDraft { base, painted });
+                Ok(true)
+            }
+            Err(e) => {
+                self.doc = base;
+                Err(e)
+            }
         }
+    }
+
+    /// Remember the curve before a point change from a view, so undo steps back through those changes while the path is edited
+    pub fn path_checkpoint(&mut self) {
+        if !self.path_steps.0.last().is_some_and(|s| s.same_curve(&self.tool.path)) {
+            self.path_steps.0.push(self.tool.path.clone());
+            self.path_steps.1.clear();
+        }
+    }
+
+    /// Whether [`Session::step_path`] would undo (`back`) or redo a point change
+    pub(crate) fn path_step_pending(&self, back: bool) -> bool {
+        let steps = if back { &self.path_steps.0 } else { &self.path_steps.1 };
+        self.tool.tool == Tool::Path && steps.iter().any(|s| !s.same_curve(&self.tool.path))
+    }
+
+    /// Undo (`back`) or redo the edited path's last point change, false when there is none; with no points left the path is gone
+    pub(crate) fn step_path(&mut self, back: bool) -> bool {
+        if self.tool.tool != Tool::Path {
+            return false;
+        }
+
+        let (from, to) = if back { (&mut self.path_steps.0, &mut self.path_steps.1) } else { (&mut self.path_steps.1, &mut self.path_steps.0) };
+        // A checkpoint taken by a press that changed nothing isn't a step
+        while from.last().is_some_and(|s| s.same_curve(&self.tool.path)) {
+            from.pop();
+        }
+        let Some(state) = from.pop() else { return false };
+
+        let path = &mut self.tool.path;
+        let now = std::mem::replace(path, PathState { editing: path.editing, edited: path.edited, ..state });
+        to.push(now);
+
+        if self.tool.path.points.is_empty() {
+            self.stop_path_edit();
+        }
+        true
+    }
+
+    /// Apply a new path being placed (as Enter would) and end the edit of a stored one, e.g. before the active texture set changes
+    pub fn finish_path(&mut self) -> Result<()> {
+        if self.path_draft.is_some() {
+            let viewport = self.viewport;
+            self.commit_path(viewport)?;
+        }
+        self.stop_path_edit();
+        Ok(())
+    }
+
+    /// Cancel the Path tool's path: a new one's preview is removed, a stored one keeps its applied changes
+    pub fn cancel_path(&mut self) {
+        self.stop_path_edit();
+        self.tool.path.clear();
+    }
+
+    /// Stop editing a stored path (its changes are already applied) and clear the tool; a new path's preview is removed
+    pub fn stop_path_edit(&mut self) {
+        if let Some(draft) = self.path_draft.take() {
+            let preview = std::mem::replace(&mut self.doc, draft.base);
+            self.changed_without_history(&preview);
+        }
+        if self.tool.path.editing.is_some() {
+            self.tool.path.clear();
+        }
+        self.path_steps = Default::default();
     }
 
     /// The selected path sublayer, or a new one on the selected layer's content or mask
@@ -344,6 +558,32 @@ impl Session {
             l.content_effects.push(e);
         }
         Ok(eid)
+    }
+
+    /// [`Session::put_path`] recompositing only the tiles it changed, with no undo step: returns the paint report and the document before
+    fn repaint_path(&mut self, eid: LayerId, index: usize, shape: PathShape) -> Result<(Value, Document)> {
+        let before = self.doc.clone();
+        let painted = match self.put_path(eid, index, shape) {
+            Ok(v) => v,
+            Err(e) => {
+                self.doc = before;
+                return Err(e);
+            }
+        };
+
+        // Paths paint into the active set; a sublayer in another set recomposites in full
+        let project = &self.doc.project;
+        let set = project.effect(eid).and_then(|(owner, _)| project.locate(owner)).map(|(ts, _, _)| ts);
+        if set == Some(self.ts()) {
+            // Content or mask, the sublayer's owner decides which sets redraw
+            let tiles = changed_tiles(&before.pixels, &self.doc.pixels, eid);
+            self.mark_painted(self.ts(), Some(PaintTarget::Layer(eid)), tiles);
+        } else {
+            self.invalidate_changed(&before);
+        }
+        self.revision = self.revision.wrapping_add(1);
+        self.modified = true;
+        Ok((painted, before))
     }
 
     /// Replace path `index` of sublayer `eid` (append when out of range) and repaint the
@@ -421,13 +661,40 @@ impl Session {
 
     fn paint_shape(&mut self, shape: &PathShape) -> Result<Value> {
         let paint = read_paint(shape)?;
+        let (camera, viewport) = paint_view(shape, &paint);
         self.tool.brush = paint.brush;
         self.tool.values = paint.values;
         self.tool.enabled = paint.enabled;
         self.tool.mask_value = paint.mask_value;
-        self.camera = paint.camera;
+        self.camera = camera;
         self.tool.path = state_of(shape);
-        self.paint_path(Vec2::from_array(shape.viewport).max(Vec2::splat(16.0)).min(Vec2::splat(16384.0)))
+        self.paint_path(viewport)
+    }
+
+    /// Where a 3D path's curve lands on the mesh painted through `camera`, per segment as [`spline_segments`] (None off the mesh)
+    pub fn path_surface(&self, points: &[Vec3], closed: bool, camera: OrbitCamera, viewport: Vec2) -> Vec<Vec<Option<Vec3>>> {
+        let aspect = viewport.x.max(1.0) / viewport.y.max(1.0);
+        let Some(screen) = points.iter().map(|p| camera.project(*p, aspect).map(|n| to_pixels(n.truncate(), viewport))).collect::<Option<Vec<_>>>() else {
+            return Vec::new();
+        };
+
+        let ctx = PickCtx { mesh: &self.mesh, bvh: &self.bvh, camera: &camera, viewport };
+        spline_segments(&screen, closed, SURFACE_STEP_PX)
+            .into_iter()
+            .zip(&screen)
+            .map(|(samples, first)| std::iter::once(*first).chain(samples).map(|q| pick(&ctx, q).map(|hit| hit.pos)).collect())
+            .collect()
+    }
+
+    /// [`Session::path_surface`] of a stored 3D path through the camera and viewport it paints with
+    pub fn stored_path_surface(&self, eid: LayerId, index: usize) -> Option<Vec<Vec<Option<Vec3>>>> {
+        let shape = self.paths(eid)?.get(index)?;
+        if shape.uv {
+            return None;
+        }
+        let (camera, viewport) = paint_view(shape, &read_paint(shape).ok()?);
+        let path = state_of(shape);
+        Some(self.path_surface(&path.points, path.closed, camera, viewport))
     }
 
     /// Paint the Path tool's curve with the current brush (or fill it when closed and filled)
