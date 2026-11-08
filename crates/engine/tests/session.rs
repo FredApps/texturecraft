@@ -128,6 +128,19 @@ fn polygon_fill_boxes_survive_hostile_params() {
     }
 }
 
+/// A small project still gets the production bake defaults; only panic_hunt overrides them.
+#[test]
+fn new_project_keeps_full_resolution_bake_defaults() {
+    let s = session();
+    assert!(!s.doc.project.texture_sets.is_empty());
+    for texture_set in &s.doc.project.texture_sets {
+        assert_eq!(texture_set.resolution, 256);
+        assert_eq!(texture_set.bake, texturecraft_engine::core::BakeSettings::default());
+        assert_eq!(texture_set.bake.common.output_size(), (2048, 2048));
+        assert_eq!(texture_set.bake.maps.ao.parameters.rays.rays, 64);
+    }
+}
+
 /// Every command must return Ok or Err — never panic — for hostile params.
 #[test]
 fn panic_hunt() {
@@ -145,6 +158,11 @@ fn panic_hunt() {
         }
         for p in &hostile {
             let mut s = session();
+            // Match the 256px fixture: otherwise empty/irrelevant bake.run params perform
+            // repeated 2048px default bakes. Keep every input, ray count and fresh session.
+            for texture_set in &mut s.doc.project.texture_sets {
+                texture_set.bake.common.resolution = texturecraft_engine::core::BakeResolution::R256;
+            }
             let _ = execute(&mut s, spec.id, p);
             s.update();
         }
