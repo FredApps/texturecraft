@@ -29,6 +29,7 @@ pub mod render_mode;
 pub mod shelf;
 pub mod shelf_preview;
 pub mod state;
+pub mod symmetry;
 pub mod theme;
 pub mod thumbs;
 pub mod titlebar;

@@ -296,6 +296,9 @@ pub struct UiState {
     /// The brush that paints the skew correction map in the 2D view of bake mode.
     #[serde(default)]
     pub bake_paint_brush: crate::bake_mode::BakePaintBrush,
+    /// How the 3D view shows symmetry
+    #[serde(default)]
+    pub symmetry: crate::symmetry::SymmetryDisplay,
 }
 
 impl UiState {
@@ -365,6 +368,7 @@ impl Default for UiState {
             recent: Vec::new(),
             keymap: Keymap::new(),
             bake_paint_brush: crate::bake_mode::BakePaintBrush::default(),
+            symmetry: crate::symmetry::SymmetryDisplay::default(),
         }
     }
 }

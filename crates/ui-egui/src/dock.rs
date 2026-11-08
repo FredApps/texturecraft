@@ -1221,25 +1221,8 @@ fn brush_section(app: &mut TextureCraftApp, ui: &mut Ui) {
         }
         slider(ui, tr("Gravity"), &mut pt.gravity, 0.0..=2.0, 2);
     });
-    section(ui, "sec_lazy", tr("Lazy mouse and symmetry"), false, |ui| {
+    section(ui, "sec_lazy", tr("Lazy mouse"), false, |ui| {
         slider(ui, tr("Lazy mouse distance"), &mut b.lazy, 0.0..=200.0, 0);
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut b.symmetry.x, tr("Mirror X"));
-            ui.checkbox(&mut b.symmetry.y, tr("Mirror Y"));
-            ui.checkbox(&mut b.symmetry.z, tr("Mirror Z"));
-        });
-        let mut copies = f32::from(b.symmetry.radial);
-        if slider(ui, tr("Radial copies"), &mut copies, 0.0..=32.0, 0).changed() {
-            b.symmetry.radial = copies as u8;
-        }
-        ui.add_enabled_ui(b.symmetry.radial > 1, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(tr("Radial axis"));
-                for (k, name) in ["X", "Y", "Z"].into_iter().enumerate() {
-                    ui.selectable_value(&mut b.symmetry.axis, k as u8, name);
-                }
-            });
-        });
     });
     *b = b.sanitized();
 }
