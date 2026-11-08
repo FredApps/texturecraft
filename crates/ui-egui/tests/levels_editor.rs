@@ -12,6 +12,12 @@ use texturecraft_ui_egui::TextureCraftApp;
 const HISTOGRAM_BUCKETS: usize = 64;
 const AUTO_MIN_SHARE: f64 = 0.001;
 
+/// Labels of the five handles
+const HANDLE_LABELS: [&str; 5] = ["Input low", "Input high", "Gamma", "Output low", "Output high"];
+
+/// Corners of a handle's pentagon pointer
+const HANDLE_POINTER_CORNERS: usize = 5;
+
 /// A clouds mask under a levels effect added by `command` with `params`, selected, and its id
 fn levels_harness(command: &str, params: Value) -> (Harness<'static, TextureCraftApp>, LayerId) {
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
@@ -243,5 +249,30 @@ fn the_levels_filter_shows_the_same_editor() {
     }
     for button in ["Reset", "Auto", "Invert"] {
         harness.get_by_role_and_label(Role::Button, button);
+    }
+}
+
+/// Bounds of the handle pointers in paint order, the last one drawn on top
+fn painted_handles(harness: &Harness<'_, TextureCraftApp>) -> Vec<egui::Rect> {
+    let centres = HANDLE_LABELS.map(|label| handle(harness, label));
+    let pointers = harness.output().shapes.iter().filter_map(|clipped| match &clipped.shape {
+        egui::Shape::Path(path) if path.closed && path.points.len() == HANDLE_POINTER_CORNERS => Some(egui::Rect::from_points(&path.points)),
+        _ => None,
+    });
+    pointers.filter(|bounds| centres.iter().any(|centre| bounds.expand(1.0).contains(*centre))).collect()
+}
+
+#[test]
+fn the_hovered_handle_is_painted_on_top() {
+    let (mut harness, _) = levels_harness("effect.add.levels", json!({"target": "mask"}));
+    assert_eq!(painted_handles(&harness).len(), HANDLE_LABELS.len(), "every handle is painted once");
+
+    for label in HANDLE_LABELS {
+        let at = handle(&harness, label);
+        harness.hover_at(at);
+        harness.run_steps(2);
+
+        let on_top = painted_handles(&harness).last().copied().unwrap();
+        assert!(on_top.expand(1.0).contains(at), "{label} is painted last while hovered: {on_top:?} vs {at:?}");
     }
 }

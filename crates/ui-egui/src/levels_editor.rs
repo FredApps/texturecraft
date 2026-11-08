@@ -194,18 +194,17 @@ fn paint_output_gradient(ui: &Ui, strip: Rect) {
     painter.rect_stroke(strip, 0.0, Stroke::new(1.0, Tokens::get(ui.ctx()).field_border), egui::StrokeKind::Outside);
 }
 
-/// Each handle filled with its gray and its value beside it, the active one first and overlapping values left out
+/// Each handle filled with its gray, the active one on top, and its value beside it, overlapping values left out
 fn paint_handles_and_values(ui: &Ui, rect: Rect, responses: &[(LevelsHandle, Response)], levels: &Levels, typing: Option<LevelsHandle>) {
     let track = track(rect);
     let tokens = Tokens::get(ui.ctx());
     let painter = ui.painter();
-    let font = egui::FontId::proportional(VALUE_FONT_SIZE);
     let is_active = |response: &Response| response.dragged() || response.hovered();
-    let mut printed: Vec<Rect> = Vec::new();
-    let mut by_priority: Vec<&(LevelsHandle, Response)> = responses.iter().collect();
-    by_priority.sort_by_key(|(_, response)| !is_active(response));
 
-    for &(handle, ref response) in by_priority {
+    // Active handles last, so the one on top is the one the pointer grabs
+    let mut by_paint_order: Vec<&(LevelsHandle, Response)> = responses.iter().collect();
+    by_paint_order.sort_by_key(|(_, response)| is_active(response));
+    for &(handle, ref response) in by_paint_order {
         let x = track_x(&track, handle.position(levels));
         let fill = match handle {
             LevelsHandle::InputLow => Color32::BLACK,
@@ -222,6 +221,14 @@ fn paint_handles_and_values(ui: &Ui, rect: Rect, responses: &[(LevelsHandle, Res
         };
         let points_down = LevelsHandle::INPUT.contains(&handle);
         painter.add(egui::Shape::convex_polygon(handle_outline(x, handle_top(rect, handle), points_down), fill, Stroke::new(1.0, outline)));
+    }
+
+    // Active values first, so a neighbour's overlapping value gives way to them
+    let font = egui::FontId::proportional(VALUE_FONT_SIZE);
+    let mut printed: Vec<Rect> = Vec::new();
+    let mut by_priority: Vec<&(LevelsHandle, Response)> = responses.iter().collect();
+    by_priority.sort_by_key(|(_, response)| !is_active(response));
+    for &(handle, ref response) in by_priority {
         if typing == Some(handle) {
             continue;
         }
