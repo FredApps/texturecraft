@@ -453,6 +453,32 @@ fn a_failing_entry_is_an_error_not_a_hang() {
 }
 
 #[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn a_late_failing_entry_after_good_ones_is_its_own_error() {
+    // Only the last entry fails and nothing panics, so the error must come from that entry.
+    for (workers, budget) in [(4usize, 25u64), (4, u64::MAX), (2, 1)] {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            let list: Vec<Entry<'_>> = (0..10)
+                .map(|i| Entry {
+                    name: format!("e{i}"),
+                    options: opts,
+                    weight: 10,
+                    body: Box::new(move |w| if i == 9 { Err(std::io::Error::other("late boom")) } else { w.write_all(&[i as u8; 100]) }),
+                })
+                .collect();
+            let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
+            let res = entries::parallel::write(&mut zip, list, workers, budget);
+            let _ = tx.send(res.map_err(|e| matches!(&e, FormatError::Io(io) if io.to_string() == "late boom")));
+        });
+        let res =
+            rx.recv_timeout(std::time::Duration::from_secs(60)).unwrap_or_else(|e| panic!("save did not finish ({e}): {workers} workers, budget {budget}"));
+        assert_eq!(res, Err(true), "{workers} workers, budget {budget}");
+    }
+}
+
+#[test]
 fn recovery_skips_unsupported_baked_map_entries() {
     let expected = sample().pf;
     let bytes = edit_archive(&expected, |name, _| {
