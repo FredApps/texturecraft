@@ -6,6 +6,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{BlendMode, Channel, ChannelKind, lum};
 
+mod curvature_detail;
+mod curvature_mode;
+
+pub use curvature_detail::CurvatureDetail;
+pub use curvature_mode::CurvatureMode;
+
 /// Id of a layer or effect (one id space per project).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct LayerId(pub u64);
@@ -543,28 +549,38 @@ pub struct Generator {
     /// Direction for `Position` / `Direction` generators (world space).
     pub direction: [f32; 3],
     pub invert: bool,
+    /// Mode and detail sizes of `Curvature` / `EdgeWear` generators (None: the curvature map as baked, as before detail sizes existed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<CurvatureDetail>,
 }
 
 impl Generator {
     pub fn new(kind: GeneratorKind) -> Generator {
         let (level, softness, noise_amount) = match kind {
-            GeneratorKind::EdgeWear => (0.6, 0.12, 0.5),
+            GeneratorKind::EdgeWear => (0.5, 0.25, 0.3),
+            GeneratorKind::Curvature => (0.5, 0.5, 0.0),
             GeneratorKind::Dirt => (0.55, 0.25, 0.35),
             GeneratorKind::ThinAreas => (0.3, 0.2, 0.0),
             _ => (0.5, 0.25, 0.0),
         };
-        Generator { kind, level, softness, noise_amount, noise_scale: 8.0, seed: 7, offset: 0.0, direction: [0.0, 1.0, 0.0], invert: false }
+        let detail = match kind {
+            GeneratorKind::Curvature => Some(CurvatureDetail::default()),
+            GeneratorKind::EdgeWear => Some(CurvatureDetail { mode: CurvatureMode::Edges, weights: CurvatureDetail::EDGE_WEIGHTS }),
+            _ => None,
+        };
+        Generator { kind, level, softness, noise_amount, noise_scale: 8.0, seed: 7, offset: 0.0, direction: [0.0, 1.0, 0.0], invert: false, detail }
     }
 
     /// The mask value for a (noise-broken) signal `s`: the smooth threshold at `level` over
-    /// `softness`, inverted if asked, then shifted by `offset`.
+    /// `softness`, inverted if asked, then shifted by `offset` (a non-finite offset counts as 0).
     pub fn shape(&self, s: f32) -> f32 {
         let th = 1.0 - self.level.clamp(0.0, 1.0);
         let soft = self.softness.max(1e-3);
         let t = ((s - (th - soft)) / (2.0 * soft)).clamp(0.0, 1.0);
         let v = t * t * (3.0 - 2.0 * t);
         let v = if self.invert { 1.0 - v } else { v };
-        (v + self.offset).clamp(0.0, 1.0)
+        let offset = if self.offset.is_finite() { self.offset } else { 0.0 };
+        (v + offset).clamp(0.0, 1.0)
     }
 }
 
@@ -1075,6 +1091,28 @@ mod tests {
         assert_eq!(g.shape(0.2), 1.0, "and the result is clamped");
         g.offset = -1.0;
         assert_eq!(g.shape(0.9), 0.0);
+    }
+
+    #[test]
+    fn generator_non_finite_offset_counts_as_zero() {
+        let mut g = Generator::new(GeneratorKind::Position);
+        let base: Vec<f32> = [0.0, 0.2, 0.5, 0.9].iter().map(|&s| g.shape(s)).collect();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            g.offset = bad;
+            let got: Vec<f32> = [0.0, 0.2, 0.5, 0.9].iter().map(|&s| g.shape(s)).collect();
+            assert_eq!(got, base, "offset {bad} behaves like 0");
+        }
+    }
+
+    #[test]
+    fn curvature_generators_saved_before_detail_sizes_load_without_them() {
+        let mut saved = serde_json::to_value(Generator::new(GeneratorKind::Curvature)).unwrap();
+        assert!(saved.get("detail").is_some(), "new curvature generators have detail sizes");
+
+        saved.as_object_mut().unwrap().remove("detail");
+        let loaded: Generator = serde_json::from_value(saved).unwrap();
+        assert_eq!(loaded.detail, None);
+        assert_eq!(Generator::new(GeneratorKind::Dirt).detail, None, "only curvature and edge wear generators have detail sizes");
     }
 
     #[test]

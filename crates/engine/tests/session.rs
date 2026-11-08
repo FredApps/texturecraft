@@ -117,6 +117,22 @@ fn generator_offset_survives_save_and_reopen_and_undo_restores_it() {
 }
 
 #[test]
+fn generator_offset_works_alongside_curvature_mode_and_sizes() {
+    let mut s = session();
+    execute(&mut s, "layer.add.fill", &json!({})).unwrap();
+    execute(&mut s, "mask.add.black", &Value::Null).unwrap();
+    let r = execute(&mut s, "effect.add.generator", &json!({"generator": "curvature", "mode": "cavities", "offset": 0.5})).unwrap();
+    let eff = r["effect"].as_u64().unwrap();
+    assert_eq!(generator_offset_of(&s), 0.5);
+
+    execute(&mut s, "effect.set", &json!({"effect": eff, "offset": -0.5, "sizes": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.5]})).unwrap();
+    assert_eq!(generator_offset_of(&s), -0.5);
+    let inspect = execute(&mut s, "project.inspect", &Value::Null).unwrap().to_string();
+    assert!(inspect.contains(r#""offset":-0.5"#) && inspect.contains(r#""mode":"Cavities""#), "{inspect}");
+    assert!(inspect.contains(r#""sizes":[0.0,0.0,0.0,1.0,0.0,0.0,0.5]"#), "{inspect}");
+}
+
+#[test]
 fn layer_rename_and_undo() {
     let mut s = session();
     let layer_id = s.selected_layer().unwrap();
@@ -165,6 +181,29 @@ fn polygon_fill_and_color_picker() {
     execute(&mut s, "tool.colorPicker", &Value::Null).unwrap();
     let r = execute(&mut s, "tool.click", &json!({"x": 200, "y": 200})).unwrap();
     assert!((r["roughness"][0].as_f64().unwrap() - 0.9).abs() < 0.01, "{r}");
+}
+
+#[test]
+fn polygon_fill_boxes_survive_hostile_params() {
+    let hostile = [
+        json!({"x0": 1e30, "y0": -1e30, "x1": f64::MAX, "y1": 0, "viewport": [1e9, 1e9]}),
+        json!({"x0": 0, "y0": 0, "x1": 0, "y1": 0, "viewport": [16, 16]}),
+        json!({"uv0": [1e30, -1e30], "uv1": [0, 0]}),
+        json!({"uv0": [0.5], "uv1": "x", "uv": [f64::MIN, 2]}),
+        json!({"hitTest": "nope", "visibleOnly": "yes", "mode": 7}),
+    ];
+    for visible_only in [true, false] {
+        for hit_test in ["intersection", "containedCenter"] {
+            let mut session = session();
+            execute(&mut session, "tool.polygonFill", &Value::Null).unwrap();
+            execute(&mut session, "tool.fillSelection", &json!({"hitTest": hit_test, "visibleOnly": visible_only})).unwrap();
+            for params in &hostile {
+                let _ = execute(&mut session, "tool.click", params);
+                let _ = execute(&mut session, "tool.fillSelection", params);
+                session.update();
+            }
+        }
+    }
 }
 
 /// Every command must return Ok or Err — never panic — for hostile params.
@@ -441,4 +480,29 @@ fn background_resizes_match_the_command_and_keep_later_edits() {
     assert_eq!((b.doc.project.texture_sets[0].resolution, painted(&b)), (512, before));
     b.update();
     assert_eq!(b.caches[0].size, (512, 512));
+}
+
+#[test]
+fn curvature_generators_take_a_mode_and_detail_sizes() {
+    let mut state = session();
+    execute(&mut state, "layer.add.fill", &json!({})).unwrap();
+    execute(&mut state, "mask.add.black", &Value::Null).unwrap();
+    let added = execute(&mut state, "effect.add.generator", &json!({"generator": "curvature", "mode": "cavities"})).unwrap();
+    let effect = added["effect"].clone();
+
+    execute(&mut state, "effect.set", &json!({"effect": effect, "sizes": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.5]})).unwrap();
+    let inspect = execute(&mut state, "project.inspect", &Value::Null).unwrap().to_string();
+    assert!(inspect.contains(r#""mode":"Cavities""#) && inspect.contains(r#""sizes":[0.0,0.0,0.0,1.0,0.0,0.0,0.5]"#), "{inspect}");
+
+    let too_few = execute(&mut state, "effect.set", &json!({"effect": effect, "sizes": [1.0, 0.5]}));
+    assert!(too_few.is_err(), "sizes takes one weight per detail size");
+    let not_numbers = execute(&mut state, "effect.set", &json!({"effect": effect, "sizes": [1.0, "a", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}));
+    assert!(not_numbers.is_err(), "a size that isn't a number is rejected, not skipped");
+    let unknown = execute(&mut state, "effect.set", &json!({"effect": effect, "mode": "ridges"}));
+    assert!(unknown.is_err(), "unknown modes are rejected");
+    let wrong_type = execute(&mut state, "effect.set", &json!({"effect": effect, "mode": 1, "level": 0.1}));
+    assert!(wrong_type.is_err(), "a mode must be a string and an invalid edit must be rejected");
+    let dirt = execute(&mut state, "effect.add.generator", &json!({"generator": "dirt", "mode": "edges"}));
+    assert!(dirt.is_err(), "only curvature generators have a mode");
+    assert_eq!(execute(&mut state, "project.inspect", &Value::Null).unwrap().to_string(), inspect, "failed commands leave the project unchanged");
 }

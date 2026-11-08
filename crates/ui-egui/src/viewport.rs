@@ -9,7 +9,7 @@ use serde_json::json;
 use texturecraft_engine::camera_cmds::DEFAULT_CAMERA;
 use texturecraft_engine::core::BakedMap;
 use texturecraft_engine::geom::glam::{Vec2, Vec3};
-use texturecraft_engine::{Tool, ViewMode};
+use texturecraft_engine::{Session, Tool, ViewMode};
 use texturecraft_render::{Frame, SetHighlight, Shade, ViewKind};
 
 use crate::TextureCraftApp;
@@ -213,12 +213,14 @@ fn shade(app: &TextureCraftApp) -> Shade {
     };
     let set_index = app.session.ts();
     let height_strength = app.session.doc.project.texture_sets.get(set_index).map(|texture_set| texture_set.atlas_height_strength()).unwrap_or(1.0);
+    // Polygon fill shows the polygons it fills without changing the saved wireframe toggles
+    let polygon_fill_tool = app.ui.mode == crate::state::Mode::Painting && app.session.tool.tool == Tool::PolygonFill;
     Shade {
         height_strength,
         view_mode,
         channel,
-        wireframe: app.ui.uv_wireframe,
-        wireframe_3d: app.ui.wireframe_3d,
+        wireframe: app.ui.uv_wireframe || polygon_fill_tool,
+        wireframe_3d: app.ui.wireframe_3d || polygon_fill_tool,
         ..Shade::from_project(&app.session.doc.project)
     }
 }
@@ -575,8 +577,17 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     let path_tool = app.session.tool.tool == Tool::Path;
     let viewport = app.session.viewport;
     let show = |app: &TextureCraftApp, point: Vec3| project(app, rect, point);
+    let mut fill_box = None;
     if painting && path_tool {
         path_input(app, ui, &response, false, |app, pointer| app.session.pick(local(pointer), viewport).map(|hit| hit.pos), show);
+    } else if painting && app.session.tool.tool == Tool::PolygonFill {
+        fill_box = polygon_fill_input(
+            app,
+            ui,
+            &response,
+            |session, point| session.polygon_fill(local(point), viewport),
+            |session, corner, opposite| session.drag_polygon_fill_box(local(corner), local(opposite), viewport),
+        );
     } else if painting {
         let pressure = pen_pressure(ui);
         if response.drag_started_by(PointerButton::Primary) || response.clicked_by(PointerButton::Primary) {
@@ -621,6 +632,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         visible: app.session.doc.project.texture_sets.iter().map(|texture_set| texture_set.visible).collect(),
     };
     add_callback(app, ui, rect, frame, sync);
+    polygon_fill_box_overlay(ui, rect, fill_box);
 
     // Shelf drops: a material goes above the selection of the set under the pointer, an alpha on the brush
     crate::shelf::drop_target(app, ui, &response, crate::shelf::DropZone::View3d);
@@ -1003,6 +1015,64 @@ fn rubber_band(ui: &Ui, rect: Rect, from: Pos2, to: Pos2) {
     p.add(egui::Shape::dashed_line(&[from, to], Stroke::new(1.0, Color32::from_white_alpha(200)), 6.0, 4.0));
 }
 
+/// Polygon fill in a view: a click fills one target, a drag fills its box live (one undo step); returns the box to draw over the view image
+fn polygon_fill_input(
+    app: &mut TextureCraftApp,
+    ui: &Ui,
+    response: &egui::Response,
+    fill_at: impl Fn(&mut Session, Pos2) -> texturecraft_engine::Result<usize>,
+    drag_box: impl Fn(&mut Session, Pos2, Pos2) -> texturecraft_engine::Result<usize>,
+) -> Option<Rect> {
+    let origin_id = response.id.with("polygon_fill_box");
+    let dragging = response.dragged_by(PointerButton::Primary);
+    let released = response.drag_stopped_by(PointerButton::Primary);
+    let held = ui.input(|input| input.pointer.primary_down());
+    if !held && !released {
+        // A drag this view started and cut short (Alt, a second finger) keeps what it filled as one step
+        if ui.data_mut(|data| data.remove_temp::<Pos2>(origin_id)).is_some() {
+            app.session.end_polygon_fill_box();
+        }
+    } else if dragging && let Some(press) = ui.input(|input| input.pointer.press_origin()) {
+        ui.data_mut(|data| data.insert_temp(origin_id, press));
+    }
+
+    // Consume the origin on release so a new press cannot resume the previous rectangle
+    let origin = if released { ui.data_mut(|data| data.remove_temp::<Pos2>(origin_id)) } else { ui.data(|data| data.get_temp::<Pos2>(origin_id)) };
+    let pointer = ui.input(|input| input.pointer.latest_pos());
+    let (filled, dragged_box) = match (origin, pointer) {
+        _ if response.clicked_by(PointerButton::Primary) => (response.interact_pointer_pos().map(|point| fill_at(&mut app.session, point)), None),
+        (Some(origin), Some(pointer)) if released => {
+            // The drag ends on release even when its last move failed
+            let shown = drag_box(&mut app.session, origin, pointer);
+            let filled = app.session.end_polygon_fill_box();
+            (Some(shown.map(|_| filled)), None)
+        }
+        _ if released => {
+            app.session.end_polygon_fill_box();
+            (None, None)
+        }
+        (Some(origin), Some(pointer)) => (Some(drag_box(&mut app.session, origin, pointer)), Some(Rect::from_two_pos(origin, pointer))),
+        _ => (None, None),
+    };
+
+    if let Some(Err(error)) = filled {
+        app.toast(error.to_string(), true);
+    }
+
+    dragged_box
+}
+
+/// How strongly the polygon fill box tints what it covers (0..1)
+const FILL_BOX_TINT: f32 = 0.15;
+
+/// The polygon fill box being dragged, over view `rect`
+fn polygon_fill_box_overlay(ui: &Ui, rect: Rect, fill_box: Option<Rect>) {
+    let Some(fill_box) = fill_box else { return };
+
+    let accent = Tokens::get(ui.ctx()).viewport_accent;
+    ui.painter_at(rect).rect(fill_box, 0.0, accent.gamma_multiply(FILL_BOX_TINT), Stroke::new(1.0, accent), egui::StrokeKind::Inside);
+}
+
 /// V held with the Clone tool in painting mode: clicks set the clone source.
 fn clone_source_key(app: &TextureCraftApp, ui: &Ui) -> bool {
     app.ui.mode == crate::state::Mode::Painting
@@ -1213,8 +1283,17 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
 
     // Painting in UV space
     let painting = app.ui.mode == crate::state::Mode::Painting && app.properties_popup.is_none() && !alt && !adjusting && !v_held;
+    let mut fill_box = None;
     if painting && path_tool {
         path_input(app, ui, &response, true, |_, pointer| Some(to_uv(pointer).extend(0.0)), show);
+    } else if painting && app.session.tool.tool == Tool::PolygonFill {
+        fill_box = polygon_fill_input(
+            app,
+            ui,
+            &response,
+            |session, point| session.polygon_fill_uv(to_uv(point)),
+            |session, corner, opposite| session.drag_polygon_fill_box_uv(to_uv(corner), to_uv(opposite)),
+        );
     } else if painting {
         let pressure = pen_pressure(ui);
         if response.drag_started_by(PointerButton::Primary) || response.clicked_by(PointerButton::Primary) {
@@ -1254,6 +1333,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         visible: app.session.doc.project.texture_sets.iter().map(|texture_set| texture_set.visible).collect(),
     };
     add_callback(app, ui, rect, frame, sync);
+    polygon_fill_box_overlay(ui, rect, fill_box);
     crate::shelf::drop_target(app, ui, &response, crate::shelf::DropZone::View2d);
 
     // The UV tile outlines (numbered for UDIM sets) and the path being edited

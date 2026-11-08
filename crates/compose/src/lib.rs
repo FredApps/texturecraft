@@ -9,6 +9,8 @@
 
 mod baked_maps;
 pub mod below;
+mod curvature_size_level;
+pub mod curvature_sizes;
 pub mod display;
 pub mod eval;
 pub mod pattern;

@@ -7,11 +7,11 @@ use texturecraft_compose::PaintTarget;
 use texturecraft_core::{Channel, Effect, EffectKind, LayerId, LayerKind, Mask, MaskBackground};
 use texturecraft_geom::glam::Vec2;
 use texturecraft_paint::{
-    CommitSource, EyeDepth, PickCtx, Pickup, PickupMode, RasterCtx, Shape, Staging, Stroke, StrokeCanvas, SurfaceHit, commit_layer, commit_mask,
-    fill_triangles, pick, rasterize,
+    CommitSource, EyeDepth, PickCtx, Pickup, PickupMode, RasterCtx, Shape, Staging, Stroke, StrokeCanvas, SurfaceHit, commit_layer, commit_mask, pick,
+    rasterize,
 };
 
-use crate::session::{ActiveStroke, CloneFrom, FillMode, Session, StackTarget, Tool};
+use crate::session::{ActiveStroke, CloneFrom, Session, StackTarget, Tool};
 use crate::{EngineError, Result};
 
 impl Session {
@@ -301,12 +301,15 @@ impl Session {
         Ok(self.continue_stroke(screen, pressure))
     }
 
-    /// Start a stroke in the 2D view at texture coordinate `uv`.
+    /// Start a stroke in the 2D view at texture coordinate `uv` (polygon fill fills there).
     pub fn begin_stroke_uv(&mut self, uv: Vec2, pressure: f32) -> Result<()> {
         self.cancel_stroke();
-        if matches!(self.tool.tool, Tool::PolygonFill | Tool::ColorPicker | Tool::GeometryMask) {
-            return Err(EngineError::Other("use this tool in the 3D view".into()));
+        match self.tool.tool {
+            Tool::PolygonFill => return self.polygon_fill_uv(uv).map(|_| ()),
+            Tool::ColorPicker | Tool::GeometryMask => return Err(EngineError::Other("use this tool in the 3D view".into())),
+            _ => {}
         }
+
         self.start_stroke(self.viewport, true, Some(uv))?;
         self.continue_stroke_uv(uv, pressure);
         Ok(())
@@ -482,21 +485,6 @@ impl Session {
         Ok(tiles)
     }
 
-    /// Polygon fill: fill the triangle / UV island / whole mesh under `screen`.
-    pub fn polygon_fill(&mut self, screen: Vec2, viewport: Vec2) -> Result<usize> {
-        let hit = self.pick(screen, viewport).ok_or_else(|| EngineError::Other("nothing under the cursor".into()))?;
-        let ts = self.ts();
-        let material = self.doc.project.texture_set(ts)?.material;
-        if hit.material != material {
-            return Err(EngineError::Other("that surface belongs to another texture set".into()));
-        }
-        let tris = self.fill_set(hit.tri, material);
-        let (gbuf, mut canvas) = self.fill_canvas(ts)?;
-        fill_triangles(&mut canvas, &gbuf, &tris);
-        self.commit_fill("Polygon fill", ts, &canvas)?;
-        Ok(tris.len())
-    }
-
     /// The G-buffer of texture set `ts` and an empty canvas for a one-shot fill, limited by the
     /// quick mask unless the fill edits it.
     pub(crate) fn fill_canvas(&self, ts: usize) -> Result<(std::sync::Arc<texturecraft_geom::UvGBuffer>, StrokeCanvas)> {
@@ -510,61 +498,31 @@ impl Session {
 
     /// Commit a one-shot fill with the tool's material (one undo step), or into the quick mask.
     pub(crate) fn commit_fill(&mut self, label: &str, ts: usize, canvas: &StrokeCanvas) -> Result<()> {
-        let size = (canvas.alpha.width(), canvas.alpha.height());
-        let src = |opacity| CommitSource { alpha: &canvas.alpha, tiles: &canvas.dirty, opacity, erase: false, per_texel: None, carried: None };
         if self.quick_mask.editing {
-            self.commit_quick_mask(ts, size, src(self.tool.brush.opacity));
-            return Ok(());
+            return self.paint_fill(ts, canvas);
         }
-        self.edit(label, |s| {
-            let target = s.paint_target()?;
-            let values = s.stroke_values(target);
-            match target {
-                PaintTarget::Layer(id) => commit_layer(&mut s.doc.pixels, id, size, &values, src(s.tool.brush.opacity), &mut Staging::default()),
-                PaintTarget::Mask(eid) => commit_mask(&mut s.doc.pixels, eid, size, s.tool.mask_value, src(s.tool.brush.opacity), &mut Staging::default()),
-            }
-            Ok(())
-        })
+
+        // Each fill is its own step, never merged into a box drag's step of the same label
+        self.edit_merging(label, false, |session| session.paint_fill(ts, canvas))
     }
 
-    /// Triangles filled by the current fill mode starting from `tri`.
-    fn fill_set(&self, tri: u32, material: usize) -> BTreeSet<u32> {
-        let m = &self.mesh;
-        match self.tool.fill_mode {
-            FillMode::Triangle => [tri].into_iter().collect(),
-            FillMode::Mesh => m.triangles_of(material).map(|t| t as u32).collect(),
-            FillMode::UvIsland => {
-                // Triangles sharing an edge in UV space form a UV island: imported meshes often
-                // split vertices along hard edges (or per face) where the UVs run on, so shared
-                // vertex indices alone break an island into its polygons.
-                let corner = |i: usize| m.uvs.get(i).map(|uv| [(uv.x * 1e5).round() as i64, (uv.y * 1e5).round() as i64]);
-                let edges = |t: usize| match m.tri(t).map(|v| v.map(corner)) {
-                    Some([Some(a), Some(b), Some(c)]) => [(a, b), (b, c), (c, a)].map(|(p, q)| (p.min(q), p.max(q))).to_vec(),
-                    _ => Vec::new(),
-                };
-                let mut by_edge: BTreeMap<_, Vec<u32>> = BTreeMap::new();
-                for t in m.triangles_of(material) {
-                    for e in edges(t) {
-                        by_edge.entry(e).or_default().push(t as u32);
-                    }
-                }
-                let mut seen = BTreeSet::new();
-                let mut stack = vec![tri];
-                while let Some(t) = stack.pop() {
-                    if !seen.insert(t) {
-                        continue;
-                    }
-                    for e in edges(t as usize) {
-                        for n in by_edge.get(&e).map(Vec::as_slice).unwrap_or(&[]) {
-                            if !seen.contains(n) {
-                                stack.push(*n);
-                            }
-                        }
-                    }
-                }
-                seen
-            }
+    /// Paint a one-shot fill with the tool's material into the paint target, or into the quick mask while it is edited (no undo step)
+    pub(crate) fn paint_fill(&mut self, ts: usize, canvas: &StrokeCanvas) -> Result<()> {
+        let size = (canvas.alpha.width(), canvas.alpha.height());
+        let opacity = self.tool.brush.opacity;
+        let source = CommitSource { alpha: &canvas.alpha, tiles: &canvas.dirty, opacity, erase: false, per_texel: None, carried: None };
+        if self.quick_mask.editing {
+            self.commit_quick_mask(ts, size, source);
+            return Ok(());
         }
+
+        let target = self.paint_target()?;
+        let values = self.stroke_values(target);
+        match target {
+            PaintTarget::Layer(id) => commit_layer(&mut self.doc.pixels, id, size, &values, source, &mut Staging::default()),
+            PaintTarget::Mask(effect) => commit_mask(&mut self.doc.pixels, effect, size, self.tool.mask_value, source, &mut Staging::default()),
+        }
+        Ok(())
     }
 
     /// Color picker: copy the material under the cursor into the tool's paint values.
@@ -626,35 +584,4 @@ fn with_commit_source<R>(
     let per_texel: Option<texturecraft_paint::TexelFn> = if st.stencil.is_some() { Some(&stencil_fn) } else { None };
     let carried = st.canvas.pickup.as_ref().map(|p| &p.values);
     f(CommitSource { alpha: &st.canvas.alpha, tiles, opacity: st.stroke.settings.opacity, erase: st.erase, per_texel, carried })
-}
-
-#[cfg(test)]
-mod tests {
-    use texturecraft_geom::glam::{Vec2, Vec3};
-    use texturecraft_geom::mesh::Mesh;
-    use texturecraft_geom::primitives;
-
-    use crate::session::{FillMode, Session};
-
-    #[test]
-    fn uv_island_fill_follows_uvs_across_split_vertices() {
-        // Two copies of a plane, each triangle with its own three vertices (as hard edges or
-        // per-face imports leave a mesh), the second copy apart in UV space.
-        let plane = primitives::plane(2.0, 4);
-        let (mut positions, mut uvs) = (Vec::<Vec3>::new(), Vec::<Vec2>::new());
-        for shift in [0.0, 0.5] {
-            for i in plane.indices.iter().map(|i| *i as usize) {
-                positions.push(plane.positions[i] + Vec3::Y * shift);
-                uvs.push(plane.uvs[i] * 0.5 + shift);
-            }
-        }
-        let indices = (0..positions.len() as u32).collect();
-        let mesh = Mesh::from_parts(positions, None, uvs, indices, "m").unwrap();
-        let n = plane.triangle_count();
-        assert_eq!(mesh.vertex_count(), 6 * n, "no vertex is shared");
-        let mut s = Session::new_project("t", mesh, "test", None, 128).unwrap();
-        s.tool.fill_mode = FillMode::UvIsland;
-        assert_eq!(s.fill_set(0, 0).len(), n, "the whole first island");
-        assert_eq!(s.fill_set(n as u32, 0).len(), n, "only the second island");
-    }
 }
