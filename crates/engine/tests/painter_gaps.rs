@@ -408,6 +408,9 @@ fn a_decal_image_fills_a_chosen_channel_or_a_mask() {
     assert!(red(at(&mut s, Channel::BaseColor, 150.0, 200.0)), "a mask decal moves like a decal layer");
     assert!(!red(at(&mut s, Channel::BaseColor, 230.0, 200.0)));
     assert!(execute(&mut s, "layer.decal.set", &json!({"effect": rough.0, "x": 150, "y": 200})).is_err(), "a layer id is not an effect");
+    execute(&mut s, "layer.decal.set", &json!({"effect": effect, "layer": masked.0, "size": 0.4})).expect("an effect with its own layer");
+    let mismatched = json!({"effect": effect, "layer": rough.0, "size": 0.4});
+    assert!(execute(&mut s, "layer.decal.set", &mismatched).is_err(), "an effect with another layer is refused");
 }
 
 /// A decal's new image stays in the channel the decal was placed in, read as gray there

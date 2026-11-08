@@ -9,6 +9,9 @@ use crate::i18n::tr;
 /// What the menu offers besides the texture set's channels: a new fill layer masked by the image
 const MASK_CHOICE: &str = "mask";
 
+/// The most of the window's height the channel list takes before it scrolls
+const MENU_MAX_HEIGHT_SHARE: f32 = 0.6;
+
 /// An image dropped on the 3D view, placed as a decal once the menu at the drop point is picked
 #[derive(Clone)]
 pub struct DecalDrop {
@@ -32,18 +35,33 @@ impl DecalDrop {
 
     /// Open the menu for this drop (replacing any other waiting drop): it stays open while the drop waits
     pub fn open(self, ui: &Ui) {
-        ui.ctx().data_mut(|data| data.insert_temp(Self::menu_id(), self));
+        let frame = ui.ctx().cumulative_frame_nr();
+        ui.ctx().data_mut(|data| data.insert_temp(Self::menu_id(), (self, frame)));
     }
 
     /// Whether a drop waits for its menu pick: the views don't paint meanwhile, so the click that dismisses the menu paints nothing
     pub fn waiting(ctx: &egui::Context) -> bool {
-        ctx.data(|data| data.get_temp::<DecalDrop>(Self::menu_id()).is_some())
+        Self::current(ctx).is_some()
+    }
+
+    /// The waiting drop; one whose menu went undrawn for a frame (the 3D view was hidden) is dropped instead of blocking the views
+    fn current(ctx: &egui::Context) -> Option<DecalDrop> {
+        let frame = ctx.cumulative_frame_nr();
+        let (drop, menu_frame) = ctx.data(|data| data.get_temp::<(DecalDrop, u64)>(Self::menu_id()))?;
+        if frame > menu_frame + 1 {
+            ctx.data_mut(|data| data.remove::<(DecalDrop, u64)>(Self::menu_id()));
+            return None;
+        }
+
+        Some(drop)
     }
 
     /// Show the waiting drop's menu over the 3D view `response`; a pick places the decal, a click elsewhere drops nothing
     pub fn show_menu(app: &mut TextureCraftApp, ui: &Ui, response: &egui::Response) {
         let id = Self::menu_id();
-        let Some(drop) = ui.ctx().data(|data| data.get_temp::<DecalDrop>(id)) else { return };
+        let Some(drop) = Self::current(ui.ctx()) else { return };
+        let frame = ui.ctx().cumulative_frame_nr();
+        ui.ctx().data_mut(|data| data.insert_temp(id, (drop.clone(), frame)));
 
         let channels = app.session.doc.project.texture_set(drop.texture_set).map(|set| set.channel_list()).unwrap_or_default();
         let mut picked = None;
@@ -58,15 +76,20 @@ impl DecalDrop {
                     picked = Some(MASK_CHOICE);
                 }
                 ui.separator();
-                for channel in channels {
-                    if ui.button(tr(channel.label())).clicked() {
-                        picked = Some(channel.id());
+
+                // Many channels scroll instead of running off the window
+                let max_height = ui.ctx().content_rect().height() * MENU_MAX_HEIGHT_SHARE;
+                egui::ScrollArea::vertical().max_height(max_height).show(ui, |ui| {
+                    for channel in channels {
+                        if ui.button(tr(channel.label())).clicked() {
+                            picked = Some(channel.id());
+                        }
                     }
-                }
+                });
             });
 
         if picked.is_some() || shown.is_none_or(|menu| menu.response.should_close()) {
-            ui.ctx().data_mut(|data| data.remove::<DecalDrop>(id));
+            ui.ctx().data_mut(|data| data.remove::<(DecalDrop, u64)>(id));
         }
 
         let Some(channel) = picked else { return };

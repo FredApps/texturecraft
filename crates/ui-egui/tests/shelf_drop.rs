@@ -8,6 +8,7 @@ use texturecraft_engine::core::Channel;
 use texturecraft_engine::geom::glam::Vec2;
 use texturecraft_ui_egui::TextureCraftApp;
 use texturecraft_ui_egui::shelf::{Asset, ShelfDrag};
+use texturecraft_ui_egui::state::ViewLayout;
 
 /// Distance between the view points searched for a set or the background
 const SEARCH_STEP: f32 = 8.0;
@@ -82,14 +83,20 @@ fn a_material_dropped_on_the_background_changes_nothing() {
     assert_eq!(harness.state().session.history_labels().len(), history);
 }
 
-/// The sample app in English with a white image dropped on texture set `position_over` (the background when `None`)
-fn drop_image(position_over: Option<usize>) -> (Harness<'static, TextureCraftApp>, Pos2) {
-    let mut harness = sample_app();
-    harness.state_mut().ui.prefs.language = "en".into();
+/// Import a small white image and return its resource name
+fn import_white_image(harness: &mut Harness<'_, TextureCraftApp>) -> String {
     let mut png = Vec::new();
     image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 255])).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
     let name = harness.state_mut().session.import_resource_bytes("logo.png", png).unwrap();
     harness.run_steps(2);
+    name
+}
+
+/// The sample app in English with a white image dropped on texture set `position_over` (the background when `None`)
+fn drop_image(position_over: Option<usize>) -> (Harness<'static, TextureCraftApp>, Pos2) {
+    let mut harness = sample_app();
+    harness.state_mut().ui.prefs.language = "en".into();
+    let name = import_white_image(&mut harness);
 
     let position = point_over(&harness, position_over);
     drop_asset(&mut harness, Asset::Texture(name), position);
@@ -141,4 +148,54 @@ fn an_image_drop_places_nothing_until_a_pick_and_nothing_on_the_background() {
 
     let (harness, position) = drop_image(None);
     assert!(!menu_open(&harness, position), "the background opens no menu");
+}
+
+#[test]
+fn hiding_the_3d_view_lets_go_of_a_waiting_image_drop() {
+    let (mut harness, position) = drop_image(Some(1));
+    assert!(menu_open(&harness, position));
+
+    // Only the 3D view shows the menu, so a 2D-only layout would otherwise leave the views blocked
+    harness.state_mut().ui.layout = ViewLayout::Only2D;
+    harness.run_steps(3);
+    harness.state_mut().ui.layout = ViewLayout::Split;
+    harness.run_steps(3);
+
+    assert!(!menu_open(&harness, position), "the drop lapsed while its menu was hidden");
+}
+
+#[test]
+fn the_click_that_closes_the_drop_menu_does_not_move_a_decal_being_placed() {
+    let (mut harness, position) = drop_image(Some(1));
+    let distance = |node: &egui_kittest::Node<'_>| node.rect().center().distance(position);
+    harness.get_all_by_label("Roughness").min_by(|a, b| distance(a).total_cmp(&distance(b))).unwrap().click();
+    harness.run_steps(2);
+    let decal_layer = harness.state().session.selected_layer().unwrap();
+    harness.state_mut().placing_decal = Some(decal_layer);
+
+    let image = import_white_image(&mut harness);
+    drop_asset(&mut harness, Asset::Texture(image), position);
+    harness.run_steps(2);
+    assert!(menu_open(&harness, position));
+    let history = harness.state().session.history_labels().len();
+
+    // A point on the same set, away from the menu
+    let rect = harness.state().viewport_rect;
+    let elsewhere = (1..(rect.width() / SEARCH_STEP) as usize)
+        .map(|step| Pos2::new(rect.max.x - step as f32 * SEARCH_STEP, position.y))
+        .find(|point| {
+            let app = harness.state();
+            let local = *point - rect.min;
+            point.distance(position) > MENU_REACH * 2.0 && app.session.texture_set_at(Vec2::new(local.x, local.y), app.session.viewport) == Some(1)
+        })
+        .unwrap();
+    harness.hover_at(elsewhere);
+    harness.run_steps(1);
+    harness.event(Event::PointerButton { pos: elsewhere, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+    harness.run_steps(1);
+    harness.event(Event::PointerButton { pos: elsewhere, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+    harness.run_steps(2);
+
+    assert!(!menu_open(&harness, position));
+    assert_eq!(harness.state().session.history_labels().len(), history, "the decal wasn't moved");
 }
