@@ -1,7 +1,7 @@
 //! Each brush section header has a reset icon that puts only that section's settings back to their defaults
 
 use egui_kittest::Harness;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use texturecraft_engine::paint::{Alignment, BrushSettings, Particles, Symmetry};
 use texturecraft_ui_egui::TextureCraftApp;
 
@@ -16,6 +16,27 @@ const SETTLE_FRAMES: usize = 3;
 
 /// Puts one section's fields of the first brush back to the second's values
 type SectionReset = fn(&mut BrushSettings, &BrushSettings);
+
+/// Each brush section's title, a label shown only while it is open, whether it starts open, and its reset
+const SECTIONS: [(&str, &str, bool, SectionReset); 7] = [
+    ("Size", "Minimum size (%)", true, |brush, defaults| {
+        (brush.size, brush.min_size, brush.screen_space) = (defaults.size, defaults.min_size, defaults.screen_space)
+    }),
+    ("Flow and opacity", "Stroke opacity", true, |brush, defaults| {
+        (brush.flow, brush.opacity, brush.spacing, brush.hardness) = (defaults.flow, defaults.opacity, defaults.spacing, defaults.hardness)
+    }),
+    ("Angle", "Follow path", false, |brush, defaults| (brush.angle, brush.follow_path) = (defaults.angle, defaults.follow_path)),
+    ("Jitters", "Size jitter", false, |brush, defaults| {
+        (brush.jitter_size, brush.jitter_angle, brush.jitter_flow, brush.jitter_position) =
+            (defaults.jitter_size, defaults.jitter_angle, defaults.jitter_flow, defaults.jitter_position)
+    }),
+    ("Alignment and culling", "Backface culling", false, |brush, defaults| {
+        (brush.alignment, brush.backface_culling, brush.angle_fade, brush.depth) =
+            (defaults.alignment, defaults.backface_culling, defaults.angle_fade, defaults.depth)
+    }),
+    ("Particles", "Gravity", false, |brush, defaults| brush.particles = defaults.particles),
+    ("Lazy mouse and symmetry", "Lazy mouse distance", false, |brush, defaults| (brush.lazy, brush.symmetry) = (defaults.lazy, defaults.symmetry)),
+];
 
 /// A brush that differs from the defaults in every field a section shows, within the valid ranges
 fn changed_brush() -> BrushSettings {
@@ -74,26 +95,10 @@ fn click_reset(harness: &mut Harness<'_, TextureCraftApp>, title: &str) {
 #[test]
 fn each_reset_puts_back_only_its_own_section() {
     let defaults = BrushSettings::default();
-    let sections: [(&str, SectionReset); 7] = [
-        ("Size", |brush, defaults| (brush.size, brush.min_size, brush.screen_space) = (defaults.size, defaults.min_size, defaults.screen_space)),
-        ("Flow and opacity", |brush, defaults| {
-            (brush.flow, brush.opacity, brush.spacing, brush.hardness) = (defaults.flow, defaults.opacity, defaults.spacing, defaults.hardness)
-        }),
-        ("Angle", |brush, defaults| (brush.angle, brush.follow_path) = (defaults.angle, defaults.follow_path)),
-        ("Jitters", |brush, defaults| {
-            (brush.jitter_size, brush.jitter_angle, brush.jitter_flow, brush.jitter_position) =
-                (defaults.jitter_size, defaults.jitter_angle, defaults.jitter_flow, defaults.jitter_position)
-        }),
-        ("Alignment and culling", |brush, defaults| {
-            (brush.alignment, brush.backface_culling, brush.angle_fade, brush.depth) =
-                (defaults.alignment, defaults.backface_culling, defaults.angle_fade, defaults.depth)
-        }),
-        ("Particles", |brush, defaults| brush.particles = defaults.particles),
-        ("Lazy mouse and symmetry", |brush, defaults| (brush.lazy, brush.symmetry) = (defaults.lazy, defaults.symmetry)),
-    ];
 
-    for (title, reset_section) in sections {
+    for (title, _, _, reset_section) in SECTIONS {
         let mut harness = app_with_brush(changed_brush());
+        assert!(!reset_icon(&harness, title).accesskit_node().is_disabled(), "the {title} reset is enabled once its section changed");
         click_reset(&mut harness, title);
 
         let mut expected = changed_brush();
@@ -102,22 +107,57 @@ fn each_reset_puts_back_only_its_own_section() {
     }
 }
 
-#[test]
-fn clicking_the_reset_icon_does_not_fold_or_unfold_the_section() {
-    let mut harness = app_with_brush(changed_brush());
+/// Scrolls the header titled `title` into view and clicks the header itself, folding or unfolding it
+fn click_header(harness: &mut Harness<'_, TextureCraftApp>, title: &str) {
+    reset_icon(harness, title).scroll_to_me();
+    harness.run_steps(SETTLE_FRAMES);
 
-    click_reset(&mut harness, "Size");
-    assert!(harness.query_by_label("Minimum size (%)").is_some(), "Size starts open and stays open");
-
-    click_reset(&mut harness, "Jitters");
-    assert!(harness.query_by_label("Size jitter").is_none(), "Jitters starts closed and stays closed");
+    let icon = reset_icon(harness, title).rect();
+    harness.query_all_by_label(title).find(|label| label.rect().y_range().intersects(icon.y_range())).unwrap_or_else(|| panic!("no {title} header")).click();
+    harness.run_steps(SETTLE_FRAMES);
 }
 
 #[test]
-fn at_the_defaults_the_reset_icon_does_nothing() {
+fn clicking_the_reset_icon_does_not_fold_or_unfold_the_section() {
+    for flip_first in [false, true] {
+        let mut harness = app_with_brush(changed_brush());
+        if flip_first {
+            for (title, _, _, _) in SECTIONS {
+                click_header(&mut harness, title);
+            }
+        }
+
+        for (title, body_label, starts_open, _) in SECTIONS {
+            let open = starts_open != flip_first;
+            click_reset(&mut harness, title);
+            assert_eq!(harness.query_by_label(body_label).is_some(), open, "{title} stays {}", if open { "open" } else { "closed" });
+        }
+    }
+}
+
+#[test]
+fn at_the_defaults_the_reset_icons_are_inert() {
     let mut harness = app_with_brush(BrushSettings::default());
 
-    click_reset(&mut harness, "Size");
-    assert_eq!(harness.state().session.tool.brush, BrushSettings::default());
-    assert!(harness.query_by_label("Minimum size (%)").is_some(), "the click doesn't reach the header");
+    for (title, body_label, starts_open, _) in SECTIONS {
+        assert!(reset_icon(&harness, title).accesskit_node().is_disabled(), "the {title} reset is disabled at the defaults");
+
+        click_reset(&mut harness, title);
+        assert_eq!(harness.query_by_label(body_label).is_some(), starts_open, "the click doesn't reach the {title} header");
+    }
+}
+
+#[test]
+fn enter_on_the_focused_reset_icon_resets() {
+    let mut harness = app_with_brush(changed_brush());
+
+    reset_icon(&harness, "Size").focus();
+    harness.run_steps(SETTLE_FRAMES);
+    assert!(reset_icon(&harness, "Size").is_focused());
+
+    harness.key_press(egui::Key::Enter);
+    harness.run_steps(SETTLE_FRAMES);
+
+    let (brush, defaults) = (&harness.state().session.tool.brush, BrushSettings::default());
+    assert_eq!((brush.size, brush.min_size, brush.screen_space), (defaults.size, defaults.min_size, defaults.screen_space));
 }

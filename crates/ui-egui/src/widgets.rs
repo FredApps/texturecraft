@@ -276,6 +276,12 @@ const SECTION_RESET_ICON_SIZE: f32 = 14.0;
 /// How much of `text_dim` the reset icon keeps while its section is at its defaults
 const SECTION_RESET_AT_DEFAULT_OPACITY: f32 = 0.4;
 
+/// Gap between the reset icon's glyph and its keyboard focus outline
+const SECTION_RESET_FOCUS_MARGIN: f32 = 2.0;
+
+/// Corner radius of the reset icon's keyboard focus outline
+const SECTION_RESET_FOCUS_CORNER_RADIUS: u8 = 3;
+
 /// The header row and body of [`section`]; `reset_at_default` adds the reset icon
 fn collapsible_section(ui: &mut Ui, id: &str, title: &str, default_open: bool, reset_at_default: Option<bool>, body: impl FnOnce(&mut Ui)) -> bool {
     let tokens = Tokens::get(ui.ctx());
@@ -298,18 +304,28 @@ fn collapsible_section(ui: &mut Ui, id: &str, title: &str, default_open: bool, r
     // Registered after the header so the icon, not the header, takes its clicks
     let mut reset_clicked = false;
     if let (Some(at_default), Some(rect)) = (reset_at_default, reset_rect) {
-        let response = ui.interact(rect, id.with("reset"), Sense::click()).on_hover_text(tr("Reset to defaults"));
+        // At the defaults the icon is inert, so Tab skips it
+        let sense = if at_default { Sense::CLICK } else { Sense::click() };
+        let response = ui.interact(rect, id.with("reset"), sense).on_hover_text(tr("Reset to defaults"));
         response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, !at_default, tr("Reset to defaults")));
 
+        let focused = response.has_focus();
         let color = if at_default {
             tokens.text_dim.gamma_multiply(SECTION_RESET_AT_DEFAULT_OPACITY)
-        } else if response.hovered() {
+        } else if response.hovered() || focused {
             tokens.text_strong
         } else {
             tokens.text_dim
         };
         let font = egui::FontId::proportional(SECTION_RESET_ICON_SIZE);
         ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, egui_phosphor::regular::CLOCK_COUNTER_CLOCKWISE, font, color);
+
+        // Enter or Space on the focused icon resets, so keyboard focus needs an outline
+        if focused {
+            let outline = rect.expand(SECTION_RESET_FOCUS_MARGIN);
+            ui.painter().rect_stroke(outline, CornerRadius::same(SECTION_RESET_FOCUS_CORNER_RADIUS), ui.visuals().selection.stroke, egui::StrokeKind::Outside);
+        }
+
         reset_clicked = response.clicked() && !at_default;
     }
 
