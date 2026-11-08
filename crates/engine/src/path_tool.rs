@@ -452,12 +452,12 @@ impl Session {
         })
     }
 
-    /// Fill the inside of `poly`: viewport pixels over the visible surface, or texture
-    /// coordinates. Returns the touched tiles.
+    /// Fill the inside of `poly` (viewport pixels over the visible surface, or texture coordinates); returns the touched tiles
     fn lasso_fill(&mut self, poly: Vec<Vec2>, uv: bool, viewport: Vec2) -> Result<usize> {
         let ts = self.ts();
         let (gbuf, mut canvas) = self.fill_canvas(ts)?;
         let w = gbuf.width.max(1);
+
         if uv {
             let lasso = Lasso::new(poly.iter().map(|p| *p * Vec2::new(w as f32, gbuf.height as f32)).collect());
             fill_coverage(&mut canvas, &gbuf, |i, _| lasso.coverage(Vec2::new((i as u32 % w) as f32 + 0.5, (i as u32 / w) as f32 + 0.5)));
@@ -469,15 +469,16 @@ impl Session {
 
             // A visible source inside the lasso can paint each symmetry copy
             let (lo, hi) = mesh.bounds();
-            let center = (lo + hi) * 0.5;
-            let inverses: Vec<_> = self.tool.brush.sanitized().symmetry.transforms().iter().map(|m| m.inverse()).collect();
+            let symmetry = self.tool.brush.sanitized().symmetry;
+            let symmetry_origin = symmetry.origin((lo + hi) * 0.5);
+            let inverses: Vec<_> = symmetry.transforms().iter().map(|m| m.inverse()).collect();
 
             fill_coverage(&mut canvas, &gbuf, |i, _| {
                 let Some(s) = gbuf.surface(mesh, i) else { return 0.0 };
                 let mut best = 0.0f32;
 
                 for m in &inverses {
-                    let pos = center + *m * (s.pos - center);
+                    let pos = symmetry_origin + *m * (s.pos - symmetry_origin);
                     let c = view_proj * pos.extend(1.0);
                     if c.w <= MIN_PROJECTIVE_W {
                         continue;

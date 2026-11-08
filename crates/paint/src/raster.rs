@@ -82,6 +82,29 @@ impl StrokeCanvas {
     }
 }
 
+/// Most a texel's eye distance may exceed the nearest surface in its 3×3 pixel neighbourhood, in pixels along the surface
+const NEIGHBOUR_REACH: f32 = 1.5;
+
+/// Facing (cosine) below which the allowance stops growing
+const MIN_FACING: f32 = 0.05;
+
+/// Height of the view in normalized device coordinates (−1 to 1)
+const NDC_HEIGHT: f32 = 2.0;
+
+/// How far toward the eye to test a texel turned `facing` away: at grazing angles the neighbouring pixels of the same surface are much nearer, and the depth test would speckle
+fn grazing_allowance(depth: &EyeDepth, point: Vec3, facing: f32) -> f32 {
+    // Back faces get none, so painting with culling off doesn't reach through thin parts
+    if facing <= 0.0 {
+        return 0.0;
+    }
+
+    let clip_w = (depth.view_proj * point.extend(1.0)).w.max(0.0);
+    let ndc_per_unit = depth.view_proj.row(1).truncate().length();
+    let world_per_pixel = clip_w * NDC_HEIGHT / (depth.height as f32 * ndc_per_unit).max(f32::EPSILON);
+    let facing = facing.clamp(MIN_FACING, 1.0);
+    world_per_pixel * NEIGHBOUR_REACH * (1.0 - facing * facing).sqrt() / facing
+}
+
 /// What the rasterizer reads.
 pub struct RasterCtx<'a> {
     pub mesh: &'a Mesh,
@@ -148,7 +171,7 @@ fn scan_triangle(ctx: &RasterCtx, s: &Stamp, t: u32, w: u32, h: u32, fade_lo: f3
     let x1 = ((ua.x.max(ub.x).max(uc.x) * w as f32).ceil().max(0.0) as u32).min(w);
     let y0 = (ua.y.min(ub.y).min(uc.y) * h as f32).floor().max(0.0) as u32;
     let y1 = ((ua.y.max(ub.y).max(uc.y) * h as f32).ceil().max(0.0) as u32).min(h);
-    // Stamp radius in texels on this triangle: texel area over world area.
+    // Stamp radius in texels on this triangle: texel area over world area
     let uv_area = (*ub - *ua).perp_dot(*uc - *ua).abs() * w as f32 * h as f32;
     let world_area = (*pb - *pa).cross(*pc - *pa).length();
     let shape = ctx.shape.at_radius(s.radius * (uv_area / world_area).sqrt());
@@ -177,22 +200,24 @@ fn scan_triangle(ctx: &RasterCtx, s: &Stamp, t: u32, w: u32, h: u32, fade_lo: f3
                 center = ([x as f32 + 0.5, y as f32 + 0.5], dist);
             }
             let n = (*na * b0 + *nb * b1 + *nc * b2).try_normalize().unwrap_or(s.normal);
-            let to_eye = (ctx.eye - p).try_normalize().unwrap_or(n);
-            let facing = n.dot(to_eye);
-            // Symmetry copies paint where the camera may not see (the back of the model).
-            let culled = ctx.backface_culling && !s.copy;
-            if culled && facing <= 0.0 {
-                continue;
-            }
             if n.dot(s.normal) <= 0.0 {
                 continue;
             }
-            if let Some(depth) = ctx.depth.filter(|_| !s.copy)
-                && !depth.visible(p)
+
+            // A copy runs the camera checks at its source's point, up to the stamp's half-depth off the surface on an asymmetric mesh
+            let (seen, seen_normal) = s.source.map_or((p, n), |source| (source.point(p), source.direction(n)));
+            let off_surface = if s.source.is_some() { s.radius * s.depth } else { 0.0 };
+            let to_eye = (ctx.eye - seen).try_normalize().unwrap_or(seen_normal);
+            let facing = seen_normal.dot(to_eye);
+            if ctx.backface_culling && facing <= 0.0 {
+                continue;
+            }
+            if let Some(depth) = ctx.depth
+                && !depth.visible(seen + to_eye * (grazing_allowance(depth, seen, facing) + off_surface))
             {
                 continue;
             }
-            let fade = if culled { smoothstep(fade_lo, fade_hi, facing) } else { 1.0 };
+            let fade = if ctx.backface_culling { smoothstep(fade_lo, fade_hi, facing) } else { 1.0 };
             let a = shape.sample(lx, ly, s.hardness, s.seed) * s.flow * fade;
             if a > 0.0 {
                 texels.push((x, y, a));
@@ -257,7 +282,7 @@ mod tests {
             hardness: 0.9,
             depth: 1.0,
             seed: 0,
-            copy: false,
+            source: None,
         };
         rasterize(&mut canvas, &ctx, &[st]);
         // Plane is 2 units over 128 texels: radius 0.25 = 16 texels around the center (64, 64).

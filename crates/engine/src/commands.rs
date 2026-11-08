@@ -4,6 +4,7 @@
 
 use serde_json::{Value, json};
 use texturecraft_core::{BlendMode, Channel, NormalFormat};
+use texturecraft_geom::glam::Vec3;
 
 use crate::{EngineError, Result, Session};
 
@@ -130,6 +131,16 @@ pub(crate) fn f32p(p: &Value, key: &str) -> Option<f32> {
 
 pub(crate) fn u64p(p: &Value, key: &str) -> Option<u64> {
     p.get(key).and_then(|v| v.as_u64().or_else(|| v.as_f64().filter(|f| f.is_finite() && *f >= 0.0).map(|f| f.round() as u64)))
+}
+
+/// A `[x, y, z]` param of finite numbers
+pub(crate) fn vec3(p: &Value, key: &str) -> Option<Vec3> {
+    let items = p.get(key)?.as_array()?;
+    let numbers: Vec<f32> = items.iter().filter_map(Value::as_f64).map(|number| number as f32).filter(|number| number.is_finite()).collect();
+    match numbers.as_slice() {
+        [x, y, z] => Some(Vec3::new(*x, *y, *z)),
+        _ => None,
+    }
 }
 
 pub(crate) fn boolp(p: &Value, key: &str) -> Option<bool> {
