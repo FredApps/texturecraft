@@ -462,7 +462,10 @@ impl eframe::App for TextureCraftApp {
             ctx.set_zoom_factor(scale);
         }
         #[cfg(not(target_arch = "wasm32"))]
-        self.autosave(now);
+        {
+            texturecraft_engine::formats::set_save_resources(self.ui.prefs.reserved_cores as usize, self.ui.prefs.save_ram_percent);
+            self.autosave(now);
+        }
         i18n::set_language(&self.ui.prefs.language);
         #[cfg(target_arch = "wasm32")]
         {

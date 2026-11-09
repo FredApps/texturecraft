@@ -1041,4 +1041,10 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Value Bounds Max", "الحد الأقصى للقيمة"),
     ("Value Bounds Min", "الحد الأدنى للقيمة"),
     ("Vertex Color", "لون الرأس"),
+    ("Cores kept for the UI", "أنوية محجوزة للواجهة"),
+    ("Max RAM while saving", "أقصى ذاكرة عند الحفظ"),
+    (
+        "Saving uses the other cores and at most this share of the free RAM. At least one core always works.",
+        "يستخدم الحفظ الأنوية الأخرى وحدًا أقصى بهذه النسبة من الذاكرة الحرة. يعمل نواة واحدة على الأقل دائمًا.",
+    ),
 ];

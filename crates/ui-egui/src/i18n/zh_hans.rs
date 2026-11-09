@@ -1000,4 +1000,10 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Value Bounds Max", "值上限"),
     ("Value Bounds Min", "值下限"),
     ("Vertex Color", "顶点颜色"),
+    ("Cores kept for the UI", "为界面保留的核心数"),
+    ("Max RAM while saving", "保存时的最大内存"),
+    (
+        "Saving uses the other cores and at most this share of the free RAM. At least one core always works.",
+        "保存使用其余核心,并最多占用这一比例的可用内存。至少始终有一个核心工作。",
+    ),
 ];

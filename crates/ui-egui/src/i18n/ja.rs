@@ -1069,4 +1069,10 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Value Bounds Max", "値の上限"),
     ("Value Bounds Min", "値の下限"),
     ("Vertex Color", "頂点カラー"),
+    ("Cores kept for the UI", "UI用に確保するコア数"),
+    ("Max RAM while saving", "保存時のRAM上限"),
+    (
+        "Saving uses the other cores and at most this share of the free RAM. At least one core always works.",
+        "保存は残りのコアと、空きRAMのこの割合までを使います。少なくとも1コアは常に動作します。",
+    ),
 ];

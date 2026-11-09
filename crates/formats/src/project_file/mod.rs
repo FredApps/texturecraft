@@ -32,6 +32,8 @@ use self::entries::Entry;
 use crate::{FormatError, MAX_IMAGE_SIZE, Result, malformed};
 
 mod entries;
+#[cfg(not(target_arch = "wasm32"))]
+pub use entries::{DEFAULT_RAM_PERCENT, DEFAULT_RESERVED_CORES, set_save_resources};
 
 const KIND: &str = "project file";
 const MAGIC: &[u8; 4] = b"TCTX";

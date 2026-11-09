@@ -118,6 +118,11 @@ pub struct Prefs {
     /// Where autosaves, smart materials, presets, templates and layouts go (desktop; read at
     /// startup). Empty or relative: `Documents/TextureCraft`.
     pub data_folder: String,
+    /// Cores a project save leaves to the UI; it compresses on the others (desktop). Any number:
+    /// at least one worker always runs.
+    pub reserved_cores: u32,
+    /// Percent of the free RAM a project save may hold at once (desktop; 1 to 100).
+    pub save_ram_percent: u8,
 }
 
 impl Default for Prefs {
@@ -132,6 +137,8 @@ impl Default for Prefs {
             system_title_bar: false,
             start_window: true,
             data_folder: String::new(),
+            reserved_cores: 1,
+            save_ram_percent: 50,
         }
     }
 }

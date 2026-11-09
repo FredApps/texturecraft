@@ -572,7 +572,14 @@ fn settings(app: &mut TextureCraftApp, ctx: &egui::Context) {
                 ui.label(tr("Autosave every"));
                 ui.add(egui::DragValue::new(&mut p.autosave_minutes).range(0..=120).suffix(format!(" {}", tr("min"))));
                 ui.end_row();
+                ui.label(tr("Cores kept for the UI"));
+                ui.add(egui::DragValue::new(&mut p.reserved_cores).range(0..=1024));
+                ui.end_row();
+                ui.label(tr("Max RAM while saving"));
+                ui.add(egui::DragValue::new(&mut p.save_ram_percent).range(1..=100).suffix(" %"));
+                ui.end_row();
             });
+            ui.label(RichText::new(tr("Saving uses the other cores and at most this share of the free RAM. At least one core always works.")).small().color(tk.text_dim));
             ui.label(
                 RichText::new(trf("0 turns autosave off. Copies go to {folder}", &[("folder", &crate::user_dir("autosave").display())]))
                     .small()

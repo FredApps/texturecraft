@@ -8,8 +8,8 @@
 //! therefore the same as in a serial save.
 //!
 //! Memory stays bounded: a worker only starts an entry while the entries started but not yet written
-//! have an estimated compressed size under [`IN_FLIGHT_BUDGET`] (a single entry larger than that runs
-//! alone), and entry bodies stream into the compressor instead of building a raw copy first.
+//! have an estimated compressed size under the RAM share the user allows (a single entry larger than
+//! that runs alone), and entry bodies stream into the compressor instead of building a raw copy first.
 
 use std::io::{Seek, Write};
 
@@ -31,22 +31,67 @@ pub(super) struct Entry<'a> {
     pub body: Body<'a>,
 }
 
-/// Compressed bytes (estimated) that may be held in memory at once while entries are in flight.
+/// How much of the machine a save may use. Native targets only; the browser saves on one thread.
 #[cfg(not(target_arch = "wasm32"))]
-const IN_FLIGHT_BUDGET: u64 = 3 << 30;
-/// More workers than this do not help: a project has a handful of large entries.
+mod limits {
+    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+
+    /// Cores a save leaves to the UI (an autosave runs while the user keeps painting).
+    static RESERVED_CORES: AtomicUsize = AtomicUsize::new(DEFAULT_RESERVED_CORES);
+    /// Share of the available RAM, in percent, that entries in flight may hold.
+    static RAM_PERCENT: AtomicU8 = AtomicU8::new(DEFAULT_RAM_PERCENT);
+
+    pub const DEFAULT_RESERVED_CORES: usize = 1;
+    pub const DEFAULT_RAM_PERCENT: u8 = 50;
+
+    pub fn set(reserved_cores: usize, ram_percent: u8) {
+        RESERVED_CORES.store(reserved_cores, Ordering::Relaxed);
+        RAM_PERCENT.store(ram_percent.clamp(1, 100), Ordering::Relaxed);
+    }
+
+    pub fn get() -> (usize, u8) {
+        (RESERVED_CORES.load(Ordering::Relaxed), RAM_PERCENT.load(Ordering::Relaxed))
+    }
+
+    /// RAM the system can give out now, in bytes (the total when the system does not say it; 8 GiB
+    /// when the system tells nothing).
+    pub fn available_ram() -> u64 {
+        let Ok(mut sys) = sysinfo::System::new() else { return 8 << 30 };
+        sys.refresh_memory();
+        match sys.available_memory() {
+            0 => sys.total_memory(),
+            n => n,
+        }
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
-const MAX_WORKERS: usize = 8;
+pub use limits::{DEFAULT_RAM_PERCENT, DEFAULT_RESERVED_CORES};
+
+/// Set what saves may use: cores left to the UI (any number; at least one worker always runs) and
+/// the percentage (1 to 100) of the available RAM that entries in flight may hold.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_save_resources(reserved_cores: usize, ram_percent: u8) {
+    limits::set(reserved_cores, ram_percent);
+}
+
+/// Worker threads and in-flight byte budget for a save of `entries` entries.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn plan(cpus: usize, reserved_cores: usize, entries: usize, available_ram: u64, ram_percent: u8) -> (usize, u64) {
+    let workers = cpus.saturating_sub(reserved_cores).max(1).min(entries);
+    let budget = u64::try_from(u128::from(available_ram) * u128::from(ram_percent.clamp(1, 100)) / 100).unwrap_or(u64::MAX);
+    (workers, budget)
+}
 
 /// Write `entries` in order: in parallel where threads exist, else one after the other.
 pub(super) fn write_entries<W: Write + Seek>(zip: &mut ZipWriter<W>, entries: Vec<Entry<'_>>) -> Result<()> {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        // Leave one core to the UI: an autosave runs while the user keeps painting.
         let cpus = std::thread::available_parallelism().map_or(1, usize::from);
-        let workers = cpus.saturating_sub(1).clamp(1, MAX_WORKERS).min(entries.len());
+        let (reserved, percent) = limits::get();
+        let (workers, budget) = plan(cpus, reserved, entries.len(), limits::available_ram(), percent);
         if workers > 1 {
-            return parallel::write(zip, entries, workers, IN_FLIGHT_BUDGET);
+            return parallel::write(zip, entries, workers, budget);
         }
     }
     write_serial(zip, entries)

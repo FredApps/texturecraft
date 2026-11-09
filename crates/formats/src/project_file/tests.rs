@@ -260,6 +260,44 @@ fn parallel_bytes(pf: &ProjectFile, workers: usize, budget: u64) -> Vec<u8> {
 
 #[test]
 #[cfg(not(target_arch = "wasm32"))]
+fn save_plan_follows_the_reserved_cores_and_the_ram_share() {
+    // No cap of 8 workers any more, only the entry count and the cores.
+    assert_eq!(entries::plan(64, 1, 100, 1000, 50), (63, 500));
+    assert_eq!(entries::plan(64, 1, 20, 1000, 50).0, 20);
+    // 0 reserved uses every core; more reserved than cores still leaves one worker.
+    assert_eq!(entries::plan(16, 0, 100, 1000, 100), (16, 1000));
+    assert_eq!(entries::plan(4, 9, 100, 1000, 100).0, 1);
+    assert_eq!(entries::plan(1, 0, 100, 1000, 100).0, 1);
+    // The share is of the RAM given, clamped to 1..=100 percent, and never overflows.
+    assert_eq!(entries::plan(2, 1, 5, 1000, 0).1, 10);
+    assert_eq!(entries::plan(2, 1, 5, 1000, 250).1, 1000);
+    assert_eq!(entries::plan(2, 1, 5, u64::MAX, 100).1, u64::MAX);
+    assert_eq!(entries::plan(2, 1, 5, u64::MAX, 50).1, u64::MAX / 2);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn parallel_save_with_any_reserved_cores_and_ram_share_matches_serial() {
+    let pf = big_sample();
+    let want = payloads(&serial_bytes(&pf));
+    let n = want.len();
+    // (cpus, reserved cores, available RAM, percent): none reserved, all reserved, a tiny and a huge share.
+    for (cpus, reserved, ram, percent) in [(8, 0, 1u64 << 40, 100u8), (8, 1, 1 << 40, 50), (8, 99, 1 << 40, 50), (16, 0, 1000, 1), (6, 1, u64::MAX, 100)] {
+        let (workers, budget) = entries::plan(cpus, reserved, n, ram, percent);
+        let got = parallel_bytes(&pf, workers, budget);
+        assert!(payloads(&got) == want, "{cpus} cpus, {reserved} reserved, {ram} bytes at {percent}%");
+        assert_same(&pf, &load_project_bytes(&got).unwrap());
+    }
+    // The setting is read by the public save; extreme values still save the same entries.
+    for (reserved, percent) in [(0, 100), (1000, 1), (1, 50)] {
+        set_save_resources(reserved, percent);
+        assert!(payloads(&save_project_bytes(&pf).unwrap()) == want, "{reserved} reserved, {percent}%");
+    }
+    set_save_resources(DEFAULT_RESERVED_CORES, DEFAULT_RAM_PERCENT);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
 fn parallel_save_writes_the_same_entries_as_serial() {
     let pf = big_sample();
     let serial = serial_bytes(&pf);
