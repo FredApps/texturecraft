@@ -4,17 +4,20 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use rayon::prelude::*;
 use texturecraft_core::{
-    BakedMap, BlendMode, BlockScales, Channel, ChannelKind, CompareOp, Effect, EffectKind, Fill, Filter, Generator, GeneratorKind, HeightMask, Layer, LayerId,
-    LayerKind, Mask, MaskBackground, NormalFormat, Project, Projection, Source, TextureSet, TileGrid, blend1, blend3, lum, mix3, per_unit,
+    BakedMap, BlendMode, BlockScales, Channel, ChannelKind, CompareOp, CurvatureDetail, CurvatureMode, Effect, EffectKind, Fill, Filter, Generator,
+    GeneratorKind, HeightMask, Layer, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, Project, Projection, Source, TextureSet, TileGrid, blend1,
+    blend3, lum, mix3, per_unit,
 };
 use texturecraft_geom::glam::{Vec2, Vec3};
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer};
 use texturecraft_texel::{DilationMap, TILE, TILE_AREA, TileImage, from_u16, noise, to_u16, to_u16_signed};
 
 use crate::below::{Band, BelowCache, Level};
+use crate::curvature_sizes::CurvatureSizes;
 use crate::pattern::{Coords, decal_uv, image_samples, procedural, world_noise};
 use crate::store::{BakedMaps, ImageStore, PixelStore, decode};
 
@@ -93,6 +96,7 @@ pub struct Inputs<'a> {
     pub gbuf: &'a UvGBuffer,
     pub pixels: &'a PixelStore,
     pub baked: &'a BakedMaps,
+    pub block_scales: BlockScales,
     pub preview: Option<&'a StrokePreview>,
     /// Imported image resources (fill sources).
     pub images: &'a ImageStore,
@@ -203,6 +207,8 @@ struct EffectPlan<'a> {
     opacity: f32,
     data: Option<Cow<'a, [u16]>>,
     preview: bool,
+    /// The curvature detail sizes a generator with detail reads.
+    curvature_sizes: Option<Arc<CurvatureSizes>>,
 }
 
 struct MaskPlan<'a> {
@@ -265,36 +271,35 @@ enum Op {
     Slope { scale: f32, seed: u32 },
 }
 
-/// Index (among visible effects) of the last neighbourhood filter of an effect stack, its
-/// radius in texels (`res` texels per UV tile across) and what it does.
+/// The last neighbourhood filter of an effect stack (see [`neighbourhood_filters`]).
 fn neighbourhood(effects: &[Effect], res: u32) -> Option<(usize, f32, Op)> {
-    let texels = |v: f32| (v * res as f32 / 2048.0).max(0.5);
-    effects
-        .iter()
-        .filter(|e| e.visible)
-        .enumerate()
-        .filter_map(|(i, e)| match &e.kind {
-            EffectKind::Filter(Filter::Blur { radius }) if *radius > 0.0 => Some((i, texels(*radius), Op::Blur(None))),
-            EffectKind::Filter(Filter::Sharpen { amount }) => Some((i, (1.5 * res as f32 / 2048.0).max(0.75), Op::Blur(Some(*amount)))),
-            EffectKind::Filter(Filter::DirectionalBlur { radius, angle }) if *radius > 0.0 => Some((i, texels(*radius), Op::Line(direction(*angle)))),
-            EffectKind::Filter(Filter::Warp { intensity, scale, seed }) if *intensity > 0.0 => {
-                Some((i, texels(*intensity), Op::Warp { scale: *scale, seed: *seed, dir: None }))
-            }
-            EffectKind::Filter(Filter::DirectionalWarp { intensity, angle, scale, seed }) if *intensity > 0.0 => {
-                Some((i, texels(*intensity), Op::Warp { scale: *scale, seed: *seed, dir: Some(direction(*angle)) }))
-            }
-            EffectKind::Filter(Filter::HighPass { radius }) => Some((i, texels(*radius), Op::HighPass)),
-            EffectKind::Filter(Filter::EdgeDetect { width }) => Some((i, texels(*width), Op::Edge)),
-            // Three box passes ramp an edge over about twice their radius.
-            EffectKind::Filter(Filter::Bevel { width }) => Some((i, texels(*width * 0.5), Op::Bevel)),
-            EffectKind::Filter(Filter::Glow { radius, amount }) => Some((i, texels(*radius), Op::Glow(*amount))),
-            EffectKind::Filter(Filter::Mosaic { size }) => Some((i, texels(*size), Op::Mosaic)),
-            EffectKind::Filter(Filter::SlopeBlur { radius, scale, seed }) if *radius > 0.0 => {
-                Some((i, texels(*radius), Op::Slope { scale: *scale, seed: *seed }))
-            }
-            _ => None,
-        })
-        .last()
+    neighbourhood_filters(effects, res).last()
+}
+
+/// The neighbourhood filters of an effect stack, bottom → top: index among the visible effects, radius in texels (`res` texels per UV tile across) and what it does.
+fn neighbourhood_filters(effects: &[Effect], res: u32) -> impl Iterator<Item = (usize, f32, Op)> + '_ {
+    let texels = move |size: f32| (size * res as f32 / 2048.0).max(0.5);
+    effects.iter().filter(|effect| effect.visible).enumerate().filter_map(move |(index, effect)| match &effect.kind {
+        EffectKind::Filter(Filter::Blur { radius }) if *radius > 0.0 => Some((index, texels(*radius), Op::Blur(None))),
+        EffectKind::Filter(Filter::Sharpen { amount }) => Some((index, (1.5 * res as f32 / 2048.0).max(0.75), Op::Blur(Some(*amount)))),
+        EffectKind::Filter(Filter::DirectionalBlur { radius, angle }) if *radius > 0.0 => Some((index, texels(*radius), Op::Line(direction(*angle)))),
+        EffectKind::Filter(Filter::Warp { intensity, scale, seed }) if *intensity > 0.0 => {
+            Some((index, texels(*intensity), Op::Warp { scale: *scale, seed: *seed, dir: None }))
+        }
+        EffectKind::Filter(Filter::DirectionalWarp { intensity, angle, scale, seed }) if *intensity > 0.0 => {
+            Some((index, texels(*intensity), Op::Warp { scale: *scale, seed: *seed, dir: Some(direction(*angle)) }))
+        }
+        EffectKind::Filter(Filter::HighPass { radius }) => Some((index, texels(*radius), Op::HighPass)),
+        EffectKind::Filter(Filter::EdgeDetect { width }) => Some((index, texels(*width), Op::Edge)),
+        // Three box passes ramp an edge over about twice their radius
+        EffectKind::Filter(Filter::Bevel { width }) => Some((index, texels(*width * 0.5), Op::Bevel)),
+        EffectKind::Filter(Filter::Glow { radius, amount }) => Some((index, texels(*radius), Op::Glow(*amount))),
+        EffectKind::Filter(Filter::Mosaic { size }) => Some((index, texels(*size), Op::Mosaic)),
+        EffectKind::Filter(Filter::SlopeBlur { radius, scale, seed }) if *radius > 0.0 => {
+            Some((index, texels(*radius), Op::Slope { scale: *scale, seed: *seed }))
+        }
+        _ => None,
+    })
 }
 
 /// Unit texel-space vector of `angle` degrees. Texel rows run down: positive angles turn
@@ -303,6 +308,12 @@ fn direction(angle: f32) -> [f32; 2] {
     let (sn, cs) = angle.to_radians().sin_cos();
     [cs, -sn]
 }
+
+/// Gain on the curvature map's own deviation from flat (±0.5 reaches black and white).
+const MAP_GAIN: f32 = 2.0;
+
+/// Gain per texel of a detail size: blurring spreads an edge over about twice its radius, so wider sizes need proportionally more to reach full strength.
+const GAIN_PER_DETAIL_TEXEL: f32 = 2.0 * std::f32::consts::SQRT_2;
 
 /// Samples along a directional or slope blur at most (beyond, samples spread out).
 const LINE_SAMPLES: i32 = 24;
@@ -421,16 +432,19 @@ fn gather(op: Op, orig: &[f32], cover: &[f32], comps: usize, (x0, y0, w, h): (u3
 /// the region it is computed in, so tiles composited in any grouping agree exactly.
 const FIX: f64 = (1u64 << 24) as f64;
 
-/// Three running-sum box blurs (≈ Gaussian) of a `w × h` image along rows then along columns.
-/// Rows (and columns, transposed) blur in parallel.
-fn blur(data: &mut [f32], w: usize, h: usize, r: usize) {
-    let fix = |v: &f32| if v.is_finite() { (f64::from(v.clamp(-1e6, 1e6)) * FIX).round() as i64 } else { 0 };
-    let mut v: Vec<i64> = data.par_iter().map(fix).collect();
-    blur_rows(&mut v, w, r);
-    let mut t = transpose(&v, w, h);
-    blur_rows(&mut t, h, r);
-    data.par_iter_mut().zip(transpose(&t, h, w)).for_each(|(d, s)| *d = (s as f64 / FIX) as f32);
+/// Three running-sum box blurs (≈ Gaussian) of a `width × height` image along its rows, then its columns, each in parallel.
+pub(crate) fn blur(data: &mut [f32], width: usize, height: usize, radius: usize) {
+    let to_fixed = |value: &f32| if value.is_finite() { (f64::from(value.clamp(-1e6, 1e6)) * FIX).round() as i64 } else { 0 };
+    let mut fixed: Vec<i64> = data.par_iter().map(to_fixed).collect();
+    blur_rows(&mut fixed, width, radius);
+
+    let mut columns = transpose(&fixed, width, height);
+    blur_rows(&mut columns, height, radius);
+    data.par_iter_mut().zip(transpose(&columns, height, width)).for_each(|(target, blurred)| *target = (blurred as f64 / FIX) as f32);
 }
+
+/// The box blurs `blur` runs along each axis
+pub(crate) const BLUR_BOX_PASSES: usize = 3;
 
 /// Three box blurs of radius `r` along every row (`w` long) of `data`.
 fn blur_rows(data: &mut [i64], w: usize, r: usize) {
@@ -439,7 +453,7 @@ fn blur_rows(data: &mut [i64], w: usize, r: usize) {
     }
     data.par_chunks_mut(w).for_each(|row| {
         let mut tmp = vec![0i64; row.len()];
-        for _ in 0..3 {
+        for _ in 0..BLUR_BOX_PASSES {
             box_line(row, &mut tmp, r);
             row.copy_from_slice(&tmp);
         }
@@ -528,153 +542,205 @@ enum Job<'a> {
     Content(Channel),
 }
 
-/// One neighbourhood-filtered field of `layer` over `tiles` plus the filter's reach, built on
-/// the fields already computed below it.
+/// A layer's mask or content channel after every neighbourhood filter of its stack, over `tiles`.
 fn field(inp: &Inputs, channels: &[Channel], below: &Fields, id: LayerId, job: Job, tiles: &[(u32, u32)]) -> Option<Field> {
-    let (gw, gh) = (inp.gbuf.width, inp.gbuf.height);
     let effects = match job {
-        Job::Mask(m) => &m.effects,
+        Job::Mask(mask) => &mask.effects,
         Job::Content(_) => &inp.project.content_layer(id)?.content_effects,
     };
-    let (k, radius, op) = neighbourhood(effects, inp.tile_res())?;
-    let opacity = effects.iter().filter(|e| e.visible).nth(k).map(|e| e.opacity.clamp(0.0, 1.0)).unwrap_or(1.0);
-    // Clamped: a hostile radius must not overflow the halo and window arithmetic.
-    let r = radius.round().clamp(1.0, gw.max(gh) as f32) as u32;
-    // Three box passes reach 3r texels, the other filters r (and a texel for bilinear samples).
-    let blurs = matches!(op, Op::Blur(_) | Op::HighPass | Op::Bevel | Op::Glow(_));
-    let reach = if blurs { 3 * r } else { r + 1 };
-    let halo = reach.div_ceil(TILE);
-    let (tx0, ty0) = tiles.iter().fold((u32::MAX, u32::MAX), |(a, b), t| (a.min(t.0), b.min(t.1)));
-    let (tx1, ty1) = tiles.iter().fold((0, 0), |(a, b), t| (a.max(t.0), b.max(t.1)));
-    let (rx0, ry0) = (tx0.saturating_sub(halo) * TILE, ty0.saturating_sub(halo) * TILE);
-    let (rx1, ry1) = (((tx1 + 1 + halo) * TILE).min(gw), ((ty1 + 1 + halo) * TILE).min(gh));
-    let (w, h) = (rx1.saturating_sub(rx0), ry1.saturating_sub(ry0));
-    if w == 0 || h == 0 {
-        return None;
+    let filters: Vec<(usize, f32, Op)> = neighbourhood_filters(effects, inp.tile_res()).collect();
+    let longest_side = inp.gbuf.width.max(inp.gbuf.height);
+
+    // Each filter's region also holds what every filter above it reads around the tiles
+    let mut margins: Vec<u32> = filters.iter().map(|&(_, radius, op)| filter_extent(radius, op, longest_side).1.div_ceil(TILE)).collect();
+    for index in (0..margins.len().saturating_sub(1)).rev() {
+        margins[index] += margins[index + 1];
     }
+
+    let mut previous: Option<(usize, Field)> = None;
+    for (&filter, &margin) in filters.iter().zip(&margins) {
+        let region = region_around(inp, tiles, margin)?;
+        let start = previous.as_ref().map(|(index, field)| (*index, field));
+        let filtered = filter_region(inp, channels, below, id, job, effects, filter, region, start)?;
+        previous = Some((filter.0, filtered));
+    }
+    previous.map(|(_, field)| field)
+}
+
+/// The tile-aligned texel region `(x0, y0, w, h)` around `tiles` plus `margin` tiles, clipped to the set.
+fn region_around(inp: &Inputs, tiles: &[(u32, u32)], margin: u32) -> Option<(u32, u32, u32, u32)> {
+    let (first_x, first_y) = tiles.iter().fold((u32::MAX, u32::MAX), |(min_x, min_y), tile| (min_x.min(tile.0), min_y.min(tile.1)));
+    let (last_x, last_y) = tiles.iter().fold((0, 0), |(max_x, max_y), tile| (max_x.max(tile.0), max_y.max(tile.1)));
+    let (x0, y0) = (first_x.saturating_sub(margin) * TILE, first_y.saturating_sub(margin) * TILE);
+    let (x1, y1) = (((last_x + 1 + margin) * TILE).min(inp.gbuf.width), ((last_y + 1 + margin) * TILE).min(inp.gbuf.height));
+    let (w, h) = (x1.saturating_sub(x0), y1.saturating_sub(y0));
+    (w > 0 && h > 0).then_some((x0, y0, w, h))
+}
+
+/// A neighbourhood filter's radius in whole texels and how many texels around a texel it reads.
+fn filter_extent(radius: f32, op: Op, longest_side: u32) -> (u32, u32) {
+    // Clamped so a hostile radius can't overflow the region arithmetic
+    let radius_texels = radius.round().clamp(1.0, longest_side as f32) as u32;
+
+    // Three box passes reach three radii; the gathering filters one radius plus a bilinear texel
+    let reach = if is_box_blur(op) { 3 * radius_texels } else { radius_texels + 1 };
+    (radius_texels, reach)
+}
+
+/// Whether neighbourhood filter `op` is computed from box blurs (the others gather samples).
+fn is_box_blur(op: Op) -> bool {
+    matches!(op, Op::Blur(_) | Op::HighPass | Op::Bevel | Op::Glow(_))
+}
+
+/// The stack up to and including neighbourhood filter `filter` over texel `region`, continued from `start` (the filter below's field) when given.
+#[allow(clippy::too_many_arguments)]
+fn filter_region(
+    inp: &Inputs,
+    channels: &[Channel],
+    below: &Fields,
+    id: LayerId,
+    job: Job,
+    effects: &[Effect],
+    (index, radius, op): (usize, f32, Op),
+    (rx0, ry0, w, h): (u32, u32, u32, u32),
+    start: Option<(usize, &Field)>,
+) -> Option<Field> {
+    let opacity = effects.iter().filter(|effect| effect.visible).nth(index).map(|effect| effect.opacity.clamp(0.0, 1.0)).unwrap_or(1.0);
+    let (radius_texels, _) = filter_extent(radius, op, inp.gbuf.width.max(inp.gbuf.height));
     let comps = match job {
         Job::Mask(_) => 1,
         Job::Content(_) => 4,
     };
-    // Evaluate the stack before the filter, tile by tile (content premultiplied by coverage).
+
+    // Evaluate the stack up to the filter, tile by tile (content premultiplied by coverage)
+    let (rx1, ry1) = (rx0 + w, ry0 + h);
     let region_tiles: Vec<(u32, u32)> = (ry0 / TILE..ry1.div_ceil(TILE)).flat_map(|y| (rx0 / TILE..rx1.div_ceil(TILE)).map(move |x| (x, y))).collect();
     let parts: Vec<Vec<(u32, u32, [f32; 4])>> = region_tiles
         .par_iter()
         .map(|&(tx, ty)| {
             let full = anchor_plan(inp, id, channels, tx, ty, Some(below));
-            let preview_tile = inp.preview.and_then(|p| p.alpha.tile(tx, ty));
+            let preview_tile = inp.preview.and_then(|preview| preview.alpha.tile(tx, ty));
             let mut mask = None;
             let mut nodes = Vec::new();
             match job {
-                Job::Mask(m) => {
-                    let Some(mut mp) = mask_plan(inp, id, m, tx, ty, None) else { return Vec::new() };
-                    mp.effects.truncate(k);
-                    mask = Some(mp);
+                Job::Mask(layer_mask) => {
+                    let Some(mut mask_stack) = mask_plan(inp, id, layer_mask, tx, ty, None) else { return Vec::new() };
+
+                    mask_stack.effects.truncate(index);
+                    mask_stack.start = start;
+                    mask = Some(mask_stack);
                 }
-                Job::Content(ch) => {
-                    nodes = plan(inp, &[id], &[ch], tx, ty, 0, Some(below));
-                    if let Some(c) = nodes.first_mut().and_then(|n| n.chans.first_mut()) {
-                        c.effects.truncate(k);
-                        c.start = None;
+                Job::Content(channel) => {
+                    nodes = plan(inp, &[id], &[channel], tx, ty, 0, Some(below));
+                    if let Some(chan) = nodes.first_mut().and_then(|node| node.chans.first_mut()) {
+                        chan.effects.truncate(index);
+                        chan.start = start;
                     }
                 }
             }
             tile_texels(inp.gbuf, tx, ty)
-                .map(|(x, y, o)| {
-                    let mut tex = Texel::new(inp, x, y, o, stroke_at(preview_tile, o));
+                .map(|(x, y, offset)| {
+                    let mut texel = Texel::new(inp, x, y, offset, stroke_at(preview_tile, offset));
                     if !full.is_empty() {
-                        tex.anchors_below(&full, id);
+                        texel.anchors_below(&full, id);
                     }
-                    let v = match (&mask, nodes.first()) {
-                        (Some(mp), _) => [tex.mask(mp), 0.0, 0.0, 0.0],
-                        (None, Some(n)) => match n.chans.first().and_then(|c| tex.content(&n.content, c)) {
-                            Some((v, cov)) => [v[0] * cov, v[1] * cov, v[2] * cov, cov],
+                    let value = match (&mask, nodes.first()) {
+                        (Some(mask_stack), _) => [texel.mask(mask_stack), 0.0, 0.0, 0.0],
+                        (None, Some(node)) => match node.chans.first().and_then(|chan| texel.content(&node.content, chan)) {
+                            Some((color, cov)) => [color[0] * cov, color[1] * cov, color[2] * cov, cov],
                             None => [0.0; 4],
                         },
                         (None, None) => [0.0; 4],
                     };
-                    (x, y, v)
+                    (x, y, value)
                 })
                 .collect()
         })
         .collect();
-    // Scatter into the region, a row of tiles at a time (the region is tile aligned).
-    let n = (w * h) as usize;
-    let mut orig = vec![0.0f32; n * comps];
-    let mut cover = vec![0.0f32; n];
+
+    // Scatter into the region, a row of tiles at a time (the region is tile aligned)
+    let texel_count = (w * h) as usize;
+    let mut orig = vec![0.0f32; texel_count * comps];
+    let mut cover = vec![0.0f32; texel_count];
     let row_tiles = (rx1.div_ceil(TILE) - rx0 / TILE).max(1) as usize;
     let band = (TILE * w) as usize;
     orig.par_chunks_mut(band * comps).zip(cover.par_chunks_mut(band)).zip(parts.par_chunks(row_tiles)).for_each(|((orig, cover), row)| {
-        for &(x, y, v) in row.iter().flatten() {
-            let i = (((y - ry0) % TILE) * w + (x - rx0)) as usize;
-            if let (Some(c), Some(px)) = (cover.get_mut(i), orig.get_mut(i * comps..(i + 1) * comps)) {
-                *c = 1.0;
-                px.copy_from_slice(&v[..comps]);
+        for &(x, y, value) in row.iter().flatten() {
+            let texel = (((y - ry0) % TILE) * w + (x - rx0)) as usize;
+            if let (Some(covered), Some(pixel)) = (cover.get_mut(texel), orig.get_mut(texel * comps..(texel + 1) * comps)) {
+                *covered = 1.0;
+                pixel.copy_from_slice(&value[..comps]);
             }
         }
     });
-    // High pass centers on the channel's mid value (0 for signed channels like height).
+
+    // High pass centers on the channel's mid value (0 for signed channels like height)
     let mid = match job {
-        Job::Content(ch) if ch.kind() == ChannelKind::Signed => 0.0,
+        Job::Content(channel) if channel.kind() == ChannelKind::Signed => 0.0,
         _ => 0.5,
     };
-    // The filter at the radius of a tile filling `scale` of its atlas block (a smaller tile has
-    // fewer texels per UV unit, so its filters reach fewer texels).
+
+    // A smaller UV tile has fewer texels per UV unit, so its filters reach fewer texels
     let filtered = |scale: f32| -> Vec<f32> {
         let res = ((inp.tile_res() as f32 * scale).round() as u32).max(1);
-        let r = neighbourhood(effects, res).map_or(r, |(_, radius, _)| radius.round().clamp(1.0, r as f32) as u32);
-        if !blurs {
-            return gather(op, &orig, &cover, comps, (rx0, ry0, w, h), r as f32, res, opacity);
+        let scaled_radius = neighbourhood_filters(effects, res)
+            .find(|filter| filter.0 == index)
+            .map_or(radius_texels, |filter| filter.1.round().clamp(1.0, radius_texels as f32) as u32);
+        if !is_box_blur(op) {
+            return gather(op, &orig, &cover, comps, (rx0, ry0, w, h), scaled_radius as f32, res, opacity);
         }
-        // Weighted so uncovered texels don't bleed in.
-        let (wu, hu, ru) = (w as usize, h as usize, r as usize);
+
+        // Weighted so uncovered texels don't bleed in
+        let (width, height, blur_radius) = (w as usize, h as usize, scaled_radius as usize);
         let mut weights = cover.clone();
-        blur(&mut weights, wu, hu, ru);
+        blur(&mut weights, width, height, blur_radius);
         let mut data = orig.clone();
-        for p in 0..comps {
-            let mut vals: Vec<f32> = orig.par_chunks(comps).map(|px| px.get(p).copied().unwrap_or(0.0)).collect();
-            blur(&mut vals, wu, hu, ru);
-            data.par_chunks_mut(comps).zip(vals.par_iter()).zip(weights.par_iter()).for_each(|((px, v), wt)| {
-                // Content is premultiplied, so the mid value is too (coverage itself is kept).
-                let cov = if comps == 4 { px.get(3).copied().unwrap_or(0.0) } else { 1.0 };
-                if *wt > 1e-6
-                    && let Some(slot) = px.get_mut(p)
+        for component in 0..comps {
+            let mut sums: Vec<f32> = orig.par_chunks(comps).map(|pixel| pixel.get(component).copied().unwrap_or(0.0)).collect();
+            blur(&mut sums, width, height, blur_radius);
+            data.par_chunks_mut(comps).zip(sums.par_iter()).zip(weights.par_iter()).for_each(|((pixel, sum), weight)| {
+                // Content is premultiplied, so the mid value is too (coverage itself is kept)
+                let cov = if comps == 4 { pixel.get(3).copied().unwrap_or(0.0) } else { 1.0 };
+                if *weight > 1e-6
+                    && let Some(slot) = pixel.get_mut(component)
                 {
-                    let (o, blurred) = (*slot, v / wt);
-                    let filtered = match op {
-                        Op::Blur(Some(amount)) => o + amount * (o - blurred),
-                        Op::HighPass if p < 3 => o - blurred + mid * cov,
-                        // Away from 0 by at most the value itself: 0 at the edge, full inside.
-                        Op::Bevel if p < 3 => o.signum() * o.abs().min((2.0 * blurred * o.signum() - o.abs()).max(0.0)),
-                        Op::Glow(amount) if p < 3 => o + amount * blurred,
-                        Op::HighPass | Op::Bevel | Op::Glow(_) => o,
+                    let (original, blurred) = (*slot, sum / weight);
+                    let result = match op {
+                        Op::Blur(Some(amount)) => original + amount * (original - blurred),
+                        Op::HighPass if component < 3 => original - blurred + mid * cov,
+                        // Away from 0 by at most the value itself: 0 at the edge, full inside
+                        Op::Bevel if component < 3 => original.signum() * original.abs().min((2.0 * blurred * original.signum() - original.abs()).max(0.0)),
+                        Op::Glow(amount) if component < 3 => original + amount * blurred,
+                        Op::HighPass | Op::Bevel | Op::Glow(_) => original,
                         _ => blurred,
                     };
-                    *slot = o + (filtered - o) * opacity;
+                    *slot = original + (result - original) * opacity;
                 }
             });
         }
         data
     };
-    // Each block keeps the result at its tile's scale (blocks are TILE aligned).
+
+    // Each block keeps the result at its tile's scale (blocks are TILE aligned)
     let scales = inp.project.texture_set(inp.ts).map(TextureSet::block_scales).unwrap_or_default();
     let mut levels: Vec<f32> =
         (ry0..ry1).step_by(TILE as usize).flat_map(|y| (rx0..rx1).step_by(TILE as usize).map(move |x| (x, y))).map(|(x, y)| scales.at(x, y)).collect();
     levels.sort_by(f32::total_cmp);
     levels.dedup();
-    let (first, rest) = levels.split_first().map_or((1.0, &[][..]), |(f, r)| (*f, r));
+    let (first, rest) = levels.split_first().map_or((1.0, &[][..]), |(first, rest)| (*first, rest));
     let mut data = filtered(first);
     for &scale in rest {
         let other = filtered(scale);
         let row = w as usize * comps;
         data.par_chunks_mut(row).zip(other.par_chunks(row)).enumerate().for_each(|(y, (dst, src))| {
-            for (x, (d, s)) in dst.chunks_mut(comps).zip(src.chunks(comps)).enumerate() {
+            for (x, (target, source)) in dst.chunks_mut(comps).zip(src.chunks(comps)).enumerate() {
                 if scales.at(rx0 + x as u32, ry0 + y as u32) == scale {
-                    d.copy_from_slice(s);
+                    target.copy_from_slice(source);
                 }
             }
         });
     }
+
     unpremultiply(&mut data, comps);
     Some(Field { x0: rx0, y0: ry0, w, h, comps, data })
 }
@@ -708,26 +774,51 @@ fn fields_of(inp: &Inputs, channels: &[Channel], list: &[LayerId], tiles: &[(u32
     if tiles.is_empty() || inp.gbuf.width == 0 {
         return out;
     }
-    let res = inp.gbuf.width;
+
+    let working_width = inp.gbuf.width;
     let mut order = Vec::new();
     draw_order(inp.project, list, 0, &mut order);
+    prepare_curvature_sizes(inp, &order);
+
     for id in order {
         let Some(layer) = inp.project.content_layer(id) else { continue };
-        if let Some(m) = layer_mask(inp.project, id).filter(|m| m.enabled && neighbourhood(&m.effects, res).is_some())
-            && let Some(f) = field(inp, channels, &out, id, Job::Mask(m), tiles)
+
+        if let Some(mask) = layer_mask(inp.project, id).filter(|mask| mask.enabled && neighbourhood(&mask.effects, working_width).is_some())
+            && let Some(filtered) = field(inp, channels, &out, id, Job::Mask(mask), tiles)
         {
-            out.insert(FieldKey::Mask(id), f);
+            out.insert(FieldKey::Mask(id), filtered);
         }
-        if layer.is_group() || neighbourhood(&layer.content_effects, res).is_none() {
+
+        if layer.is_group() || neighbourhood(&layer.content_effects, working_width).is_none() {
             continue;
         }
-        for ch in channels.iter().filter(|c| layer.channels.contains_key(c)) {
-            if let Some(f) = field(inp, channels, &out, id, Job::Content(*ch), tiles) {
-                out.insert(FieldKey::Content(id, *ch), f);
+        for channel in channels.iter().filter(|channel| layer.channels.contains_key(channel)) {
+            if let Some(filtered) = field(inp, channels, &out, id, Job::Content(*channel), tiles) {
+                out.insert(FieldKey::Content(id, *channel), filtered);
             }
         }
     }
     out
+}
+
+/// Build the curvature detail sizes every visible generator of `layers` reads, once, before tiles composite in parallel.
+fn prepare_curvature_sizes(inp: &Inputs, layers: &[LayerId]) {
+    let visible = layers.iter().filter(|id| inp.project.layers.get(id).is_some_and(|layer| layer.visible));
+    let masks = visible.filter_map(|id| layer_mask(inp.project, *id)).filter(|mask| mask.enabled);
+    prepare_mask_curvature_sizes(inp, masks);
+}
+
+/// Build the curvature detail sizes the visible generators of `masks` read, once, before tiles composite in parallel.
+fn prepare_mask_curvature_sizes<'a>(inp: &Inputs, masks: impl Iterator<Item = &'a Mask>) {
+    let mut needed = [false; CurvatureDetail::BLURRED_SIZES];
+    for effect in masks.flat_map(|mask| &mask.effects).filter(|effect| effect.visible) {
+        if let EffectKind::Generator(Generator { detail: Some(detail), .. }) = &effect.kind {
+            for (slot, in_use) in needed.iter_mut().zip(detail.blurred_sizes_in_use()) {
+                *slot |= in_use;
+            }
+        }
+    }
+    CurvatureSizes::of(inp, &needed);
 }
 
 struct Node<'a> {
@@ -747,21 +838,26 @@ struct Node<'a> {
 
 /// Plans of the visible effects of a stack: mask effects (`channel` None) or the content
 /// effects of one channel (paint effects then read that channel's pixels).
-fn effect_plans<'a>(inp: &Inputs<'a>, effects: &'a [Effect], tx: u32, ty: u32, channel: Option<Channel>) -> Vec<EffectPlan<'a>> {
+fn effect_plans<'a>(inp: &Inputs<'a>, effects: &'a [Effect], tile_x: u32, tile_y: u32, channel: Option<Channel>) -> Vec<EffectPlan<'a>> {
     effects
         .iter()
-        .filter(|e| e.visible)
-        .map(|e| {
-            let (img, target) = match channel {
-                Some(c) => (inp.pixels.layer(e.id, c), PaintTarget::Layer(e.id)),
-                None => (inp.pixels.masks.get(&e.id), PaintTarget::Mask(e.id)),
+        .filter(|effect| effect.visible)
+        .map(|effect| {
+            let (image, target) = match channel {
+                Some(channel) => (inp.pixels.layer(effect.id, channel), PaintTarget::Layer(effect.id)),
+                None => (inp.pixels.masks.get(&effect.id), PaintTarget::Mask(effect.id)),
+            };
+            let curvature_sizes = match &effect.kind {
+                EffectKind::Generator(Generator { detail: Some(detail), .. }) => CurvatureSizes::of(inp, &detail.blurred_sizes_in_use()),
+                _ => None,
             };
             EffectPlan {
-                kind: &e.kind,
-                blend: e.blend,
-                opacity: e.opacity,
-                data: if e.kind.painted() { tile_of(inp, img, tx, ty, channel) } else { None },
+                kind: &effect.kind,
+                blend: effect.blend,
+                opacity: effect.opacity,
+                data: if effect.kind.painted() { tile_of(inp, image, tile_x, tile_y, channel) } else { None },
                 preview: previews(inp, target),
+                curvature_sizes,
             }
         })
         .collect()
@@ -1043,7 +1139,11 @@ impl<'a, 'b> Texel<'a, 'b> {
     }
 
     fn baked(&self, m: BakedMap) -> Option<f32> {
-        self.inp.baked.scalar(m, self.x, self.y, (self.res, self.inp.gbuf.height))
+        self.baked_color(m).map(|value| value[0])
+    }
+
+    fn baked_color(&self, map: BakedMap) -> Option<[f32; 3]> {
+        self.inp.baked.sample_working(map, self.x, self.y, (self.res, self.inp.gbuf.height), &self.inp.block_scales)
     }
 
     /// Where projection `proj` samples this texel: the texel's coordinates, or for a decal its
@@ -1110,94 +1210,142 @@ impl<'a, 'b> Texel<'a, 'b> {
         }
     }
 
-    fn generator(&mut self, g: &Generator) -> f32 {
-        let c = self.coords();
-        let s = match g.kind {
-            GeneratorKind::EdgeWear => (self.baked(BakedMap::Curvature).unwrap_or(0.5) - 0.5) * 2.0,
-            GeneratorKind::Curvature => self.baked(BakedMap::Curvature).unwrap_or(0.5),
-            GeneratorKind::Dirt => 1.0 - self.baked(BakedMap::AmbientOcclusion).unwrap_or(1.0),
-            GeneratorKind::AmbientOcclusion => self.baked(BakedMap::AmbientOcclusion).unwrap_or(1.0),
-            GeneratorKind::ThinAreas => 1.0 - self.baked(BakedMap::Thickness).unwrap_or(1.0),
-            GeneratorKind::Position => c.pos.dot(Vec3::from(g.direction).try_normalize().unwrap_or(Vec3::Y)) * 0.5 + 0.5,
-            GeneratorKind::Direction => c.nrm.dot(Vec3::from(g.direction).try_normalize().unwrap_or(Vec3::Y)) * 0.5 + 0.5,
+    fn generator(&mut self, generator: &Generator, curvature_sizes: Option<&CurvatureSizes>) -> f32 {
+        let coords = self.coords();
+        let signal = match (generator.kind, &generator.detail) {
+            (GeneratorKind::Curvature | GeneratorKind::EdgeWear, Some(detail)) => self.curvature_detail(detail, curvature_sizes),
+            (GeneratorKind::EdgeWear, None) => (self.baked(BakedMap::Curvature).unwrap_or(0.5) - 0.5) * 2.0,
+            (GeneratorKind::Curvature, None) => self.baked(BakedMap::Curvature).unwrap_or(0.5),
+            (GeneratorKind::Dirt, _) => 1.0 - self.baked(BakedMap::AmbientOcclusion).unwrap_or(1.0),
+            (GeneratorKind::AmbientOcclusion, _) => self.baked(BakedMap::AmbientOcclusion).unwrap_or(1.0),
+            (GeneratorKind::ThinAreas, _) => 1.0 - self.baked(BakedMap::Thickness).unwrap_or(1.0),
+            (GeneratorKind::Position, _) => coords.pos.dot(Vec3::from(generator.direction).try_normalize().unwrap_or(Vec3::Y)) * 0.5 + 0.5,
+            (GeneratorKind::Direction, _) => coords.nrm.dot(Vec3::from(generator.direction).try_normalize().unwrap_or(Vec3::Y)) * 0.5 + 0.5,
         };
-        let s = if g.noise_amount > 0.0 { s + (world_noise(c.pos, g.noise_scale, g.seed) - 0.5) * g.noise_amount } else { s };
-        let th = 1.0 - g.level.clamp(0.0, 1.0);
-        let soft = g.softness.max(1e-3);
-        let t = ((s - (th - soft)) / (2.0 * soft)).clamp(0.0, 1.0);
-        let v = t * t * (3.0 - 2.0 * t);
-        if g.invert { 1.0 - v } else { v }
+        let signal = if generator.noise_amount > 0.0 {
+            let noise = world_noise(coords.pos, generator.noise_scale, generator.seed);
+            if let (GeneratorKind::Curvature | GeneratorKind::EdgeWear, Some(detail)) = (generator.kind, &generator.detail) {
+                // Break up curvature without inventing edges or cavities on a flat surface
+                let neutral = if detail.mode == CurvatureMode::Raw { 0.5 } else { 0.0 };
+                neutral + (signal - neutral) * (1.0 - noise * generator.noise_amount).max(0.0)
+            } else {
+                signal + (noise - 0.5) * generator.noise_amount
+            }
+        } else {
+            signal
+        };
+
+        // A smooth step from black to white over 2 × softness around 1 − level
+        let threshold = 1.0 - generator.level.clamp(0.0, 1.0);
+        let softness = generator.softness.max(1e-3);
+        let ramp = ((signal - (threshold - softness)) / (2.0 * softness)).clamp(0.0, 1.0);
+        let value = ramp * ramp * (3.0 - 2.0 * ramp);
+        if generator.invert { 1.0 - value } else { value }
     }
 
-    fn mask(&mut self, m: &MaskPlan) -> f32 {
-        let mut v = m.background;
-        let mut skip = 0;
-        if let Some((k, field)) = m.start
-            && let Some(f) = field.get(self.x, self.y).and_then(|d| d.first().copied())
-        {
-            v = f;
-            skip = k + 1;
+    /// The curvature of `detail`'s mode at this texel: each detail size's edges and cavities, weighted and combined like a screen blend.
+    fn curvature_detail(&self, detail: &CurvatureDetail, curvature_sizes: Option<&CurvatureSizes>) -> f32 {
+        let combine = |edges: f32, cavities: f32| match detail.mode {
+            CurvatureMode::Edges => edges,
+            CurvatureMode::Cavities => cavities,
+            CurvatureMode::Both => 1.0 - (1.0 - edges) * (1.0 - cavities),
+            CurvatureMode::Raw => 0.5 + 0.5 * (edges - cavities),
+        };
+
+        // Without curvature to read the texel is flat: no edges or cavities
+        let Some(curvature) = self.baked(BakedMap::Curvature) else { return combine(0.0, 0.0) };
+
+        let working_size = (self.res, self.inp.gbuf.height);
+        let texel_uv = [(self.x as f32 + 0.5) / working_size.0.max(1) as f32, (self.y as f32 + 0.5) / working_size.1.max(1) as f32];
+        let Some(baked_uv) = self.inp.block_scales.bake_uv(texel_uv, working_size) else { return combine(0.0, 0.0) };
+
+        let baked_size = (self.inp.baked.resolution, self.inp.baked.height(BakedMap::Curvature));
+        let (baked_x, baked_y) = ((baked_uv[0] * baked_size.0 as f32) as u32, (baked_uv[1] * baked_size.1 as f32) as u32);
+        let blurred = |index: usize| {
+            curvature_sizes.and_then(|sizes| sizes.levels.get(index)).and_then(Option::as_deref).map_or(0.0, |level| level.sample(baked_x, baked_y))
+        };
+        let (mut edges, mut cavities) = (0.0f32, 0.0f32);
+        for (index, (size, weight)) in CurvatureDetail::SIZES.iter().zip(detail.weights).enumerate() {
+            let deviation = if index == 0 { curvature - 0.5 } else { blurred(index - 1) };
+
+            let response = deviation * if *size == 0.0 { MAP_GAIN } else { GAIN_PER_DETAIL_TEXEL * size };
+            let weight = weight.clamp(0.0, 1.0);
+            edges = 1.0 - (1.0 - edges) * (1.0 - weight * response.clamp(0.0, 1.0));
+            cavities = 1.0 - (1.0 - cavities) * (1.0 - weight * (-response).clamp(0.0, 1.0));
         }
-        for e in m.effects.iter().skip(skip) {
-            let o = e.opacity.clamp(0.0, 1.0);
-            match e.kind {
+
+        combine(edges, cavities)
+    }
+
+    fn mask(&mut self, plan: &MaskPlan) -> f32 {
+        let mut value = plan.background;
+        let mut skip = 0;
+        if let Some((filtered_index, field)) = plan.start
+            && let Some(filtered) = field.get(self.x, self.y).and_then(|texel| texel.first().copied())
+        {
+            value = filtered;
+            skip = filtered_index + 1;
+        }
+
+        for effect in plan.effects.iter().skip(skip) {
+            let opacity = effect.opacity.clamp(0.0, 1.0);
+            match effect.kind {
                 EffectKind::Paint | EffectKind::Path(_) => {
-                    let (mut pv, mut cov) = match e.data.as_deref() {
-                        Some(d) => (from_u16(d.get(self.o * 2).copied().unwrap_or(0)), from_u16(d.get(self.o * 2 + 1).copied().unwrap_or(0))),
+                    let (mut painted, mut cov) = match effect.data.as_deref() {
+                        Some(data) => (from_u16(data.get(self.o * 2).copied().unwrap_or(0)), from_u16(data.get(self.o * 2 + 1).copied().unwrap_or(0))),
                         None => (0.0, 0.0),
                     };
-                    if e.preview
-                        && let Some(p) = self.inp.preview
+                    if effect.preview
+                        && let Some(preview) = self.inp.preview
                     {
-                        let a = (self.stroke * p.opacity).clamp(0.0, 1.0);
-                        if p.erase {
-                            pv *= 1.0 - a;
-                            cov *= 1.0 - a;
+                        let stroke = (self.stroke * preview.opacity).clamp(0.0, 1.0);
+                        if preview.erase {
+                            painted *= 1.0 - stroke;
+                            cov *= 1.0 - stroke;
                         } else {
-                            pv = p.mask_value * a + pv * (1.0 - a);
-                            cov = a + cov * (1.0 - a);
+                            painted = preview.mask_value * stroke + painted * (1.0 - stroke);
+                            cov = stroke + cov * (1.0 - stroke);
                         }
                     }
                     if cov > 0.0 {
-                        let val = pv / cov.max(1e-5);
-                        v += (blend1(e.blend, v, val) - v) * cov * o;
+                        let layer_value = painted / cov.max(1e-5);
+                        value += (blend1(effect.blend, value, layer_value) - value) * cov * opacity;
                     }
                 }
                 EffectKind::Fill { source, projection } => {
-                    let val = self.source(source, projection, ChannelKind::Scalar)[0];
-                    v += (blend1(e.blend, v, val) - v) * o * self.cover(std::iter::once(source), projection);
+                    let fill = self.source(source, projection, ChannelKind::Scalar)[0];
+                    value += (blend1(effect.blend, value, fill) - value) * opacity * self.cover(std::iter::once(source), projection);
                 }
-                EffectKind::Generator(g) => {
-                    let val = self.generator(g);
-                    v += (blend1(e.blend, v, val) - v) * o;
+                EffectKind::Generator(generator) => {
+                    let generated = self.generator(generator, effect.curvature_sizes.as_deref());
+                    value += (blend1(effect.blend, value, generated) - value) * opacity;
                 }
-                EffectKind::Levels(l) => v += (l.apply(v) - v) * o,
-                EffectKind::Filter(f) => {
-                    // A mask is gray (HSL only changes its lightness); neighbourhood filters come
-                    // precomputed through `MaskPlan::start`.
-                    let val = f.point(ChannelKind::Scalar, [v; 3]).map_or(v, |x| x[0]);
-                    v += (val - v) * o;
+                EffectKind::Levels(levels) => value += (levels.apply(value) - value) * opacity,
+                EffectKind::Filter(filter) => {
+                    // A mask is gray (HSL only changes its lightness); neighbourhood filters come precomputed through `MaskPlan::start`
+                    let filtered = filter.point(ChannelKind::Scalar, [value; 3]).map_or(value, |gray| gray[0]);
+                    value += (filtered - value) * opacity;
                 }
                 EffectKind::ColorSelection { colors, tolerance } => {
-                    let id = self.inp.baked.sample(BakedMap::Id, self.x, self.y, (self.res, self.inp.gbuf.height));
-                    let hit = id.is_some_and(|c| colors.iter().any(|k| (k[0] - c[0]).abs().max((k[1] - c[1]).abs()).max((k[2] - c[2]).abs()) <= *tolerance));
-                    let val = if hit { 1.0 } else { 0.0 };
-                    v += (blend1(e.blend, v, val) - v) * o;
+                    let id = self.baked_color(BakedMap::Id);
+                    let within = |picked: &[f32; 3], color: [f32; 3]| (0..3).all(|component| (picked[component] - color[component]).abs() <= *tolerance);
+                    let selected = if id.is_some_and(|color| colors.iter().any(|picked| within(picked, color))) { 1.0 } else { 0.0 };
+                    value += (blend1(effect.blend, value, selected) - value) * opacity;
                 }
-                EffectKind::Compare { op, value, tolerance } => {
+                EffectKind::Compare { op, value: compared, tolerance } => {
                     let pass = match op {
-                        CompareOp::LesserThan => v < *value,
-                        CompareOp::GreaterThan => v > *value,
-                        CompareOp::WithinTolerance => (v - value).abs() <= *tolerance,
+                        CompareOp::LesserThan => value < *compared,
+                        CompareOp::GreaterThan => value > *compared,
+                        CompareOp::WithinTolerance => (value - compared).abs() <= *tolerance,
                     };
-                    let val = if pass { 1.0 } else { 0.0 };
-                    v += (val - v) * o;
+                    let result = if pass { 1.0 } else { 0.0 };
+                    value += (result - value) * opacity;
                 }
-                // Content-only effects.
+                // Content-only effects
                 EffectKind::Material(_) | EffectKind::Anchor => {}
             }
         }
-        v.clamp(0.0, 1.0)
+        value.clamp(0.0, 1.0)
     }
 
     /// Composite `nodes` over `acc`, recording anchors. Returns true when it reached the `stop`
@@ -1835,47 +1983,123 @@ pub fn pad_tiles(out: &mut Composite, dmap: &DilationMap, tiles: &[(u32, u32)]) 
     written
 }
 
-/// The mask of layer `id` as an 8-bit grayscale image of `size × size` stretched over the
-/// texture set (nearest texel; uncovered texels black). None when the layer has no enabled mask.
-pub fn mask_image(inp: &Inputs, id: LayerId, size: u32) -> Option<Vec<u8>> {
-    let mask = layer_mask(inp.project, id).filter(|m| m.enabled)?;
-    let channels = inp.project.texture_set(inp.ts).map(|t| t.channel_list()).unwrap_or_default();
-    let (w, h) = (inp.gbuf.width, inp.gbuf.height);
-    let all = all_tiles(w, h);
-    let fields = neighbourhood_fields(inp, &channels, &all);
-    let tiles: Vec<(u32, u32, Vec<u8>)> = all
+/// The layer mask as a square grayscale image, using nearest texels and black outside the mesh
+/// Returns None without an enabled mask
+pub fn mask_image(inputs: &Inputs, id: LayerId, size: u32) -> Option<Vec<u8>> {
+    let mask = layer_mask(inputs.project, id).filter(|mask| mask.enabled)?;
+    let channels = inputs.project.texture_set(inputs.ts).map(|set| set.channel_list()).unwrap_or_default();
+    let (width, height) = (inputs.gbuf.width, inputs.gbuf.height);
+    let coordinates = all_tiles(width, height);
+
+    // A hidden layer's mask is left out of the stack's preparation
+    prepare_mask_curvature_sizes(inputs, std::iter::once(mask));
+
+    let fields = neighbourhood_fields(inputs, &channels, &coordinates);
+    let tiles: HashMap<(u32, u32), Vec<u8>> = coordinates
         .par_iter()
-        .filter_map(|&(tx, ty)| {
-            let mp = mask_plan(inp, id, mask, tx, ty, Some(&fields))?;
-            let full = anchor_plan(inp, id, &channels, tx, ty, Some(&fields));
-            let mut buf = vec![0u8; TILE_AREA];
-            for (x, y, o) in tile_texels(inp.gbuf, tx, ty) {
-                let mut tex = Texel::new(inp, x, y, o, 0.0);
-                if !full.is_empty() {
-                    tex.anchors_below(&full, id);
-                }
-                if let Some(b) = buf.get_mut(o) {
-                    *b = (tex.mask(&mp) * 255.0 + 0.5) as u8;
+        .map(|&tile| {
+            let mut values = vec![0u8; TILE_AREA];
+            for (offset, value) in mask_tile(inputs, id, mask, &channels, &fields, tile, 0..TILE_AREA) {
+                if let Some(destination) = values.get_mut(offset) {
+                    *destination = (value * 255.0 + 0.5) as u8;
                 }
             }
-            Some((tx, ty, buf))
+            (tile, values)
         })
         .collect();
+
     let size = size.max(1);
-    let mut out = vec![0u8; (size * size) as usize];
-    let lookup: std::collections::HashMap<(u32, u32), &Vec<u8>> = tiles.iter().map(|(x, y, b)| ((*x, *y), b)).collect();
+    let mut output = vec![0u8; (size * size) as usize];
     for y in 0..size {
         for x in 0..size {
-            let (sx, sy) = ((x as u64 * w as u64 / size as u64) as u32, (y as u64 * h as u64 / size as u64) as u32);
-            if let Some(t) = lookup.get(&(sx / TILE, sy / TILE))
-                && let Some(v) = t.get(((sy % TILE) * TILE + sx % TILE) as usize)
-                && let Some(d) = out.get_mut((y * size + x) as usize)
+            let sample_x = (u64::from(x) * u64::from(width) / u64::from(size)) as u32;
+            let sample_y = (u64::from(y) * u64::from(height) / u64::from(size)) as u32;
+            if let Some(tile) = tiles.get(&(sample_x / TILE, sample_y / TILE))
+                && let Some(value) = tile.get(((sample_y % TILE) * TILE + sample_x % TILE) as usize)
+                && let Some(destination) = output.get_mut((y * size + x) as usize)
             {
-                *d = *v;
+                *destination = *value;
             }
         }
     }
-    Some(out)
+    Some(output)
+}
+
+/// Mask values at texture-set coordinates, in request order; None without an enabled mask
+/// Uncovered and out-of-range texels read zero; neighbourhood filters also evaluate surrounding texels
+pub fn mask_at(inputs: &Inputs, id: LayerId, texels: &[(u32, u32)]) -> Option<Vec<f32>> {
+    let mask = layer_mask(inputs.project, id).filter(|mask| mask.enabled)?;
+    let mut output = vec![0.0; texels.len()];
+
+    // Group valid requests before planning effects, which may resample painted tiles
+    let mut requested: HashMap<(u32, u32), Vec<(usize, usize)>> = HashMap::new();
+    for (index, &(x, y)) in texels.iter().enumerate() {
+        if x >= inputs.gbuf.width || y >= inputs.gbuf.height {
+            continue;
+        }
+
+        let offset = ((y % TILE) * TILE + x % TILE) as usize;
+        requested.entry((x / TILE, y / TILE)).or_default().push((offset, index));
+    }
+
+    if requested.is_empty() {
+        return Some(output);
+    }
+
+    let channels = inputs.project.texture_set(inputs.ts).map(|set| set.channel_list()).unwrap_or_default();
+
+    // A hidden layer's mask is left out of the stack's preparation
+    prepare_mask_curvature_sizes(inputs, std::iter::once(mask));
+
+    // Filters and anchors can depend on texels outside the requested tiles
+    let fields = neighbourhood_fields(inputs, &channels, &all_tiles(inputs.gbuf.width, inputs.gbuf.height));
+    let values: Vec<(usize, f32)> = requested
+        .par_iter_mut()
+        .flat_map_iter(|(&tile, requests)| {
+            requests.sort_unstable_by_key(|&(offset, _)| offset);
+            let groups = requests.chunk_by(|left, right| left.0 == right.0);
+            let offsets = groups.clone().filter_map(|group| group.first().map(|&(offset, _)| offset));
+            mask_tile(inputs, id, mask, &channels, &fields, tile, offsets)
+                .zip(groups)
+                .flat_map(|((_, value), group)| group.iter().map(move |&(_, index)| (index, value)))
+        })
+        .collect();
+
+    for (index, value) in values {
+        if let Some(destination) = output.get_mut(index) {
+            *destination = value;
+        }
+    }
+    Some(output)
+}
+
+/// Mask values in offset order, including zeros for uncovered texels so request groups stay aligned
+fn mask_tile<'a>(
+    inputs: &'a Inputs<'a>,
+    id: LayerId,
+    mask: &'a Mask,
+    channels: &[Channel],
+    fields: &'a Fields,
+    (tile_x, tile_y): (u32, u32),
+    offsets: impl Iterator<Item = usize> + 'a,
+) -> impl Iterator<Item = (usize, f32)> + 'a {
+    let plan = mask_plan(inputs, id, mask, tile_x, tile_y, Some(fields));
+    let anchor_stack = anchor_plan(inputs, id, channels, tile_x, tile_y, Some(fields));
+    offsets.map(move |offset| {
+        let Some(plan) = plan.as_ref() else { return (offset, 0.0) };
+
+        let x = tile_x * TILE + (offset % TILE as usize) as u32;
+        let y = tile_y * TILE + (offset / TILE as usize) as u32;
+        if x >= inputs.gbuf.width || y >= inputs.gbuf.height || inputs.gbuf.tri.get((y * inputs.gbuf.width + x) as usize).is_none_or(|tri| *tri == NO_TRI) {
+            return (offset, 0.0);
+        }
+
+        let mut texel = Texel::new(inputs, x, y, offset, 0.0);
+        if !anchor_stack.is_empty() {
+            texel.anchors_below(&anchor_stack, id);
+        }
+        (offset, texel.mask(plan))
+    })
 }
 
 /// Tiles [`effect_histogram`] samples at most (a million texels).
@@ -1913,7 +2137,7 @@ pub fn effect_histogram(inp: &Inputs, effect: LayerId, channel: Channel, bins: u
             false
         }
     };
-    let cut_inp = Inputs { project: &cut, preview: None, ..*inp };
+    let cut_inp = Inputs { project: &cut, preview: None, block_scales: inp.block_scales.clone(), ..*inp };
     let channels = cut.texture_set(inp.ts).map(|t| t.channel_list()).unwrap_or_default();
     let tiles = histogram_tiles(inp.gbuf.width, inp.gbuf.height);
     // A field covers the bounding box of the tiles it is built for, which for a scattered sample
@@ -1990,7 +2214,7 @@ pub fn flatten_layer(inp: &Inputs, id: LayerId, tiles: &[(u32, u32)]) -> Option<
     if let Some(l) = solo.layers.get_mut(&id) {
         l.visible = true;
     }
-    let solo_inp = Inputs { project: &solo, preview: None, ..*inp };
+    let solo_inp = Inputs { project: &solo, preview: None, block_scales: inp.block_scales.clone(), ..*inp };
     let fields = neighbourhood_fields(&solo_inp, &channels, tiles);
     let out: Vec<Vec<FlatTile>> = tiles
         .par_iter()
@@ -2067,6 +2291,7 @@ mod tests {
             gbuf: &f.gbuf,
             pixels: &f.pixels,
             baked: &f.baked,
+            block_scales: f.project.texture_sets[0].block_scales(),
             preview,
             images: &images,
             bounds: f.mesh.bounds(),
@@ -2173,6 +2398,235 @@ mod tests {
         let out = run(&f, None);
         let vals: Vec<f32> = (0..64).map(|x| out.value(Channel::BaseColor, x, 20)[0]).collect();
         assert!(vals.iter().any(|v| *v > 0.99) && vals.iter().any(|v| *v < 0.51), "{vals:?}");
+    }
+
+    fn assert_sparse_mask_matches_image(fixture: &Fixture, layer: LayerId, texels: &[(u32, u32)]) -> Option<Vec<f32>> {
+        let images = ImageStore::default();
+        let inputs = Inputs {
+            project: &fixture.project,
+            ts: 0,
+            mesh: &fixture.mesh,
+            gbuf: &fixture.gbuf,
+            pixels: &fixture.pixels,
+            baked: &fixture.baked,
+            block_scales: fixture.project.texture_sets[0].block_scales(),
+            preview: None,
+            images: &images,
+            bounds: fixture.mesh.bounds(),
+        };
+        let sparse = mask_at(&inputs, layer, texels);
+        let image = mask_image(&inputs, layer, fixture.gbuf.width);
+        assert_eq!(sparse.is_some(), image.is_some());
+        let values = sparse?;
+        let image = image?;
+        assert_eq!(values.len(), texels.len());
+
+        for (&(x, y), &value) in texels.iter().zip(&values) {
+            let expected =
+                if x < fixture.gbuf.width && y < fixture.gbuf.height { f32::from(image[(y * fixture.gbuf.width + x) as usize]) / 255.0 } else { 0.0 };
+            assert!((value - expected).abs() <= 0.5 / 255.0 + 1e-6, "({x}, {y}): {value} vs {expected}");
+        }
+        Some(values)
+    }
+
+    #[test]
+    fn mask_at_reads_the_same_values_as_the_mask_image() {
+        let mut fixture = fixture();
+        fixture.gbuf = UvGBuffer::new(&fixture.mesh, 0, 128, 128);
+        fixture.project.texture_sets[0].resolution = 128;
+        fixture.gbuf.tri[30 * 128 + 90] = NO_TRI;
+        let layer = fill_layer(&mut fixture.project, [1.0; 3], 1.0);
+        let maskless = fill_layer(&mut fixture.project, [1.0; 3], 1.0);
+        let effect = fixture.project.alloc_id();
+        let mut mask = Mask::new(MaskBackground::Black);
+        let pattern = Procedural::new(ProceduralKind::Checker);
+        mask.effects.push(Effect::new(
+            effect,
+            EffectKind::Fill { source: Source::Procedural { pattern, low: [0.0; 3], high: [1.0; 3] }, projection: Projection::default() },
+        ));
+        fixture.project.layer_mut(layer).unwrap().mask = Some(mask);
+
+        // Cross tile boundaries and include duplicates, a UV hole and invalid coordinates
+        let texels = [(0, 0), (0, 40), (63, 63), (64, 64), (127, 127), (0, 40), (90, 30), (128, 0), (0, 128), (u32::MAX, u32::MAX)];
+        let values = assert_sparse_mask_matches_image(&fixture, layer, &texels).unwrap();
+        assert!(values.iter().any(|value| *value > 0.99) && values.iter().take(6).any(|value| *value < 0.01));
+        assert_eq!(&values[6..], &[0.0; 4]);
+        assert_eq!(assert_sparse_mask_matches_image(&fixture, layer, &[]), Some(Vec::new()));
+        assert!(assert_sparse_mask_matches_image(&fixture, maskless, &texels).is_none());
+        let missing = fixture.project.alloc_id();
+        assert!(assert_sparse_mask_matches_image(&fixture, missing, &texels).is_none());
+        fixture.project.layer_mut(layer).unwrap().mask.as_mut().unwrap().enabled = false;
+        assert!(assert_sparse_mask_matches_image(&fixture, layer, &texels).is_none());
+    }
+
+    #[test]
+    fn mask_at_ignores_out_of_range_texels_before_resampling_paint() {
+        let mut fixture = fixture();
+        let layer = fill_layer(&mut fixture.project, [1.0; 3], 1.0);
+        let paint = fixture.project.alloc_id();
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects.push(Effect::new(paint, EffectKind::Paint));
+        fixture.project.layer_mut(layer).unwrap().mask = Some(mask);
+        fixture.pixels.mask_mut(paint, (32, 32)).set(4, 5, &[u16::MAX; 2]);
+
+        let texels = [(8, 10), (u32::MAX, 0), (0, u32::MAX), (u32::MAX, u32::MAX), (64, 0), (0, 64)];
+        let values = assert_sparse_mask_matches_image(&fixture, layer, &texels).unwrap();
+        assert!(values[0] > 0.5, "valid texels still read resampled paint");
+        assert_eq!(&values[1..], &[0.0; 5]);
+        assert_eq!(assert_sparse_mask_matches_image(&fixture, layer, &texels[1..]), Some(vec![0.0; 5]));
+    }
+
+    #[test]
+    fn mask_at_preserves_anchors_and_neighbourhood_filters_across_tiles() {
+        let mut fixture = fixture();
+        fixture.gbuf = UvGBuffer::new(&fixture.mesh, 0, 128, 128);
+        fixture.project.texture_sets[0].resolution = 128;
+        let lower = fill_layer(&mut fixture.project, [0.0; 3], 1.0);
+        let LayerKind::Fill(fill) = &mut fixture.project.layer_mut(lower).unwrap().kind else { panic!("expected a fill layer") };
+
+        fill.sources.insert(Channel::BaseColor, Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: [0.0; 3], high: [1.0; 3] });
+        let anchor = content_fx(&mut fixture, lower, EffectKind::Anchor);
+        let upper = fill_layer(&mut fixture.project, [1.0; 3], 1.0);
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects.push(Effect::new(
+            fixture.project.alloc_id(),
+            EffectKind::Fill { source: Source::Anchor { anchor, channel: Channel::BaseColor }, projection: Projection::default() },
+        ));
+        fixture.project.layer_mut(upper).unwrap().mask = Some(mask.clone());
+        let texels: Vec<_> = (0..128).map(|x| (x, 63)).collect();
+        let original = assert_sparse_mask_matches_image(&fixture, upper, &texels).unwrap();
+        assert!(original.iter().any(|value| *value > 0.99) && original.iter().any(|value| *value < 0.01), "the anchor supplies the checker");
+
+        for filter in [Filter::Blur { radius: 64.0 }, Filter::DirectionalWarp { intensity: 256.0, angle: 90.0, scale: 4.0, seed: 3 }] {
+            let mut filtered = mask.clone();
+            filtered.effects.push(Effect::new(fixture.project.alloc_id(), EffectKind::Filter(filter)));
+            fixture.project.layer_mut(upper).unwrap().mask = Some(filtered);
+            let values = assert_sparse_mask_matches_image(&fixture, upper, &texels).unwrap();
+            assert!(values.iter().zip(&original).any(|(value, original)| (value - original).abs() > 0.1), "the filter changes the anchor values");
+        }
+    }
+
+    #[test]
+    fn a_mask_runs_every_neighbourhood_filter_in_order() {
+        let mut fixture = fixture();
+        fixture.gbuf = UvGBuffer::new(&fixture.mesh, 0, 128, 128);
+        fixture.project.texture_sets[0].resolution = 128;
+        let layer = fill_layer(&mut fixture.project, [1.0; 3], 1.0);
+        let checker = Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: [0.0; 3], high: [1.0; 3] };
+        let warp = Filter::DirectionalWarp { intensity: 256.0, angle: 90.0, scale: 4.0, seed: 3 };
+        let texels: Vec<_> = (0..128).map(|x| (x, 63)).collect();
+        let mut masked = |filters: &[Filter]| {
+            let mut mask = Mask::new(MaskBackground::Black);
+            mask.effects.push(Effect::new(fixture.project.alloc_id(), EffectKind::Fill { source: checker.clone(), projection: Projection::default() }));
+            for filter in filters {
+                mask.effects.push(Effect::new(fixture.project.alloc_id(), EffectKind::Filter(filter.clone())));
+            }
+            fixture.project.layer_mut(layer).unwrap().mask = Some(mask);
+            assert_sparse_mask_matches_image(&fixture, layer, &texels).unwrap()
+        };
+
+        let warped = masked(std::slice::from_ref(&warp));
+        let blurred_then_warped = masked(&[Filter::Blur { radius: 64.0 }, warp]);
+        assert!(blurred_then_warped.iter().zip(&warped).any(|(chained, single)| (chained - single).abs() > 0.1), "the blur under the warp still runs");
+        assert!(blurred_then_warped.iter().any(|value| *value > 0.05 && *value < 0.95), "the blur softens the checker before the warp moves it");
+    }
+
+    #[test]
+    fn a_content_stack_runs_every_neighbourhood_filter_in_order() {
+        let mut fixture = fixture();
+        let layer = fill_layer(&mut fixture.project, [0.0; 3], 1.0);
+        let LayerKind::Fill(fill) = &mut fixture.project.layer_mut(layer).unwrap().kind else { panic!("expected a fill layer") };
+
+        fill.sources.insert(Channel::BaseColor, Source::Procedural { pattern: Procedural::new(ProceduralKind::Checker), low: [0.0; 3], high: [1.0; 3] });
+        let warp = Filter::DirectionalWarp { intensity: 256.0, angle: 90.0, scale: 4.0, seed: 3 };
+        let warp_effect = content_fx(&mut fixture, layer, EffectKind::Filter(warp));
+        let row = |fixture: &Fixture| -> Vec<f32> {
+            let composite = run(fixture, None);
+            (0..64).map(|x| composite.value(Channel::BaseColor, x, 20)[0]).collect()
+        };
+        let warped = row(&fixture);
+
+        content_fx(&mut fixture, layer, EffectKind::Filter(Filter::Blur { radius: 64.0 }));
+        let effects = &mut fixture.project.layer_mut(layer).unwrap().content_effects;
+        let warp_index = effects.iter().position(|effect| effect.id == warp_effect).unwrap();
+        let warp_on_top = effects.remove(warp_index);
+        effects.push(warp_on_top);
+        let blurred_then_warped = row(&fixture);
+        assert!(blurred_then_warped.iter().zip(&warped).any(|(chained, single)| (chained - single).abs() > 0.1), "the blur under the warp still runs");
+    }
+
+    #[test]
+    fn larger_curvature_detail_sizes_reach_further_from_an_edge() {
+        let mut fixture = fixture();
+        fixture.gbuf = UvGBuffer::new(&fixture.mesh, 0, 256, 256);
+        fixture.project.texture_sets[0].resolution = 256;
+        let ridge: Vec<f32> = (0..256 * 256).map(|texel| if texel % 256 == 128 { 1.0 } else { 0.5 }).collect();
+        fixture.baked = BakedMaps { resolution: 256, maps: [(BakedMap::Curvature, Arc::new(ridge))].into() };
+        let layer = fill_layer(&mut fixture.project, [1.0; 3], 1.0);
+        let row_with = |fixture: &mut Fixture, weights: [f32; 7]| -> Vec<f32> {
+            let detail = CurvatureDetail { mode: CurvatureMode::Edges, weights };
+            let generator = Generator { level: 0.5, softness: 0.5, noise_amount: 0.0, detail: Some(detail), ..Generator::new(GeneratorKind::Curvature) };
+            let mut mask = Mask::new(MaskBackground::Black);
+            mask.effects.push(Effect::new(fixture.project.alloc_id(), EffectKind::Generator(generator)));
+            fixture.project.layer_mut(layer).unwrap().mask = Some(mask);
+            let images = Default::default();
+            let inputs = Inputs {
+                project: &fixture.project,
+                ts: 0,
+                mesh: &fixture.mesh,
+                gbuf: &fixture.gbuf,
+                pixels: &fixture.pixels,
+                baked: &fixture.baked,
+                block_scales: BlockScales::default(),
+                preview: None,
+                images: &images,
+                bounds: fixture.mesh.bounds(),
+            };
+            mask_at(&inputs, layer, &(120..137).map(|x| (x, 128)).collect::<Vec<_>>()).unwrap()
+        };
+
+        // The row starts at x 120: the ridge is its ninth texel, five texels left of it the fourth
+        let (ridge, five_texels_away) = (8, 3);
+        let finest = row_with(&mut fixture, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let largest = row_with(&mut fixture, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+        assert!(finest[ridge] > 0.99 && finest[five_texels_away] < 0.01, "the map itself marks only the ridge: {finest:?}");
+        assert!(largest[ridge] > 0.99 && largest[five_texels_away] > 0.5, "the largest size reaches texels away from it: {largest:?}");
+    }
+
+    #[test]
+    fn curvature_detail_noise_keeps_flat_areas_neutral() {
+        let mut fixture = fixture();
+        fixture.baked = BakedMaps { resolution: 64, maps: [(BakedMap::Curvature, Arc::new(vec![0.5; 64 * 64]))].into() };
+        let layer = fill_layer(&mut fixture.project, [1.0; 3], 1.0);
+        let texels: Vec<_> = (0..64).map(|x| (x, 32)).collect();
+
+        for kind in [GeneratorKind::Curvature, GeneratorKind::EdgeWear] {
+            for mode in CurvatureMode::ALL {
+                let detail = CurvatureDetail { mode, weights: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] };
+                let generator = Generator { level: 0.5, softness: 0.5, noise_amount: 2.0, detail: Some(detail), ..Generator::new(kind) };
+                let mut mask = Mask::new(MaskBackground::Black);
+                mask.effects.push(Effect::new(fixture.project.alloc_id(), EffectKind::Generator(generator)));
+                fixture.project.layer_mut(layer).unwrap().mask = Some(mask);
+
+                let values = assert_sparse_mask_matches_image(&fixture, layer, &texels).unwrap();
+                let expected = if mode == CurvatureMode::Raw { 0.5 } else { 0.0 };
+                assert!(values.iter().all(|value| (value - expected).abs() < 0.001), "{kind:?} {mode:?} paints noise on flat curvature: {values:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn raw_curvature_reads_mid_gray_without_a_curvature_map() {
+        let mut fixture = fixture();
+        let layer = fill_layer(&mut fixture.project, [1.0; 3], 1.0);
+        let detail = CurvatureDetail { mode: CurvatureMode::Raw, ..CurvatureDetail::default() };
+        let generator = Generator { level: 0.5, softness: 0.5, noise_amount: 0.0, detail: Some(detail), ..Generator::new(GeneratorKind::Curvature) };
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects.push(Effect::new(fixture.project.alloc_id(), EffectKind::Generator(generator)));
+        fixture.project.layer_mut(layer).unwrap().mask = Some(mask);
+
+        let values = assert_sparse_mask_matches_image(&fixture, layer, &[(32, 32)]).unwrap();
+        assert!(values.iter().all(|value| (value - 0.5).abs() < 0.01), "flat curvature is mid gray in raw mode, not black: {values:?}");
     }
 
     #[test]
@@ -2433,6 +2887,7 @@ soft {soft:?}"
             gbuf: &f.gbuf,
             pixels: &f.pixels,
             baked: &f.baked,
+            block_scales: f.project.texture_sets[0].block_scales(),
             preview: None,
             images: &images,
             bounds: f.mesh.bounds(),
@@ -2494,6 +2949,7 @@ soft {soft:?}"
                 gbuf: &f.gbuf,
                 pixels: &f.pixels,
                 baked: &f.baked,
+                block_scales: f.project.texture_sets[0].block_scales(),
                 preview: None,
                 images: &images,
                 bounds: f.mesh.bounds(),

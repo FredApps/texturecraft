@@ -24,6 +24,8 @@ struct Globals {
     fwd: vec4<f32>,      // xyz camera view direction (unit), w -
     disp: vec4<f32>,     // x displacement on (1), y world units per unit of height at strength 1, z vertex spacing in UV units, w -
     refr: vec4<f32>,     // x screen-space refraction on (1), y lods of the scene behind, z refraction depth (world units), w -
+    highlight: vec4<f32>, // rgb highlighted set's edge color in the scene (before exposure and tone mapping), a opacity
+    highlight_shift: vec4<f32>, // xy sideways shift of each highlight line copy (clip units), zw -
 };
 
 @group(0) @binding(0) var<uniform> g: Globals;
@@ -659,8 +661,7 @@ fn fs_wire(i: VOut) -> @location(0) vec4<f32> {
 
 // 3D wireframe over the shaded mesh: depth-tested, pulled slightly toward the camera so the
 // lines win against their own triangles.
-@vertex
-fn vs_wire3d(v: VIn) -> VOut {
+fn wire3d(v: VIn) -> VOut {
     var o: VOut;
     o.wpos = v.pos;
     o.nrm = v.nrm;
@@ -671,7 +672,26 @@ fn vs_wire3d(v: VIn) -> VOut {
     return o;
 }
 
+@vertex
+fn vs_wire3d(v: VIn) -> VOut {
+    return wire3d(v);
+}
+
 @fragment
 fn fs_wire3d(i: VOut) -> @location(0) vec4<f32> {
     return vec4<f32>(0.35, 0.35, 0.35, 0.45);
+}
+
+// The highlighted set's edges: four copies of each line, shifted to the corners of the extra width, make it wider than one pixel
+@vertex
+fn vs_wire_highlight(v: VIn, @builtin(instance_index) copy: u32) -> VOut {
+    var o = wire3d(v);
+    let corner = vec2<f32>(f32(copy & 1u), f32((copy >> 1u) & 1u)) * 2.0 - 1.0;
+    o.clip = vec4<f32>(o.clip.xy + corner * g.highlight_shift.xy * o.clip.w, o.clip.zw);
+    return o;
+}
+
+@fragment
+fn fs_wire_highlight(i: VOut) -> @location(0) vec4<f32> {
+    return g.highlight;
 }

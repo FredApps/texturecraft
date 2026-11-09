@@ -48,20 +48,24 @@ fn paint_red_at(s: &mut Session, p: Vec3) {
 
 #[test]
 fn uv_tiles_are_detected_and_inspected() {
-    let mut s = session();
-    let set = execute(&mut s, "textureSet.inspect", &Value::Null).unwrap();
+    let mut session = session();
+    let set = execute(&mut session, "textureSet.inspect", &Value::Null).unwrap();
     assert_eq!(set["uvTiles"], json!([1001, 1002]));
     assert_eq!(set["size"], json!([2 * RES, RES]));
-    assert_eq!(set["tiles"], json!([{ "udim": 1001, "block": [0, 0], "resolution": RES }, { "udim": 1002, "block": [1, 0], "resolution": RES }]));
-    assert_eq!(s.caches[0].size, (2 * RES, RES));
-    // Explicit modes: classic on the UDIM plane, one tile on a 0..1 mesh.
-    execute(&mut s, "project.new", &json!({"mesh": "udim_plane", "resolution": RES, "uvTiles": false})).unwrap();
-    assert!(s.doc.project.texture_sets[0].uv_tiles.is_empty());
-    execute(&mut s, "project.new", &json!({"mesh": "plane", "resolution": RES})).unwrap();
-    assert!(s.doc.project.texture_sets[0].uv_tiles.is_empty(), "UVs in 0..1 stay classic");
-    execute(&mut s, "project.new", &json!({"mesh": "plane", "resolution": RES, "uvTiles": true})).unwrap();
-    assert_eq!(s.doc.project.texture_sets[0].uv_tiles, vec![1001]);
-    assert_eq!(s.caches[0].size, (RES, RES));
+    assert_eq!(
+        set["tiles"],
+        json!([{ "udim": 1001, "block": [0, 0], "resolution": RES, "bakeEnabled": true }, { "udim": 1002, "block": [1, 0], "resolution": RES, "bakeEnabled": true }])
+    );
+    assert_eq!(session.caches[0].size, (2 * RES, RES));
+
+    // Explicit modes: classic on the UDIM plane, one tile on a 0..1 mesh
+    execute(&mut session, "project.new", &json!({"mesh": "udim_plane", "resolution": RES, "uvTiles": false})).unwrap();
+    assert!(session.doc.project.texture_sets[0].uv_tiles.is_empty());
+    execute(&mut session, "project.new", &json!({"mesh": "plane", "resolution": RES})).unwrap();
+    assert!(session.doc.project.texture_sets[0].uv_tiles.is_empty(), "UVs in 0..1 stay classic");
+    execute(&mut session, "project.new", &json!({"mesh": "plane", "resolution": RES, "uvTiles": true})).unwrap();
+    assert_eq!(session.doc.project.texture_sets[0].uv_tiles, vec![1001]);
+    assert_eq!(session.caches[0].size, (RES, RES));
 }
 
 #[test]

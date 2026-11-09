@@ -2,13 +2,14 @@
 //! texture-painting workflow, with stable ids; an item is live when the engine (or the shell, for `ui.*` ids) implements
 //! its id. The same catalog drives `docs/parity.md`.
 
-use egui::{Key, KeyboardShortcut, Modifiers};
+use egui::{Key, Modifiers};
 use serde_json::{Value, json};
 
 use crate::TextureCraftApp;
 use crate::i18n::tr;
 use crate::state::{Mode, ViewLayout};
 use crate::theme::Tokens;
+use crate::toolbar::{MAX_BRUSH_SIZE, MIN_BRUSH_SIZE};
 
 /// One menu entry. `label == "-"` is a separator; `sub` names a submenu group.
 #[derive(Clone, Copy, Debug)]
@@ -61,12 +62,13 @@ pub const CATALOG: &[Item] = &[
     it("Mode", "Painting", "ui.mode.paint", Some("F9")),
     it("Mode", "Rendering (path traced)", "ui.mode.render", Some("F10")),
     sub("Window", "Views", "Assets", "ui.view.assets", None),
-    sub("Window", "Views", "Bake Maps", "ui.view.bakeMaps", None),
-    sub("Window", "Views", "Settings", "ui.view.bakeSettings", None),
+    sub("Window", "Views", "Common Settings", "ui.view.bakeSettings", None),
     sub("Window", "Views", "Display Settings", "ui.view.display", None),
     sub("Window", "Views", "History", "ui.view.history", None),
     sub("Window", "Views", "Layers", "ui.view.layers", None),
     sub("Window", "Views", "Log", "ui.view.log", None),
+    sub("Window", "Views", "Mesh Map Bakers", "ui.view.meshMapBakers", None),
+    sub("Window", "Views", "Mesh Map Settings", "ui.view.bakeMaps", None),
     sub("Window", "Views", "Properties", "ui.view.properties", None),
     sub("Window", "Views", "Shader Settings", "ui.view.shader", None),
     sub("Window", "Views", "Texture Sets", "ui.view.textureSetList", None),
@@ -98,6 +100,8 @@ pub const CATALOG: &[Item] = &[
     it("Help", "Report a bug...", "ui.help.bug", None),
     sep("Help"),
     it("Help", "Show log...", "ui.view.log", None),
+    #[cfg(not(target_arch = "wasm32"))]
+    it("Help", "Check for Updates...", "ui.help.checkForUpdates", None),
     it("Help", "About TextureCraft...", "ui.about", None),
 ];
 
@@ -163,6 +167,8 @@ pub fn invoke(app: &mut TextureCraftApp, ctx: &egui::Context, id: &str) {
         "ui.layout.2d" => app.ui.layout = ViewLayout::Only2D,
         "ui.help.shortcuts" => app.ui.windows.shortcuts = true,
         "ui.about" => app.ui.windows.about = true,
+        #[cfg(not(target_arch = "wasm32"))]
+        "ui.help.checkForUpdates" => crate::updates_ui::request_check(app, ctx),
         "ui.help.discord" => ctx.open_url(egui::OpenUrl::new_tab("https://discord.gg/artcraft")),
         "ui.help.website" => ctx.open_url(egui::OpenUrl::new_tab("https://getartcraft.com/apps/texturecraft")),
         "ui.help.docs" => ctx.open_url(egui::OpenUrl::new_tab("https://github.com/storytold/texturecraft#readme")),
@@ -174,21 +180,6 @@ pub fn invoke(app: &mut TextureCraftApp, ctx: &egui::Context, id: &str) {
             app.run(id, Value::Null);
         }
     }
-}
-
-/// Parse "Ctrl+Shift+E" style shortcuts.
-pub fn parse_shortcut(s: &str) -> Option<KeyboardShortcut> {
-    let mut mods = Modifiers::NONE;
-    let mut key = None;
-    for part in s.split('+') {
-        match part {
-            "Ctrl" | "Cmd" => mods |= Modifiers::COMMAND,
-            "Shift" => mods |= Modifiers::SHIFT,
-            "Alt" => mods |= Modifiers::ALT,
-            k => key = Key::from_name(k),
-        }
-    }
-    key.map(|k| KeyboardShortcut::new(mods, k))
 }
 
 /// The menus, then the mode label at the right of `ui` (the strip `titlebar::show` lays out).
@@ -277,16 +268,33 @@ fn menu_item(app: &mut TextureCraftApp, ctx: &egui::Context, ui: &mut egui::Ui, 
 /// Keys pressed in a floating panel's own OS window run the shortcuts the main window's keys do.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn forwarded_shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context, events: Vec<egui::Event>, held: Modifiers) {
-    if crate::keymap::capturing(ctx) {
+    if crate::keymap::capturing(ctx) || crate::updates_ui::blocks_input(app) {
         return;
     }
-    let active = crate::keymap::active(&app.ui.keymap);
+    app.bindings.sync(&app.ui.keymap, craft_keymap::egui::platform(ctx));
     for event in events {
-        let event = clipboard_key(&event, held).unwrap_or(event);
-        let egui::Event::Key { key, pressed: true, repeat: false, modifiers, .. } = event else { continue };
-        let Some((id, _)) = active.iter().find(|(_, sc)| sc.logical_key == key && modifiers.matches_logically(sc.modifiers)) else { continue };
-        invoke(app, ctx, effect_command(app, id));
+        let event = forwarded_press(&app.bindings, event, held);
+        if !matches!(event, egui::Event::Key { pressed: true, repeat: false, .. }) {
+            continue;
+        }
+        let Some(id) = app.bindings.command_of(&event) else { continue };
+        invoke(app, ctx, effect_command(app, &id));
     }
+}
+
+/// The press a floating panel's event stands for. Cut and Paste with Shift alone are Shift+Delete
+/// and Shift+Insert when something is bound to them, and clipboard shortcuts otherwise.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn forwarded_press(bindings: &crate::keymap::Bindings, event: egui::Event, held: Modifiers) -> egui::Event {
+    let shift_key = match event {
+        egui::Event::Cut => Some(Key::Delete),
+        egui::Event::Paste(_) => Some(Key::Insert),
+        _ => None,
+    };
+    if let Some(key) = shift_key.filter(|_| shift_only(held) && !bindings.shift_clipboard_is_free(&event)) {
+        return egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: held };
+    }
+    clipboard_key(&event, held).unwrap_or(event)
 }
 
 /// Layer shortcuts act on the selected effect instead of its layer (copy, cut, duplicate,
@@ -303,45 +311,66 @@ fn effect_command<'a>(app: &TextureCraftApp, id: &'a str) -> &'a str {
     }
 }
 
+/// Runs the commands bound to the keys pressed this frame, outside text fields and key capture
 pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
-    if crate::keymap::capturing(ctx) || (ctx.memory(|m| m.focused().is_some()) && ctx.egui_wants_keyboard_input()) {
+    if crate::keymap::capturing(ctx) || (ctx.memory(|memory| memory.focused().is_some()) && ctx.egui_wants_keyboard_input()) {
+        return;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if crate::updates_ui::blocks_input(app) {
         return;
     }
 
+    // The dispatcher reads Copy, Cut and Paste as their chords. A pasted image is Ctrl+V here, and
+    // Shift+Delete and Shift+Insert (Cut and Paste on Windows) are Ctrl+X and Ctrl+V unless
+    // something is bound to them.
     ctx.input_mut(|input| {
-        let keys: Vec<_> = input.events.iter().filter_map(|event| clipboard_key(event, input.modifiers)).collect();
-        input.events.extend(keys);
+        let held = input.modifiers;
+        let aliases: Vec<_> = input
+            .events
+            .iter()
+            .filter(|event| matches!(event, egui::Event::PasteImage(_)) || (shift_only(held) && app.bindings.shift_clipboard_is_free(event)))
+            .filter_map(|event| clipboard_key(event, held))
+            .collect();
+        input.events.extend(aliases);
     });
 
-    if !ctx.input(|input| input.events.iter().any(|event| matches!(event, egui::Event::Key { pressed: true, .. }))) {
-        return;
-    }
+    // Escape closes an open popup first, before the Properties popup or the stroke
+    let popup_open = egui::Popup::is_any_open(ctx);
 
-    let active_shortcuts = crate::keymap::active(&app.ui.keymap);
-    let mut commands_to_invoke: Vec<&str> = Vec::new();
-    ctx.input_mut(|input| {
-        for (id, shortcut) in &active_shortcuts {
-            if input.consume_shortcut(shortcut) {
-                commands_to_invoke.push(*id);
+    let commands_to_invoke = ctx.input_mut(|input| {
+        // egui's label selection copies on these events at the end of the frame
+        let copies: Vec<_> = input.events.iter().filter(|event| matches!(event, egui::Event::Copy | egui::Event::Cut)).cloned().collect();
+        let commands = app.bindings.dispatch(input);
+        for copy in copies {
+            if !input.events.contains(&copy) {
+                input.events.push(copy);
             }
         }
 
+        // [ and ] shrink and grow the brush by this factor per press
+        const BRACKET_SIZE_STEP: f32 = 1.15;
         let size_down = input.consume_key(Modifiers::NONE, Key::OpenBracket);
         let size_up = input.consume_key(Modifiers::NONE, Key::CloseBracket);
         if app.ui.mode == Mode::Painting && (size_down || size_up) {
-            let scale = if size_up { 1.15 } else { 1.0 / 1.15 };
-            app.session.tool.brush.size = (app.session.tool.brush.size * scale).clamp(0.0005, 0.25);
+            let scale = if size_up { BRACKET_SIZE_STEP } else { 1.0 / BRACKET_SIZE_STEP };
+            app.session.tool.brush.size = (app.session.tool.brush.size * scale).clamp(MIN_BRUSH_SIZE, MAX_BRUSH_SIZE);
         }
 
-        if app.ui.mode == Mode::Painting && input.consume_key(Modifiers::NONE, Key::Escape) {
+        if !popup_open && app.properties_popup.is_some() && input.consume_key(Modifiers::NONE, Key::Escape) {
+            app.properties_popup = None;
+        } else if !popup_open && app.picking_id_color.is_some() && input.consume_key(Modifiers::NONE, Key::Escape) {
+            crate::id_color_pick::IdColorPick::end(app);
+        } else if app.ui.mode == Mode::Painting && !popup_open && input.consume_key(Modifiers::NONE, Key::Escape) {
             app.session.cancel_stroke();
             app.session.tool.path.points.clear();
             app.session.tool.path.editing = None;
         }
+        commands
     });
 
-    for id in commands_to_invoke {
-        if matches!(id, "layer.copy" | "layer.cut")
+    for id in &commands_to_invoke {
+        if matches!(id.as_str(), "layer.copy" | "layer.cut")
             && let Some(layer) = app.session.selected_layer().and_then(|layer| app.session.doc.project.layers.get(&layer))
         {
             // Ctrl+V reaches the app only while the system clipboard holds text or an image
@@ -361,5 +390,11 @@ fn clipboard_key(event: &egui::Event, held: Modifiers) -> Option<egui::Event> {
         egui::Event::Paste(_) | egui::Event::PasteImage(_) => Key::V,
         _ => return None,
     };
-    Some(egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: held | Modifiers::COMMAND })
+    let modifiers = if shift_only(held) { Modifiers::COMMAND } else { held | Modifiers::COMMAND };
+    Some(egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers })
+}
+
+/// Shift alone is held: a clipboard event that came from Shift+Delete or Shift+Insert.
+fn shift_only(held: Modifiers) -> bool {
+    held.shift && !(held.command || held.ctrl || held.mac_cmd || held.alt)
 }

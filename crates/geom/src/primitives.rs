@@ -63,9 +63,17 @@ impl Builder {
         }
     }
 
+    /// The mesh of one material, with tangents.
     fn finish(self, material: &str) -> Mesh {
+        let mut m = self.into_mesh(material);
+        m.compute_tangents();
+        m
+    }
+
+    /// The mesh of one material, without tangents.
+    fn into_mesh(self, material: &str) -> Mesh {
         let count = self.idx.len() as u32;
-        let mut m = Mesh {
+        Mesh {
             positions: self.p,
             normals: self.n,
             uvs: self.uv,
@@ -75,9 +83,7 @@ impl Builder {
             submeshes: vec![SubMesh { name: material.into(), material: 0, start: 0, count }],
             materials: vec![material.into()],
             diagonals: self.diag,
-        };
-        m.compute_tangents();
-        m
+        }
     }
 }
 
@@ -187,6 +193,132 @@ fn lathe_into(b: &mut Builder, center: Vec3, profile: &[(f32, f32)], segs: usize
         let n = dir * n2.x + Vec3::Y * n2.y;
         (p, n, r.map(u, len[i] / total))
     });
+}
+
+/// [`preview_orb`]: half-size of the cube that cuts the unit sphere flat (each face rim is the
+/// circle where they meet).
+const ORB_CUT: f32 = 0.8;
+/// [`preview_orb`] domed panels: where the valley sits, as a fraction of the face rim radius.
+const ORB_PANEL_VALLEY: f32 = 0.88;
+
+/// The preview orb of the smart mask and smart material previews: a sphere cut flat by a cube on six sides, on a thin round base
+/// Each feature gives one kind of mask something to show: sharp face rims (edges), a softly
+/// blended left face (soft edges), domed panels inside the front, left and top faces whose valleys
+/// hold dirt (cavities), a slot around the middle (cavity), the base (thin part, the seam where it
+/// meets the body) and plain rounded corners (gradients). Faces +Z (front), -X (left) and +Y (top)
+/// carry the panels, so the shape is made to be seen from the front left, slightly from above.
+/// The body takes the top 79 % of the UV square, the base the bottom 19 %.
+pub fn preview_orb() -> Mesh {
+    // Grid rows (columns: twice as many); fewer blur the panel walls, more cost bake time
+    const ROWS: usize = 300;
+    const BODY_UV_HEIGHT: f32 = 0.79;
+    const BASE_UV: UvRect = UvRect { o: Vec2::new(0.0, 0.81), s: Vec2::new(1.0, 0.19) };
+    const BASE_RADIUS: f32 = 0.95;
+    const BASE_HALF_HEIGHT: f32 = 0.025;
+    const BASE_Y: f32 = -0.6;
+    const BASE_RIM_STEPS: usize = 12;
+    const BASE_SEGMENTS: usize = 256;
+
+    let mut b = Builder::default();
+    b.grid(ROWS, ROWS * 2, |i, j| {
+        let (u, v) = (j as f32 / (ROWS * 2) as f32, i as f32 / ROWS as f32);
+        let (theta, phi) = (v * PI, u * TAU + PI * 1.5);
+        let dir = Vec3::new(theta.sin() * phi.cos(), theta.cos(), -theta.sin() * phi.sin());
+        (dir * preview_orb_radius(dir), dir, Vec2::new(u, v * BODY_UV_HEIGHT))
+    });
+
+    // Base: a thin disc with a rounded rim (a half circle from its top face to its bottom face)
+    let mut profile = vec![(0.0, BASE_HALF_HEIGHT)];
+    for k in 0..=BASE_RIM_STEPS {
+        let a = k as f32 / BASE_RIM_STEPS as f32 * PI;
+        profile.push((BASE_RADIUS - BASE_HALF_HEIGHT + BASE_HALF_HEIGHT * a.sin(), BASE_HALF_HEIGHT * a.cos()));
+    }
+    profile.push((0.0, -BASE_HALF_HEIGHT));
+    lathe_into(&mut b, Vec3::Y * BASE_Y, &profile, BASE_SEGMENTS, BASE_UV);
+
+    let mut m = b.into_mesh("Preview");
+    // Normals from the triangles: the panel walls are too steep for the sphere's directions
+    m.compute_normals();
+    // Body and base both run U around the vertical axis, so the tangent is that direction (a
+    // fraction of the cost of the general tangent pass on this many triangles)
+    m.tangents = m
+        .positions
+        .iter()
+        .zip(&m.normals)
+        .map(|(p, n)| {
+            let around = Vec3::new(p.z, 0.0, -p.x).try_normalize().unwrap_or(Vec3::X);
+            (around - *n * n.dot(around)).try_normalize().unwrap_or_else(|| n.any_orthonormal_vector()).extend(1.0)
+        })
+        .collect();
+    m
+}
+
+/// Distance from the centre of the [`preview_orb`] body along unit direction `d`.
+fn preview_orb_radius(d: Vec3) -> f32 {
+    // Rim blends: the sharp faces, and the softly blended left face
+    const SHARP_BLEND: f32 = 0.035;
+    const SOFT_BLEND: f32 = 0.18;
+    // Domed panels: valley depth below the face, dome rise past it; the left panel is smaller
+    const PANEL_DEPTH: f32 = 0.11;
+    const PANEL_BULGE: f32 = 0.04;
+    const LEFT_PANEL_SCALE: f32 = 0.9;
+    // Slot around the middle: centre height, half-width, edge rounding, depth; it fades out over
+    // this fraction of the left panel's rim
+    const SLOT_Y: f32 = -0.03;
+    const SLOT_HALF_WIDTH: f32 = 0.05;
+    const SLOT_ROUNDING: f32 = 0.015;
+    const SLOT_DEPTH: f32 = 0.12;
+    const SLOT_FADE: f32 = 0.04;
+
+    let rim = (1.0 - ORB_CUT * ORB_CUT).sqrt() / ORB_CUT;
+    let smooth = |a: f32, b: f32, x: f32| {
+        let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
+    // Polynomial smooth minimum with blend radius k
+    let smin = |a: f32, b: f32, k: f32| {
+        let h = (0.5 + 0.5 * (b - a) / k).clamp(0.0, 1.0);
+        b + (a - b) * h - k * h * (1.0 - h)
+    };
+    // Domed panel at `rho` (radius in face units) inside a face of rim `rim`: a steep wall from
+    // the rim into a valley, then a dome rising slightly past the face over the middle
+    let panel = |rho: f32, rim: f32| {
+        let valley = rim * ORB_PANEL_VALLEY;
+        if rho < valley {
+            PANEL_BULGE - (PANEL_BULGE + PANEL_DEPTH) * (rho / valley).powi(3)
+        } else {
+            -PANEL_DEPTH * (1.0 - ((rho - valley) / (rim - valley)).min(1.0))
+        }
+    };
+    let face_rho = |along: f32, u: f32, v: f32| (u * u + v * v).sqrt() / along.max(1e-3);
+
+    // The cut: sharp rims except the softly blended left face
+    let mut radius = 1.0f32;
+    for (along, blend) in [(d.x, SHARP_BLEND), (-d.x, SOFT_BLEND), (d.y, SHARP_BLEND), (-d.y, SHARP_BLEND), (d.z, SHARP_BLEND), (-d.z, SHARP_BLEND)] {
+        // Directions facing away from a face stay on the sphere (9 = far past it)
+        let to_face = if along > 1e-3 { ORB_CUT / along } else { 9.0 };
+        radius = smin(radius, to_face, blend);
+    }
+
+    let a = d.abs();
+    let left_rim = rim * LEFT_PANEL_SCALE;
+    let mut relief = 0.0;
+    if d.z > 0.0 && a.z >= a.x && a.z >= a.y {
+        relief += panel(face_rho(d.z, d.x, d.y), rim);
+    }
+    if d.x < 0.0 && a.x >= a.y && a.x >= a.z {
+        relief += panel(face_rho(-d.x, d.y, d.z), left_rim);
+    }
+    if d.y > 0.0 && a.y >= a.x && a.y >= a.z {
+        relief += panel(face_rho(d.y, d.x, d.z), rim);
+    }
+
+    // Slot around the middle, stopping at the left panel
+    let in_left_panel = if d.x < 0.0 { 1.0 - smooth(left_rim * (1.0 - SLOT_FADE), left_rim * (1.0 + SLOT_FADE), face_rho(-d.x, d.y, d.z)) } else { 0.0 };
+    let slot_band = 1.0 - smooth(SLOT_HALF_WIDTH - SLOT_ROUNDING, SLOT_HALF_WIDTH + SLOT_ROUNDING, (d.y - SLOT_Y).abs());
+    relief -= SLOT_DEPTH * slot_band * (1.0 - in_left_panel);
+
+    radius + relief
 }
 
 /// A flat disk facing up (+Y) or down, with planar UVs inside `r`.
@@ -340,6 +472,8 @@ pub fn builtin(id: &str) -> Option<Mesh> {
         "plane" => plane(2.0, 16),
         "crate" => crate_scene(),
         "udim_plane" | "udimplane" => udim_plane(),
+        // Not offered for new projects (not in BUILTINS): the smart mask preview session's mesh
+        "preview_orb" => preview_orb(),
         _ => return None,
     })
 }
@@ -394,6 +528,22 @@ mod tests {
         }
         assert!(builtin("nope").is_none());
         assert_eq!(udim_plane().uv_tiles(0).into_iter().collect::<Vec<_>>(), vec![(0, 0), (1, 0)]);
+    }
+
+    #[test]
+    fn preview_orb_is_well_formed_with_domed_panels() {
+        let m = preview_orb();
+        check(&m, 1.0);
+
+        // Above the middle slot, the front panel's dome rises past the cut face and its valley
+        // sits below it
+        let front_depth = |rho: f32| {
+            let d = Vec3::new(0.0, rho, 1.0).normalize();
+            preview_orb_radius(d) * d.z
+        };
+        let rim = (1.0 - ORB_CUT * ORB_CUT).sqrt() / ORB_CUT;
+        let (dome, valley) = (front_depth(0.2), front_depth(rim * ORB_PANEL_VALLEY));
+        assert!(dome > ORB_CUT && valley < ORB_CUT - 0.05, "dome {dome}, valley {valley}");
     }
 
     #[test]

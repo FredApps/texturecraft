@@ -3,34 +3,43 @@ use std::ops::{Add, Mul};
 use texturecraft_geom::glam::Vec3;
 use texturecraft_geom::{Mesh, Surface};
 
-pub(super) fn interpolate<T: Copy + Mul<f32, Output = T> + Add<Output = T>>(mesh: &Mesh, v: &[T], tri: u32, [b1, b2]: [f32; 2]) -> Option<T> {
-    let [a, b, c] = mesh.tri(tri as usize)?;
-    Some(*v.get(a)? * (1.0 - b1 - b2) + *v.get(b)? * b1 + *v.get(c)? * b2)
+/// `values` (one per vertex) at `barycentric` in triangle `triangle`
+pub(crate) fn interpolate<T: Copy + Mul<f32, Output = T> + Add<Output = T>>(mesh: &Mesh, values: &[T], triangle: u32, barycentric: [f32; 2]) -> Option<T> {
+    let [first, second, third] = mesh.tri(triangle as usize)?;
+    let [second_weight, third_weight] = barycentric;
+
+    Some(*values.get(first)? * (1.0 - second_weight - third_weight) + *values.get(second)? * second_weight + *values.get(third)? * third_weight)
 }
 
-pub(super) fn welded(mesh: &Mesh, diag: f32) -> (Vec<u32>, Vec<Vec3>, Vec<Vec3>) {
-    let q = diag * 1e-5;
-    let mut ids: HashMap<[i64; 3], u32> = HashMap::new();
-    let (mut pos, mut nrm) = (Vec::new(), Vec::<Vec3>::new());
-    let weld: Vec<u32> = mesh
+/// Vertices closer than this fraction of the mesh diagonal count as one when welding
+const WELD_TOLERANCE_PER_DIAGONAL: f32 = 1e-5;
+
+/// Vertices that share a position merged: each vertex's welded index, the welded positions and their averaged normals
+pub(crate) fn welded(mesh: &Mesh, diagonal: f32) -> (Vec<u32>, Vec<Vec3>, Vec<Vec3>) {
+    let tolerance = diagonal * WELD_TOLERANCE_PER_DIAGONAL;
+    let mut welded_index_of_cell: HashMap<[i64; 3], u32> = HashMap::new();
+    let (mut positions, mut normal_sums) = (Vec::new(), Vec::<Vec3>::new());
+
+    let welded_indices: Vec<u32> = mesh
         .positions
         .iter()
         .zip(&mesh.normals)
-        .map(|(p, n)| {
-            let key = [p.x, p.y, p.z].map(|c| (c / q).round() as i64);
-            let id = *ids.entry(key).or_insert_with(|| {
-                pos.push(*p);
-                nrm.push(Vec3::ZERO);
-                (pos.len() - 1) as u32
+        .map(|(position, normal)| {
+            let cell = [position.x, position.y, position.z].map(|coordinate| (coordinate / tolerance).round() as i64);
+            let welded_index = *welded_index_of_cell.entry(cell).or_insert_with(|| {
+                positions.push(*position);
+                normal_sums.push(Vec3::ZERO);
+                (positions.len() - 1) as u32
             });
-            if let Some(acc) = nrm.get_mut(id as usize) {
-                *acc += *n;
+            if let Some(normal_sum) = normal_sums.get_mut(welded_index as usize) {
+                *normal_sum += *normal;
             }
-            id
+            welded_index
         })
         .collect();
-    let nrm = nrm.into_iter().map(|n| n.try_normalize().unwrap_or(Vec3::ZERO)).collect();
-    (weld, pos, nrm)
+
+    let normals = normal_sums.into_iter().map(|normal_sum| normal_sum.try_normalize().unwrap_or(Vec3::ZERO)).collect();
+    (welded_indices, positions, normals)
 }
 
 pub(super) fn splitmix64(x: u64) -> u64 {

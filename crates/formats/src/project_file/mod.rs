@@ -499,6 +499,8 @@ fn load<R: Read + Seek>(reader: R) -> Result<ProjectFile> {
         // Ignore other entries from newer minor revisions
     }
 
+    pf.project.format_version = FORMAT_VERSION;
+
     if recovered {
         pf.warnings.push(
             "Warning: Some project settings or mesh maps could not be imported. TextureCraft recovered what it could, using defaults where needed.".into(),

@@ -2,7 +2,7 @@
 //! without a screenshot.
 
 use serde_json::{Value, json};
-use texturecraft_core::{Effect, EffectKind, Fill, Filter, Layer, LayerKind, NormalFormat, Projection, Source};
+use texturecraft_core::{Effect, EffectKind, Fill, Filter, Generator, Layer, LayerKind, NormalFormat, Projection, Source};
 
 use crate::Session;
 use crate::session::StackTarget;
@@ -34,38 +34,49 @@ fn fill_json(f: &Fill) -> Value {
 }
 
 /// A mask or content (`content`) effect.
-fn effect_json(s: &Session, e: &Effect, content: bool) -> Value {
-    let mut ej = json!({ "id": e.id.0, "name": e.name, "kind": e.kind.name(), "visible": e.visible, "blend": e.blend.label(), "opacity": e.opacity });
-    match &e.kind {
-        EffectKind::Generator(g) => {
-            ej["generator"] = json!({ "type": format!("{:?}", g.kind), "level": g.level, "softness": g.softness, "noise": g.noise_amount, "invert": g.invert })
+fn effect_json(session: &Session, effect: &Effect, content: bool) -> Value {
+    let mut out = json!({ "id": effect.id.0, "name": effect.name, "kind": effect.kind.name(), "visible": effect.visible, "blend": effect.blend.label(), "opacity": effect.opacity });
+    let mask_tiles = || session.doc.pixels.masks.get(&effect.id).map_or(0, |image| image.allocated_count());
+    let content_tiles = || session.doc.pixels.layers.iter().filter(|((id, _), _)| *id == effect.id).map(|(_, image)| image.allocated_count()).sum::<usize>();
+
+    match &effect.kind {
+        EffectKind::Generator(generator) => out["generator"] = generator_json(generator),
+        EffectKind::Levels(levels) => out["levels"] = json!([levels.in_low, levels.in_high, levels.gamma, levels.out_low, levels.out_high]),
+        EffectKind::ColorSelection { colors, tolerance } => {
+            out["colors"] = json!(colors);
+            out["tolerance"] = json!(tolerance);
         }
-        EffectKind::Levels(lv) => ej["levels"] = json!([lv.in_low, lv.in_high, lv.gamma, lv.out_low, lv.out_high]),
         EffectKind::Path(paths) => {
-            ej["paths"] = json!(paths.iter().map(|p| json!({ "points": p.points.len(), "uv": p.uv, "closed": p.closed, "fill": p.fill })).collect::<Vec<_>>());
-            ej["tiles"] = json!(if content {
-                s.doc.pixels.layers.iter().filter(|((id, _), _)| *id == e.id).map(|(_, img)| img.allocated_count()).sum::<usize>()
-            } else {
-                s.doc.pixels.masks.get(&e.id).map(|i| i.allocated_count()).unwrap_or(0)
-            });
+            out["paths"] = json!(
+                paths.iter().map(|path| json!({ "points": path.points.len(), "uv": path.uv, "closed": path.closed, "fill": path.fill })).collect::<Vec<_>>()
+            );
+            out["tiles"] = json!(if content { content_tiles() } else { mask_tiles() });
         }
-        EffectKind::Paint if content => {
-            ej["tiles"] = json!(s.doc.pixels.layers.iter().filter(|((id, _), _)| *id == e.id).map(|(_, img)| img.allocated_count()).sum::<usize>())
-        }
-        EffectKind::Paint => ej["tiles"] = json!(s.doc.pixels.masks.get(&e.id).map(|i| i.allocated_count()).unwrap_or(0)),
-        EffectKind::Fill { source, .. } => ej["source"] = source_json(source),
-        EffectKind::Material(f) => ej["fill"] = fill_json(f),
-        EffectKind::Filter(f) => {
-            ej["filter"] = json!(f);
-            match f {
-                Filter::Hsl { hue, saturation, lightness } => ej["hsl"] = json!([hue, saturation, lightness]),
-                Filter::Blur { radius } => ej["radius"] = json!(radius),
+        EffectKind::Paint if content => out["tiles"] = json!(content_tiles()),
+        EffectKind::Paint => out["tiles"] = json!(mask_tiles()),
+        EffectKind::Fill { source, .. } => out["source"] = source_json(source),
+        EffectKind::Material(fill) => out["fill"] = fill_json(fill),
+        EffectKind::Filter(filter) => {
+            out["filter"] = json!(filter);
+            match filter {
+                Filter::Hsl { hue, saturation, lightness } => out["hsl"] = json!([hue, saturation, lightness]),
+                Filter::Blur { radius } => out["radius"] = json!(radius),
                 _ => {}
             }
         }
         _ => {}
     }
-    ej
+    out
+}
+
+/// A generator's settings, with its curvature mode and detail size weights when it has them.
+fn generator_json(generator: &Generator) -> Value {
+    let mut out = json!({ "type": format!("{:?}", generator.kind), "level": generator.level, "softness": generator.softness, "noise": generator.noise_amount, "invert": generator.invert });
+    if let Some(detail) = &generator.detail {
+        out["mode"] = json!(format!("{:?}", detail.mode));
+        out["sizes"] = json!(detail.weights);
+    }
+    out
 }
 
 fn layer_json(s: &Session, l: &Layer, depth: usize) -> Value {
@@ -129,26 +140,34 @@ pub fn texture_sets(s: &Session) -> Value {
     json!((0..s.set_count()).map(|i| texture_set(s, i)).collect::<Vec<_>>())
 }
 
-/// One texture set; UV-tiled sets list their tiles and where each sits in the texel atlas.
-pub fn texture_set(s: &Session, i: usize) -> Value {
-    let Some(t) = s.doc.project.texture_sets.get(i) else { return Value::Null };
-    let grid = t.tile_grid();
-    let tiles: Vec<Value> =
-        t.uv_tiles.iter().filter_map(|u| grid?.block(*u).map(|(x, y)| json!({ "udim": u, "block": [x, y], "resolution": t.tile_resolution(*u) }))).collect();
+/// One texture set, including UV tile layout and bake selection
+pub fn texture_set(session: &Session, index: usize) -> Value {
+    let Some(texture_set) = session.doc.project.texture_sets.get(index) else { return Value::Null };
+
+    let grid = texture_set.tile_grid();
+    let tiles: Vec<Value> = texture_set
+        .uv_tiles
+        .iter()
+        .filter_map(|tile| {
+            grid?.block(*tile).map(|(x, y)| {
+                json!({"udim": tile, "block": [x, y], "resolution": texture_set.tile_resolution(*tile), "bakeEnabled": !texture_set.bake_excluded_tiles.contains(tile)})
+            })
+        })
+        .collect();
     json!({
-        "index": i,
-        "name": t.name,
-        "resolution": t.resolution,
-        "size": t.size(),
-        "blockResolution": t.block_resolution(),
-        "uvTiles": t.uv_tiles,
+        "index": index,
+        "name": texture_set.name,
+        "resolution": texture_set.resolution,
+        "size": texture_set.size(),
+        "blockResolution": texture_set.block_resolution(),
+        "uvTiles": texture_set.uv_tiles,
         "tiles": tiles,
-        "channels": t.channels.iter().map(|(c, f)| json!({ "channel": c.id(), "format": f.label() })).collect::<Vec<_>>(),
-        "layers": s.doc.project.walk(i).len(),
-        "parts": crate::set_cmds::parts(s, i),
-        "baked": crate::project_cmds::baked_json(s.doc.baked.get(&i)),
-        "visible": t.visible,
-        "active": i == s.ts(),
+        "channels": texture_set.channels.iter().map(|(channel, format)| json!({ "channel": channel.id(), "format": format.label() })).collect::<Vec<_>>(),
+        "layers": session.doc.project.walk(index).len(),
+        "parts": crate::set_cmds::parts(session, index),
+        "baked": crate::project_cmds::baked_json(session.doc.baked.get(&index)),
+        "visible": texture_set.visible,
+        "active": index == session.ts(),
     })
 }
 
@@ -161,7 +180,7 @@ pub fn session(s: &Session) -> Value {
         "path": s.path,
         "modified": s.modified,
         "textureSets": texture_sets(s),
-        "bakeMeshes": crate::bake_cmds::meshes_json(s),
+        "bakeMeshes": crate::bake::meshes_json(s),
         "activeTextureSet": ts,
         "selectedLayer": s.selected_layer().map(|l| l.0),
         "target": match s.target { StackTarget::Content => json!("content"), StackTarget::Mask => json!("mask"), StackTarget::Effect(e) => json!(e.0) },

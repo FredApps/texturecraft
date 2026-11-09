@@ -29,4 +29,4 @@ pub use path::{Lasso, spline};
 pub use pickup::{Pickup, PickupMode};
 pub use raster::{RasterCtx, StrokeCanvas, UvStamp, fill_coverage, fill_triangles, rasterize, rasterize_uv};
 pub use stroke::{PickCtx, Stamp, Stroke, SurfaceHit, pick};
-pub use visibility::EyeDepth;
+pub use visibility::{EyeDepth, screen_point};

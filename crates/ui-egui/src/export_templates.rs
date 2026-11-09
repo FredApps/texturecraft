@@ -341,11 +341,14 @@ pub fn import(app: &mut TextureCraftApp, preset: &ExportPreset) {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn import_file(app: &mut TextureCraftApp, _ctx: &egui::Context) {
-    let Some(path) = rfd::FileDialog::new().add_filter(tr("Export template"), &["json"]).pick_file() else { return };
-    match texturecraft_engine::formats::load_preset(&path) {
-        Ok(p) => import(app, &p),
-        Err(e) => app.toast(trf("Couldn't import {name}: {error}", &[("name", &path.display()), ("error", &e)]), true),
-    }
+    use crate::file_dialogs::{Bound, FileDialog};
+    app.ask_file(FileDialog::open().filter(tr("Export template"), &["json"]), Bound::App, |app, paths| {
+        let Some(path) = paths.first() else { return };
+        match texturecraft_engine::formats::load_preset(path) {
+            Ok(p) => import(app, &p),
+            Err(e) => app.toast(trf("Couldn't import {name}: {error}", &[("name", &path.display()), ("error", &e)]), true),
+        }
+    });
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -356,26 +359,43 @@ fn import_file(_app: &mut TextureCraftApp, ctx: &egui::Context) {
 fn export_file(app: &mut TextureCraftApp) {
     let Some(p) = selected(app) else { return };
     let name = format!("{}.json", sanitize_file_stem(&p.name));
-    let saved = texturecraft_engine::formats::preset_to_json(&p).map_err(|e| e.to_string()).and_then(|json| write_json(&name, &json));
-    match saved {
-        Ok(Some(to)) => app.toast(trf("Exported template \"{name}\" to {path}", &[("name", &p.name), ("path", &to)]), false),
-        Ok(None) => {}
-        Err(e) => app.toast(trf("Couldn't export the template: {error}", &[("error", &e)]), true),
-    }
+    let json = match texturecraft_engine::formats::preset_to_json(&p) {
+        Ok(json) => json,
+        Err(e) => {
+            export_failed(app, &e);
+            return;
+        }
+    };
+    write_json(app, p.name, name, json);
 }
 
-/// Save `json` with the native dialog (Ok(None): cancelled).
+fn export_failed(app: &mut TextureCraftApp, error: &dyn std::fmt::Display) {
+    app.toast(trf("Couldn't export the template: {error}", &[("error", error)]), true);
+}
+
+fn exported(app: &mut TextureCraftApp, name: &str, to: &str) {
+    app.toast(trf("Exported template \"{name}\" to {path}", &[("name", &name), ("path", &to)]), false);
+}
+
+/// Asks where to save `json` with the native dialog.
 #[cfg(not(target_arch = "wasm32"))]
-fn write_json(name: &str, json: &str) -> Result<Option<String>, String> {
-    let Some(path) = rfd::FileDialog::new().add_filter(tr("Export template"), &["json"]).set_file_name(name).save_file() else { return Ok(None) };
-    std::fs::write(&path, json).map_err(|e| e.to_string())?;
-    Ok(Some(path.display().to_string()))
+fn write_json(app: &mut TextureCraftApp, preset: String, name: String, json: String) {
+    use crate::file_dialogs::{Bound, FileDialog};
+    app.ask_file(FileDialog::save().filter(tr("Export template"), &["json"]).file_name(name), Bound::App, move |app, paths| {
+        let Some(path) = paths.first() else { return };
+        match std::fs::write(path, &json) {
+            Ok(()) => exported(app, &preset, &path.display().to_string()),
+            Err(e) => export_failed(app, &e),
+        }
+    });
 }
 
 #[cfg(target_arch = "wasm32")]
-fn write_json(name: &str, json: &str) -> Result<Option<String>, String> {
-    crate::web_files::download(name, json.as_bytes())?;
-    Ok(Some(name.to_string()))
+fn write_json(app: &mut TextureCraftApp, preset: String, name: String, json: String) {
+    match crate::web_files::download(&name, json.as_bytes()) {
+        Ok(()) => exported(app, &preset, &name),
+        Err(e) => export_failed(app, &e),
+    }
 }
 
 /// Read the user's templates: the library folder on the desktop, the app storage on the web.

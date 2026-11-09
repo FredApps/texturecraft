@@ -30,6 +30,12 @@ ron = "0.12"
 [target.'cfg(windows)'.dependencies]
 winit = { version = "0.30", default-features = false }
 winsafe = { version = "0.0.29", default-features = false, features = ["user"] }
+# The update helper is a copy of this program (`main`).
+craft-update = { workspace = true }
+
+# Quit (Cmd+Q) asks about unsaved changes (src/main.rs); winit's own Quit does not.
+[target.'cfg(target_os = "macos")'.dependencies]
+craft-menu = { workspace = true }
 
 [build-dependencies]
 winresource = "0.1"

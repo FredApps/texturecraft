@@ -174,25 +174,56 @@ pub fn elided(painter: &egui::Painter, text: impl Into<String>, size: f32, color
     painter.layout_job(job)
 }
 
-/// A square icon button (Phosphor glyph) in a rounded tool well: `selected` sits in the accent
-/// tinted well (the shared Craft icon button, `craft_ui::buttons`).
+/// A square Phosphor icon button with a tooltip and an accent well when selected
 pub fn icon_button(ui: &mut Ui, icon: &str, tooltip: &str, selected: bool, size: f32) -> Response {
-    let tk = Tokens::get(ui.ctx());
+    icon_button_without_tooltip(ui, icon, tooltip, selected, size).on_hover_text(tooltip)
+}
+
+/// Icon glyph size as a fraction of the button height
+const ICON_SCALE: f32 = 0.62;
+
+/// Extra width an `icon_dropdown_button` gives its caret, as a fraction of the button height
+const CARET_STRIP_SCALE: f32 = 0.34;
+
+/// An `icon_button` with no tooltip, whose `label` still names it for screen readers
+pub fn icon_button_without_tooltip(ui: &mut Ui, icon: &str, label: &str, selected: bool, size: f32) -> Response {
+    let style = icon_button_style(&Tokens::get(ui.ctx()));
+    IconButton::new(label, vec2(size, size), &style).selected(selected).show(ui, |ui, rect, color| {
+        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(size * ICON_SCALE), color);
+    })
+}
+
+/// Width of an `icon_dropdown_button` `size` high: the square icon and the caret strip after it
+pub fn icon_dropdown_button_width(size: f32) -> f32 {
+    size * (1.0 + CARET_STRIP_SCALE)
+}
+
+/// An `icon_button_without_tooltip` with a dropdown caret after the icon, drawn in the icon's color
+pub fn icon_dropdown_button(ui: &mut Ui, icon: &str, label: &str, selected: bool, size: f32) -> Response {
+    // Caret glyph size, and how far its center sits from the right edge, as fractions of the height
+    const CARET_SCALE: f32 = 0.34;
+    const CARET_INSET_SCALE: f32 = 0.25;
+
+    let style = icon_button_style(&Tokens::get(ui.ctx()));
+    IconButton::new(label, vec2(icon_dropdown_button_width(size), size), &style).selected(selected).show(ui, |ui, rect, color| {
+        let icon_center = rect.left_center() + vec2(size / 2.0, 0.0);
+        let caret_center = rect.right_center() - vec2(size * CARET_INSET_SCALE, 0.0);
+        ui.painter().text(icon_center, egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(size * ICON_SCALE), color);
+        ui.painter().text(caret_center, egui::Align2::CENTER_CENTER, egui_phosphor::regular::CARET_DOWN, egui::FontId::proportional(size * CARET_SCALE), color);
+    })
+}
+
+/// Transparent at rest, a hover well, and the active-tool well when pressed or selected
+fn icon_button_style(tokens: &Tokens) -> IconButtonStyle {
     let well = |fill, icon| ButtonVisuals { fill, stroke: Stroke::NONE, icon };
-    let style = IconButtonStyle {
-        normal: well(Color32::TRANSPARENT, tk.text),
-        hovered: well(tk.row_hover, tk.text_strong),
-        pressed: Some(well(tk.tool_active, tk.text_strong)),
-        selected: well(tk.tool_active, tk.text_strong),
+    IconButtonStyle {
+        normal: well(Color32::TRANSPARENT, tokens.text),
+        hovered: well(tokens.row_hover, tokens.text_strong),
+        pressed: Some(well(tokens.tool_active, tokens.text_strong)),
+        selected: well(tokens.tool_active, tokens.text_strong),
         corner_radius: CornerRadius::same(6),
-        focus_stroke: Stroke::new(1.0, tk.accent),
-    };
-    IconButton::new(tooltip, vec2(size, size), &style)
-        .selected(selected)
-        .show(ui, |ui, rect, color| {
-            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(size * 0.62), color);
-        })
-        .on_hover_text(tooltip)
+        focus_stroke: Stroke::new(1.0, tokens.accent),
+    }
 }
 
 /// A flat button filled with the accent, white lettering (a dialog's main action).

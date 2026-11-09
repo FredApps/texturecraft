@@ -1,11 +1,12 @@
 //! Bake mode: with the skew brush on, dragging in the 2D view paints the skew map, and the
-//! brush controls are in the Bake panel.
+//! brush controls are in Common Settings.
 
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 use texturecraft_ui_egui::TextureCraftApp;
 use texturecraft_ui_egui::state::{Mode, ViewLayout};
 
+/// A bake-mode app with a high poly, the 2D view, and Common Settings in front
 fn harness() -> Harness<'static, TextureCraftApp> {
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
     session.add_high_poly_bytes("High.obj", b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n".to_vec()).unwrap();
@@ -13,7 +14,7 @@ fn harness() -> Harness<'static, TextureCraftApp> {
     h.state_mut().ui.mode = Mode::Baking;
     h.state_mut().ui.layout = ViewLayout::Only2D;
     h.run_steps(4);
-    h.state_mut().ui.dock.focus(texturecraft_ui_egui::docking::Panel::BakeSettings);
+    h.state_mut().ui.dock.focus(texturecraft_ui_egui::docking::Panel::CommonSettings);
     h.run_steps(3);
     h
 }

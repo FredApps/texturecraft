@@ -6,6 +6,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{BlendMode, Channel, ChannelKind, lum};
 
+mod curvature_detail;
+mod curvature_mode;
+
+pub use curvature_detail::CurvatureDetail;
+pub use curvature_mode::CurvatureMode;
+
 /// Id of a layer or effect (one id space per project).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct LayerId(pub u64);
@@ -540,17 +546,26 @@ pub struct Generator {
     /// Direction for `Position` / `Direction` generators (world space).
     pub direction: [f32; 3],
     pub invert: bool,
+    /// Mode and detail sizes of `Curvature` / `EdgeWear` generators (None: the curvature map as baked, as before detail sizes existed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<CurvatureDetail>,
 }
 
 impl Generator {
     pub fn new(kind: GeneratorKind) -> Generator {
         let (level, softness, noise_amount) = match kind {
-            GeneratorKind::EdgeWear => (0.6, 0.12, 0.5),
+            GeneratorKind::EdgeWear => (0.5, 0.25, 0.3),
+            GeneratorKind::Curvature => (0.5, 0.5, 0.0),
             GeneratorKind::Dirt => (0.55, 0.25, 0.35),
             GeneratorKind::ThinAreas => (0.3, 0.2, 0.0),
             _ => (0.5, 0.25, 0.0),
         };
-        Generator { kind, level, softness, noise_amount, noise_scale: 8.0, seed: 7, direction: [0.0, 1.0, 0.0], invert: false }
+        let detail = match kind {
+            GeneratorKind::Curvature => Some(CurvatureDetail::default()),
+            GeneratorKind::EdgeWear => Some(CurvatureDetail { mode: CurvatureMode::Edges, weights: CurvatureDetail::EDGE_WEIGHTS }),
+            _ => None,
+        };
+        Generator { kind, level, softness, noise_amount, noise_scale: 8.0, seed: 7, direction: [0.0, 1.0, 0.0], invert: false, detail }
     }
 }
 
@@ -1049,6 +1064,17 @@ impl Effect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn curvature_generators_saved_before_detail_sizes_load_without_them() {
+        let mut saved = serde_json::to_value(Generator::new(GeneratorKind::Curvature)).unwrap();
+        assert!(saved.get("detail").is_some(), "new curvature generators have detail sizes");
+
+        saved.as_object_mut().unwrap().remove("detail");
+        let loaded: Generator = serde_json::from_value(saved).unwrap();
+        assert_eq!(loaded.detail, None);
+        assert_eq!(Generator::new(GeneratorKind::Dirt).detail, None, "only curvature and edge wear generators have detail sizes");
+    }
 
     #[test]
     fn levels_map_range_and_gamma() {

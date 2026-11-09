@@ -13,18 +13,25 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+pub mod bake_visualization;
+mod cage_gpu;
 pub mod displace;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod gpu_bake;
 pub mod gpu_trace;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod headless;
+mod high_poly_gpu;
 pub mod ibl;
 pub mod mesh_maps;
 pub mod readback;
 pub mod renderer;
+pub mod set_highlight;
 mod subdivide;
 pub mod trace;
+mod uv_seam_gpu;
 
+pub use bake_visualization::BakeVisualization;
 pub use renderer::{COLOR_FORMAT, Frame, MSAA, Renderer, Shade, ViewKind, aux_size, uv_view_scale};
+pub use set_highlight::SetHighlight;
 pub use wgpu;

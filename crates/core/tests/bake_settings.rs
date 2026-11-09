@@ -20,7 +20,7 @@ fn reference_defaults_cover_common_and_per_map_settings() {
         "id": {"source": "MaterialColor", "generator": "HueShift"},
         "ao": {"rays": rays, "ignore_backface": "Never", "self_occlusion": "Always", "attenuation": "Linear", "ground_plane": {"enabled": false, "offset": 0.0}},
         "curvature": {
-            "method": "NormalMap",
+            "method": "Mesh",
             "normal_map": {"details": 0.5, "enable_seams": true, "seams_intensity": 1.0},
             "mesh": {"rays": 32, "sampling_radius": 0.001, "relative_to_bounding_box": true, "self_intersection": "Always", "auto_tonemapping": true, "value_min": -1.0, "value_max": 1.0}
         },
@@ -54,7 +54,9 @@ fn reference_defaults_cover_common_and_per_map_settings() {
             }
         }
     }
+
     assert_shape(&serde_json::to_value(decoded).unwrap(), &expected);
+
     assert_eq!(BakedMap::ALL.len(), 10);
     for name in ["color_map", "Color map", "WorldDirection", "world_space_direction"] {
         assert_eq!(BakedMap::parse(name), None);

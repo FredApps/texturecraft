@@ -6,7 +6,7 @@ use texturecraft_bake::BakePaintMap;
 use texturecraft_core::BakePaintTarget;
 use texturecraft_geom::glam::Vec2;
 
-pub fn specs() -> Vec<CommandSpec> {
+pub(super) fn specs() -> Vec<CommandSpec> {
     vec![
         cmd!("bake.skew.set", "Set Skew Correction", [], None, "{ts?, value?: 0..1 | path: grayscale image}", always, |session, parameters| set(
             session,
@@ -65,7 +65,7 @@ fn set(session: &mut Session, parameters: &Value, target: BakePaintTarget) -> Re
         session.doc.bake_paint.insert((texture_set, target), Arc::new(map));
         Ok(())
     })?;
-    Ok(crate::bake_cmds::meshes_json(session))
+    Ok(super::meshes_json(session))
 }
 
 fn clear(session: &mut Session, parameters: &Value, target: BakePaintTarget) -> Result<Value> {
@@ -76,7 +76,7 @@ fn clear(session: &mut Session, parameters: &Value, target: BakePaintTarget) -> 
             Ok(())
         })?;
     }
-    Ok(crate::bake_cmds::meshes_json(session))
+    Ok(super::meshes_json(session))
 }
 
 fn paint(session: &mut Session, parameters: &Value, target: BakePaintTarget) -> Result<Value> {
@@ -123,7 +123,7 @@ fn paint(session: &mut Session, parameters: &Value, target: BakePaintTarget) -> 
         }
         Arc::make_mut(map).paint(&points, radius, value, hardness, strength).map_err(|error| bad("bake.paint", error.to_string()))
     })?;
-    Ok(crate::bake_cmds::meshes_json(session))
+    Ok(super::meshes_json(session))
 }
 
 #[cfg(not(target_arch = "wasm32"))]

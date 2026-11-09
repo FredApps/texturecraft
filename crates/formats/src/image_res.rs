@@ -21,20 +21,27 @@ pub fn decode_image(bytes: &[u8]) -> Result<DecodedImage> {
 /// [`decode_image`] for an image of at most `max_texels` (width × height), checked from the
 /// header, before any pixel is decoded or allocated.
 pub fn decode_image_within(bytes: &[u8], max_texels: u64) -> Result<DecodedImage> {
-    let reader =
+    let mut reader =
         image::ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().map_err(|e| FormatError::Malformed { kind: "image", msg: e.to_string() })?;
-    let (w, h) = reader.into_dimensions().map_err(|e| FormatError::Malformed { kind: "image", msg: e.to_string() })?;
-    if w == 0 || h == 0 || w > MAX_IMAGE_SIZE || h > MAX_IMAGE_SIZE {
-        return Err(FormatError::TooLarge(format!("image is {w}x{h} (limit {MAX_IMAGE_SIZE})")));
+
+    // TGA has no magic signature; its decoder validates the header when no format was recognized
+    let format = reader.format().unwrap_or(image::ImageFormat::Tga);
+    reader.set_format(format);
+
+    let (width, height) = reader.into_dimensions().map_err(|e| FormatError::Malformed { kind: "image", msg: e.to_string() })?;
+    if width == 0 || height == 0 || width > MAX_IMAGE_SIZE || height > MAX_IMAGE_SIZE {
+        return Err(FormatError::TooLarge(format!("image is {width}x{height} (limit {MAX_IMAGE_SIZE})")));
     }
-    if u64::from(w) * u64::from(h) > max_texels {
-        return Err(FormatError::TooLarge(format!("image is {w}x{h}, more than {max_texels} texels")));
+    if u64::from(width) * u64::from(height) > max_texels {
+        return Err(FormatError::TooLarge(format!("image is {width}x{height}, more than {max_texels} texels")));
     }
-    let img = crate::guard("image", || image::load_from_memory(bytes).map_err(|e| FormatError::Malformed { kind: "image", msg: e.to_string() }))?;
-    let srgb = !matches!(img, image::DynamicImage::ImageRgb32F(_) | image::DynamicImage::ImageRgba32F(_));
-    let f = img.into_rgba32f();
-    let (width, height) = f.dimensions();
-    let rgba = f.pixels().map(|p| p.0).collect();
+
+    let image =
+        crate::guard("image", || image::load_from_memory_with_format(bytes, format).map_err(|e| FormatError::Malformed { kind: "image", msg: e.to_string() }))?;
+    let srgb = !matches!(image, image::DynamicImage::ImageRgb32F(_) | image::DynamicImage::ImageRgba32F(_));
+    let float_image = image.into_rgba32f();
+    let (width, height) = float_image.dimensions();
+    let rgba = float_image.pixels().map(|pixel| pixel.0).collect();
     Ok(DecodedImage { width, height, rgba, srgb })
 }
 
@@ -67,6 +74,19 @@ mod tests {
         let text = decode_image(&coverage_png(2, 1, &[0, 255], [255; 3]).unwrap()).unwrap();
         assert_eq!(text.rgba, vec![[1.0, 1.0, 1.0, 0.0], [1.0; 4]]);
         assert!(coverage_png(2, 2, &[0], [255; 3]).is_err());
+    }
+
+    #[test]
+    fn tga_without_a_magic_signature_decodes_within_the_texel_budget() {
+        let mut bytes = Vec::new();
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([128, 51, 255, 255])).write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Tga).unwrap();
+        let image = decode_image_within(&bytes, 16).unwrap();
+        assert_eq!((image.width, image.height), (4, 4));
+        assert!((image.rgba[0][1] - 0.2).abs() < 1e-6);
+        assert!(image.srgb);
+        let header = &bytes[..18];
+        assert!(matches!(decode_image_within(header, 15), Err(FormatError::TooLarge(_))));
+        assert!(decode_image(header).is_err());
     }
 
     #[test]
