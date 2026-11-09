@@ -72,7 +72,7 @@ fn join(dir: &str, name: &str) -> String {
 impl Headless {
     pub fn new(session: Session, fs: Filesystem) -> Headless {
         // Bakes run here (CLI, MCP) cast their rays on the GPU when there is one.
-        texturecraft_engine::bake_cmds::install_gpu_tracer(std::sync::Arc::new(texturecraft_render::gpu_bake::GpuBaker::new()));
+        texturecraft_engine::bake::install_gpu_tracer(std::sync::Arc::new(texturecraft_render::gpu_bake::GpuBaker::new()));
         Headless { session, fs, gpu: None }
     }
 

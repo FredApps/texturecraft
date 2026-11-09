@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{BakeSettings, BakedMap, Channel, ChannelFormat, CoreError, Effect, Layer, LayerId, LayerKind, Result};
 
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// Maximum group nesting (also bounds recursion over hostile project files)
 pub const MAX_DEPTH: usize = 16;
@@ -63,6 +63,9 @@ pub struct TextureSet {
     /// [`TileGrid`], [`TextureSet::block_resolution`] texels square.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub uv_tiles: Vec<u32>,
+    /// UV tiles excluded from baking; missing entries stay included
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub bake_excluded_tiles: BTreeSet<u32>,
     /// Per-tile resolutions overriding `resolution` (UDIM → texels per side). A tile smaller
     /// than the atlas block fills the block's top-left corner (see [`TextureSet::to_atlas`]).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -132,26 +135,7 @@ impl TileGrid {
     }
 }
 
-/// The fraction of its atlas block the UV tile of each block fills ([`TextureSet::tile_scale`]):
-/// such a tile has fewer texels per UV unit, so filter radii and height slopes shrink with it.
-/// Empty (every scale 1) unless a tile is smaller than its block.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct BlockScales {
-    block: u32,
-    cols: u32,
-    scales: Vec<f32>,
-}
-
-impl BlockScales {
-    /// The scale at atlas texel (x, y).
-    pub fn at(&self, x: u32, y: u32) -> f32 {
-        let (bx, by) = (x / self.block.max(1), y / self.block.max(1));
-        if bx >= self.cols {
-            return 1.0;
-        }
-        self.scales.get(by as usize * self.cols as usize + bx as usize).copied().unwrap_or(1.0)
-    }
-}
+pub use crate::block_scales::BlockScales;
 
 fn one() -> f32 {
     1.0
@@ -176,6 +160,7 @@ impl TextureSet {
             baked: BTreeSet::new(),
             visible: true,
             uv_tiles: Vec::new(),
+            bake_excluded_tiles: BTreeSet::new(),
             tile_resolutions: BTreeMap::new(),
         }
     }
@@ -183,6 +168,10 @@ impl TextureSet {
     /// The atlas grid of a UV-tiled set (None for a classic set).
     pub fn tile_grid(&self) -> Option<TileGrid> {
         TileGrid::of(&self.uv_tiles)
+    }
+
+    pub fn has_enabled_bake_tiles(&self) -> bool {
+        self.uv_tiles.is_empty() || self.uv_tiles.iter().any(|tile| !self.bake_excluded_tiles.contains(tile))
     }
 
     /// Height strength for slopes measured over the whole texture width (the viewport shader,
@@ -406,6 +395,11 @@ pub struct Project {
     /// it, so parts the file leaves unnamed get the same name (from it) as on import.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub mesh_file: String,
+    /// Where the mesh file was imported from (the project's "3D mesh path"). Reimport mesh reads
+    /// it again from there, so edits made to the file since are picked up. Empty when unknown
+    /// (built-in meshes, web imports, projects saved before it was kept).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mesh_path: String,
     pub normal_format: NormalFormat,
     pub texture_sets: Vec<TextureSet>,
     pub layers: BTreeMap<LayerId, Layer>,
@@ -423,6 +417,7 @@ impl Project {
             name: name.into(),
             mesh: mesh.into(),
             mesh_file: String::new(),
+            mesh_path: String::new(),
             normal_format: NormalFormat::OpenGl,
             texture_sets: Vec::new(),
             layers: BTreeMap::new(),

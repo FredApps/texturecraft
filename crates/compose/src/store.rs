@@ -1,9 +1,9 @@
 //! Pixel data owned by a document: painted layer channels, painted mask effects and baked mesh
 //! maps. Everything is copy-on-write, so cloning the store for undo is cheap.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
-use texturecraft_core::{BakedMap, Channel, ChannelKind, LayerId};
+use texturecraft_core::{Channel, ChannelKind, LayerId};
 use texturecraft_texel::{TileImage, from_u16, from_u16_signed};
 
 /// Painted data of one paint layer channel: premultiplied value(s) plus coverage, u16 per
@@ -56,38 +56,7 @@ pub fn decode(kind: ChannelKind, v: u16) -> f32 {
     if kind == ChannelKind::Signed { from_u16_signed(v) } else { from_u16(v) }
 }
 
-/// Baked mesh maps of one texture set (dense, row-major, `components()` floats per texel). The
-/// width is `resolution`; height follows the output size and UV tile grid
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct BakedMaps {
-    /// Width in texels.
-    pub resolution: u32,
-    pub maps: BTreeMap<BakedMap, std::sync::Arc<Vec<f32>>>,
-}
-
-impl BakedMaps {
-    /// Height in texels of map `m` (from its length).
-    pub fn height(&self, m: BakedMap) -> u32 {
-        self.maps.get(&m).map_or(0, |d| (d.len() / (self.resolution.max(1) as usize * m.components())) as u32)
-    }
-
-    /// Sample the corresponding texel of an image with the supplied output size
-    pub fn sample(&self, map: BakedMap, x: u32, y: u32, output_size: (u32, u32)) -> Option<[f32; 3]> {
-        let data = self.maps.get(&map)?;
-        let width = u64::from(self.resolution.max(1));
-        let height = u64::from(self.height(map).max(1));
-        let sample_x = (u64::from(x) * width / u64::from(output_size.0.max(1))).min(width - 1);
-        let sample_y = (u64::from(y) * height / u64::from(output_size.1.max(1))).min(height - 1);
-        let component_count = map.components();
-        let offset = ((sample_y * width + sample_x) as usize).checked_mul(component_count)?;
-        let texel = data.get(offset..offset.checked_add(component_count)?)?;
-        Some(if component_count == 3 { [texel[0], texel[1], texel[2]] } else { [texel[0]; 3] })
-    }
-
-    pub fn scalar(&self, m: BakedMap, x: u32, y: u32, size: (u32, u32)) -> Option<f32> {
-        self.sample(m, x, y, size).map(|v| v[0])
-    }
-}
+pub use crate::baked_maps::BakedMaps;
 
 /// A decoded image resource sampled by fills (values in the file's encoding; see `srgb`).
 #[derive(Clone, Debug, PartialEq)]

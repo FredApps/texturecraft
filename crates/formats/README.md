@@ -145,6 +145,11 @@ pub fn load_project(path: &Path) -> Result<ProjectFile>;            // native
 allocated 64×64 tile `tx`, `ty` (u32 LE) and the raw `u16` LE components (sparse, lossless).
 Baked maps: the same header with 0 tiles, then `width × height × components` f32 LE.
 
+Project format version 2 stores baked maps in uniform UV tile blocks, independent of working
+tile-resolution overrides. Older projects load their stored bake pixels as-is, without converting
+the old layout; their appearance may change until rebaked. Painted layers and cage/skew correction
+maps retain their working atlas layout.
+
 Loading runs `Project::validate`, refuses a newer `format_version` (`FormatError::NewerVersion`),
 checks every tile against its texture set's resolution and component count, rejects repeated or
 out-of-range tiles and trailing data, drops pixels of layers that are in no stack. Single resources

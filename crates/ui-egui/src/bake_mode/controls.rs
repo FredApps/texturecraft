@@ -3,63 +3,35 @@ use crate::theme::{Tokens, caption};
 use egui::collapsing_header::CollapsingState;
 use egui::{RichText, Ui};
 
-pub(super) fn section_header(ui: &mut Ui, title: &str, mut is_enabled: Option<&mut bool>, collapsing_state: Option<&mut CollapsingState>) -> bool {
+/// A section's title bar with its chevron; clicking it opens or closes the section
+fn section_header(ui: &mut Ui, title: &str, collapsing_state: &mut CollapsingState) {
     let tokens = Tokens::get(ui.ctx());
-    let text_color = if is_enabled.as_deref().copied().unwrap_or(true) { tokens.text_strong } else { tokens.text_dim };
-    let mut checkbox_rect = None;
-    let mut arrow_rect = None;
-
     let header = egui::Frame::NONE.fill(tokens.row).corner_radius(tokens.cr()).inner_margin(egui::Margin::symmetric(8, 4)).show(ui, |ui| {
         ui.set_min_width(ui.available_width());
         ui.horizontal(|ui| {
             ui.set_min_height(ui.spacing().interact_size.y);
-            let checkbox = is_enabled.as_deref_mut().map(|is_enabled| ui.checkbox(is_enabled, ""));
-            let title_response = ui.add(egui::Label::new(caption(title).color(text_color)).selectable(false));
-            if let Some(checkbox) = checkbox {
-                checkbox_rect = Some(checkbox.rect);
-                checkbox.labelled_by(title_response.id);
-            }
-
-            if collapsing_state.is_some() {
-                arrow_rect = Some(
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.allocate_exact_size(egui::vec2(ui.spacing().indent, ui.spacing().icon_width), egui::Sense::hover()).0
-                    })
-                    .inner,
-                );
-            }
-        });
+            ui.add(egui::Label::new(caption(title).color(tokens.text_strong)).selectable(false));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.allocate_exact_size(egui::vec2(ui.spacing().indent, ui.spacing().icon_width), egui::Sense::hover()).0
+            })
+            .inner
+        })
+        .inner
     });
 
-    if let (Some(collapsing_state), Some(arrow_rect)) = (collapsing_state, arrow_rect) {
-        let mut toggle_rect = header.response.rect;
-        if let Some(checkbox_rect) = checkbox_rect {
-            let checkbox_margin = ui.spacing().item_spacing.x * 0.5;
-            if ui.style().right_to_left {
-                toggle_rect.max.x = checkbox_rect.left() - checkbox_margin;
-            } else {
-                toggle_rect.min.x = checkbox_rect.right() + checkbox_margin;
-            }
-        }
-
-        let response = ui.interact(toggle_rect, ui.make_persistent_id("section_header"), egui::Sense::click());
-        if response.clicked() {
-            collapsing_state.toggle(ui);
-        }
-
-        let chevron = crate::widgets::section_chevron(ui, collapsing_state.is_open());
-        ui.put(arrow_rect, egui::Label::new(chevron).selectable(false));
+    let response = ui.interact(header.response.rect, ui.make_persistent_id("section_header"), egui::Sense::click());
+    if response.clicked() {
+        collapsing_state.toggle(ui);
     }
 
-    is_enabled.as_deref().copied().unwrap_or(true)
+    let chevron = crate::widgets::section_chevron(ui, collapsing_state.is_open());
+    ui.put(header.inner, egui::Label::new(chevron).selectable(false));
 }
 
-pub(super) fn section(ui: &mut Ui, title: &str, is_enabled: Option<&mut bool>, contents: impl FnOnce(&mut Ui)) -> bool {
+/// A collapsible section with `contents` and Restore Defaults; returns whether that was clicked
+pub(super) fn section(ui: &mut Ui, title: &str, contents: impl FnOnce(&mut Ui)) -> bool {
     let mut collapsing_state = CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id("section"), true);
-    if !section_header(ui, title, is_enabled, Some(&mut collapsing_state)) {
-        collapsing_state.store(ui.ctx());
-        return false;
-    }
+    section_header(ui, title, &mut collapsing_state);
 
     collapsing_state
         .show_body_unindented(ui, |ui| {

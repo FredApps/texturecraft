@@ -14,8 +14,23 @@ use texturecraft_geom::primitives;
 
 use super::*;
 
+#[path = "test/cage_shell.rs"]
+mod cage_shell;
+
+#[path = "test/high_poly_reach.rs"]
+mod high_poly_reach;
+
 #[path = "test/setting.rs"]
 mod setting;
+
+#[path = "test/normal_map_curvature.rs"]
+mod normal_map_curvature;
+
+#[path = "test/tile_selection.rs"]
+mod tile_selection;
+
+#[path = "test/vertex_reach.rs"]
+mod vertex_reach;
 
 fn settings(resolution: u32, maps: &[BakedMap]) -> BakeSettings {
     with_rays(
@@ -307,7 +322,7 @@ fn strips_match_a_single_pass() {
         tiles: (1, 1),
     };
     let whole = bake(&req, &Progress::new()).unwrap();
-    let strips = bake_in_strips(&req, &Progress::new(), 128 * 2, &CpuTracer).unwrap();
+    let strips = bake_in_strips(&req, &Progress::new(), 128 * 2, &CpuTracer, &[]).unwrap();
     for (map, a) in &whole.maps {
         let b = &strips.maps[map];
         let off = a.iter().zip(b).filter(|(a, b)| (*a - *b).abs() > 1e-3).count();
@@ -563,6 +578,25 @@ fn a_high_poly_box_has_bright_edges_and_flat_faces() {
 }
 
 #[test]
+fn default_curvature_brightens_box_edges_and_never_darkens_them() {
+    let mut bake_settings = settings(256, &[BakedMap::Curvature]);
+    bake_settings.cage = CageSettings { max_frontal: 0.06, max_rear: 0.02, ..bake_settings.cage };
+    bake_settings.maps.curvature.parameters.method = CurvatureMethod::default();
+
+    // A box has no concave texel, whether it is baked from itself or from a beveled high poly
+    let low = primitives::cube(2.0);
+    let high = primitives::rounded_box(Vec3::ONE, 0.15);
+    let bakes = [("itself", run(&low, &bake_settings).unwrap()), ("a beveled high poly", transfer(&low, &high, None, &bake_settings).unwrap())];
+    for (source, bake_output) in bakes {
+        let curvature = covered_values(&low, &bake_output, BakedMap::Curvature);
+        let darkest = curvature.iter().map(|(_, value)| *value).fold(1.0, f32::min);
+        let brightest = curvature.iter().map(|(_, value)| *value).fold(0.0, f32::max);
+        assert!(darkest > 0.45, "baked from {source}, darkest {darkest}");
+        assert!(brightest > 0.6, "baked from {source}, brightest {brightest}");
+    }
+}
+
+#[test]
 fn a_narrow_high_poly_bevel_stays_bright() {
     let s = {
         let mut base = settings(1024, &[BakedMap::Curvature]);
@@ -633,21 +667,6 @@ fn bump_tilts_the_baked_normal() {
     }
     let height = &out.maps[&BakedMap::Height];
     assert!(height[quad_texel(64, 0.0, 0.0)] > height[quad_texel(64, 0.6, 0.6)] + 0.2, "the bump top is higher");
-}
-
-#[test]
-fn curvature_from_the_normal_map_sees_the_bump() {
-    let s = {
-        let mut base = settings(64, &[BakedMap::Curvature]);
-        base.cage = CageSettings { max_frontal: 0.06, max_rear: 0.02, ..base.cage };
-        base.maps.curvature.parameters = CurvatureSettings { method: CurvatureMethod::NormalMap, ..base.maps.curvature.parameters };
-        base
-    };
-    let out = transfer(&quad(), &bumped(0.1, 0.4), None, &s).unwrap();
-    assert!(!out.maps.contains_key(&BakedMap::Normal), "the helper normal map is not returned");
-    let c = &out.maps[&BakedMap::Curvature];
-    assert!(c[quad_texel(64, 0.0, 0.0)] > 0.55, "convex top {}", c[quad_texel(64, 0.0, 0.0)]);
-    assert!((c[quad_texel(64, 0.9, 0.9)] - 0.5).abs() < 0.02, "flat corner {}", c[quad_texel(64, 0.9, 0.9)]);
 }
 
 #[test]

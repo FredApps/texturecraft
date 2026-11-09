@@ -24,8 +24,12 @@ use crate::theme::Tokens;
 pub enum Panel {
     Viewport,
     Assets,
-    BakeMaps,
-    BakeSettings,
+    // Saved layouts name the bake panels by their earlier names
+    #[serde(rename = "BakeMaps")]
+    MeshMapSettings,
+    #[serde(rename = "BakeSettings")]
+    CommonSettings,
+    MeshMapBakers,
     TextureSetList,
     Layers,
     TextureSetSettings,
@@ -37,14 +41,15 @@ pub enum Panel {
 }
 
 /// Window ▸ Views items and the panels they show or hide.
-pub const VIEWS: [(&str, Panel); 11] = [
+pub const VIEWS: [(&str, Panel); 12] = [
     ("ui.view.assets", Panel::Assets),
-    ("ui.view.bakeMaps", Panel::BakeMaps),
-    ("ui.view.bakeSettings", Panel::BakeSettings),
+    ("ui.view.bakeMaps", Panel::MeshMapSettings),
+    ("ui.view.bakeSettings", Panel::CommonSettings),
     ("ui.view.display", Panel::Display),
     ("ui.view.history", Panel::History),
     ("ui.view.layers", Panel::Layers),
     ("ui.view.log", Panel::Log),
+    ("ui.view.meshMapBakers", Panel::MeshMapBakers),
     ("ui.view.properties", Panel::Properties),
     ("ui.view.shader", Panel::Shader),
     ("ui.view.textureSetList", Panel::TextureSetList),
@@ -59,17 +64,18 @@ pub fn view_panel(id: &str) -> Option<Panel> {
 impl Panel {
     pub(crate) fn available_in(self, mode: crate::state::Mode) -> bool {
         match self {
-            Self::BakeMaps | Self::BakeSettings => mode == crate::state::Mode::Baking,
+            Self::MeshMapSettings | Self::CommonSettings | Self::MeshMapBakers => mode == crate::state::Mode::Baking,
             Self::Assets | Self::Layers | Self::Properties | Self::TextureSetSettings => mode != crate::state::Mode::Baking,
             _ => true,
         }
     }
 
-    pub const ALL: [Panel; 12] = [
+    pub const ALL: [Panel; 13] = [
         Panel::Viewport,
         Panel::Assets,
-        Panel::BakeMaps,
-        Panel::BakeSettings,
+        Panel::MeshMapSettings,
+        Panel::CommonSettings,
+        Panel::MeshMapBakers,
         Panel::TextureSetList,
         Panel::Layers,
         Panel::TextureSetSettings,
@@ -84,8 +90,9 @@ impl Panel {
         match self {
             Panel::Viewport => "Viewport",
             Panel::Assets => "Assets",
-            Panel::BakeMaps => "Bake Maps",
-            Panel::BakeSettings => "Settings",
+            Panel::MeshMapSettings => "Mesh Map Settings",
+            Panel::CommonSettings => "Common Settings",
+            Panel::MeshMapBakers => "Mesh Map Bakers",
             Panel::TextureSetList => "Texture Sets",
             Panel::Layers => "Layers",
             Panel::TextureSetSettings => "Texture Set Settings",
@@ -122,8 +129,8 @@ fn tabs(panels: &[Panel]) -> Node<Panel> {
     Node::Tabs { panels: panels.to_vec(), active: 0 }
 }
 
-fn split(axis: SplitAxis, ratio: f32, first: Node<Panel>, second: Node<Panel>) -> Node<Panel> {
-    Node::Split { axis, size: SplitSize::Ratio(ratio), first: Box::new(first), second: Box::new(second) }
+fn split(axis: SplitAxis, size: SplitSize, first: Node<Panel>, second: Node<Panel>) -> Node<Panel> {
+    Node::Split { axis, size, first: Box::new(first), second: Box::new(second) }
 }
 
 /// The default: assets left of the viewport; texture set list, layers (tabbed with the texture
@@ -131,9 +138,14 @@ fn split(axis: SplitAxis, ratio: f32, first: Node<Panel>, second: Node<Panel>) -
 /// shader, history and log are closed and open as floating windows.
 pub fn default_workspace() -> Workspace {
     use Panel::*;
-    let column =
-        split(SplitAxis::Vertical, 0.125, tabs(&[TextureSetList]), split(SplitAxis::Vertical, 0.57, tabs(&[Layers, TextureSetSettings]), tabs(&[Properties])));
-    let root = split(SplitAxis::Horizontal, 0.115, tabs(&[Assets]), split(SplitAxis::Horizontal, 0.78, tabs(&[Viewport]), column));
+    let column = split(
+        SplitAxis::Vertical,
+        SplitSize::Ratio(0.125),
+        tabs(&[TextureSetList]),
+        split(SplitAxis::Vertical, SplitSize::Ratio(0.57), tabs(&[Layers, TextureSetSettings]), tabs(&[Properties])),
+    );
+    let root =
+        split(SplitAxis::Horizontal, SplitSize::Ratio(0.115), tabs(&[Assets]), split(SplitAxis::Horizontal, SplitSize::Ratio(0.78), tabs(&[Viewport]), column));
     let mut workspace = Workspace::new(Layout { root: Some(root), floating: Vec::new() });
     for panel in Panel::ALL {
         if let Some(rect) = panel.float_rect() {
@@ -149,7 +161,7 @@ pub fn default_workspace() -> Workspace {
             workspace.hidden.push((panel, location));
         }
     }
-    for panel in [BakeMaps, BakeSettings] {
+    for panel in [MeshMapSettings, CommonSettings, MeshMapBakers] {
         workspace.hidden.push((
             panel,
             Location {
@@ -206,17 +218,28 @@ pub fn validate(workspace: &Workspace) -> Result<(), String> {
 // ---------------------------------------------------------------------------------------------
 // The live dock
 
+/// Width of the bake layout's texture set and mesh map bakers column, in points
+const BAKERS_COLUMN_WIDTH: f32 = 200.0;
+/// Width of the bake layout's common and mesh map settings column, in points
+const SETTINGS_COLUMN_WIDTH: f32 = 330.0;
+/// Height of the log under the bake layout's columns, in points
+const BAKING_LOG_HEIGHT: f32 = 160.0;
+/// Share of the first bake column the texture set list takes above the mesh map bakers
+const TEXTURE_SET_LIST_SHARE: f32 = 0.4;
+
 /// The dock layout (part of `UiState`; serialized as a craft-ui `Workspace`).
 #[derive(Clone, Debug)]
 pub struct Dock {
     workspace: Workspace,
     /// A panel to bring in front of the other floating windows on the next frame.
     raise: Option<Panel>,
+    /// A saved layout could not be read, so this is the painting default in its place
+    replaced_unreadable: bool,
 }
 
 impl Default for Dock {
     fn default() -> Self {
-        Dock { workspace: default_workspace(), raise: None }
+        Dock { workspace: default_workspace(), raise: None, replaced_unreadable: false }
     }
 }
 
@@ -240,18 +263,27 @@ impl<'de> Deserialize<'de> for Dock {
 }
 
 impl Dock {
-    /// The dock for a saved layout; the default when it is not a valid workspace.
+    /// The dock for a saved layout; the default, marked as a replacement, when it is not a valid workspace
     pub fn from_value(value: Value) -> Dock {
+        let unreadable = Dock { replaced_unreadable: true, ..Dock::default() };
         let default = default_workspace();
         let loaded = serde_json::from_value::<Workspace>(value).ok();
-        let Some(mut workspace) = loaded.filter(|w| validate(w).is_ok()) else { return Dock::default() };
+        let Some(mut workspace) = loaded.filter(|w| validate(w).is_ok()) else { return unreadable };
+
         workspace.reconcile(|_| true, permissions, &default);
         if validate(&workspace).is_err() {
-            return Dock::default();
+            return unreadable;
         }
-        Dock { workspace, raise: None }
+
+        Dock { workspace, raise: None, replaced_unreadable: false }
     }
 
+    /// Whether a saved layout could not be read and this dock is the painting default instead
+    pub(crate) fn replaced_unreadable(&self) -> bool {
+        self.replaced_unreadable
+    }
+
+    /// Texture sets over the bakers, the two settings tabs, the log under both, then the viewport
     pub(crate) fn for_baking() -> Self {
         let mut workspace = default_workspace();
         for panel in [Panel::Assets, Panel::Layers, Panel::TextureSetSettings, Panel::Properties] {
@@ -259,17 +291,19 @@ impl Dock {
                 workspace.hidden.push((panel, location));
             }
         }
-        workspace.hidden.retain(|(panel, _)| !matches!(panel, Panel::BakeMaps | Panel::BakeSettings));
-        workspace.layout = Layout {
-            root: Some(Node::Split {
-                axis: SplitAxis::Horizontal,
-                size: SplitSize::FixedFirst(320.0),
-                first: Box::new(tabs(&[Panel::TextureSetList, Panel::BakeSettings, Panel::BakeMaps])),
-                second: Box::new(tabs(&[Panel::Viewport])),
-            }),
-            floating: Vec::new(),
-        };
-        Dock { workspace, raise: None }
+
+        let bake_panels = [Panel::MeshMapSettings, Panel::CommonSettings, Panel::MeshMapBakers, Panel::Log];
+        workspace.hidden.retain(|(panel, _)| !bake_panels.contains(panel));
+
+        let gutter_width = f32::from(crate::theme::GUTTER);
+        let list_column = split(SplitAxis::Vertical, SplitSize::Ratio(TEXTURE_SET_LIST_SHARE), tabs(&[Panel::TextureSetList]), tabs(&[Panel::MeshMapBakers]));
+        let settings_column = tabs(&[Panel::CommonSettings, Panel::MeshMapSettings]);
+        let columns = split(SplitAxis::Horizontal, SplitSize::FixedFirst(BAKERS_COLUMN_WIDTH), list_column, settings_column);
+        let columns_over_log = split(SplitAxis::Vertical, SplitSize::FixedSecond(BAKING_LOG_HEIGHT), columns, tabs(&[Panel::Log]));
+        let columns_width = BAKERS_COLUMN_WIDTH + gutter_width + SETTINGS_COLUMN_WIDTH;
+        let root = split(SplitAxis::Horizontal, SplitSize::FixedFirst(columns_width), columns_over_log, tabs(&[Panel::Viewport]));
+        workspace.layout = Layout { root: Some(root), floating: Vec::new() };
+        Dock { workspace, raise: None, replaced_unreadable: false }
     }
 
     pub fn workspace(&self) -> &Workspace {
@@ -354,6 +388,17 @@ fn style(ui: &Ui, t: &Tokens) -> DockStyle {
     s
 }
 
+/// Whether a modal layer or update dialog holds the input, so the panels, floating ones included,
+/// do not take it.
+pub(crate) fn input_blocked(app: &TextureCraftApp, context: &egui::Context) -> bool {
+    let modal = context.memory(|memory| memory.top_modal_layer()).is_some();
+    #[cfg(not(target_arch = "wasm32"))]
+    let modal = modal || crate::updates_ui::blocks_input(app);
+    #[cfg(target_arch = "wasm32")]
+    let _ = app;
+    modal
+}
+
 /// Draw the dock (viewport and panels) into `ui`.
 pub fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
     for panel in Panel::ALL {
@@ -366,7 +411,7 @@ pub fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
     let tokens = Tokens::get(&context);
     let style = style(ui, &tokens);
     let layout = app.ui.dock.workspace.layout.clone();
-    let mut area = DockArea::new(area_id()).input_blocked(context.memory(|memory| memory.top_modal_layer()).is_some());
+    let mut area = DockArea::new(area_id()).input_blocked(input_blocked(app, &context));
     if let Some(panel) = app.ui.dock.raise.take() {
         area = area.raise_panel(panel);
     }
@@ -401,9 +446,10 @@ impl DockContent<Panel> for Panels<'_> {
             return;
         }
         egui::Frame::new().inner_margin(Margin::symmetric(8, 4)).show(ui, |ui| match panel {
-            Panel::BakeMaps => crate::bake_mode::bake_body(app, ui),
+            Panel::MeshMapSettings => crate::bake_mode::mesh_map_settings_panel(app, ui),
             Panel::Assets => crate::shelf::body(app, ui),
-            Panel::BakeSettings => crate::bake_mode::settings_body(app, ui),
+            Panel::CommonSettings => crate::bake_mode::common_settings_panel(app, ui),
+            Panel::MeshMapBakers => crate::bake_mode::mesh_map_bakers_panel(app, ui),
             Panel::TextureSetList if app.ui.mode == crate::state::Mode::Baking => crate::bake_mode::texture_sets(app, ui),
             Panel::TextureSetList => crate::dock::texture_set_list(app, ui),
             Panel::Layers => crate::dock::layers(app, ui),
@@ -425,8 +471,6 @@ impl DockContent<Panel> for Panels<'_> {
     fn logical_label(&self, panel: &Panel) -> String {
         match panel {
             Panel::Properties => crate::dock::properties_title(self.app),
-            Panel::BakeMaps => tr("Bake Maps").to_string(),
-            Panel::BakeSettings => tr("Settings").to_string(),
             p => tr(p.name()).to_string(),
         }
     }
@@ -472,6 +516,20 @@ mod tests {
         let dock = Dock::default();
         let json = serde_json::to_string(&dock).unwrap();
         let back: Dock = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, dock);
+    }
+
+    #[test]
+    fn the_bake_dock_round_trips_with_the_log_under_both_settings_columns() {
+        let dock = Dock::for_baking();
+        assert!(validate(dock.workspace()).is_ok());
+        assert_eq!(
+            panels_of(dock.workspace()),
+            [Panel::TextureSetList, Panel::MeshMapBakers, Panel::CommonSettings, Panel::MeshMapSettings, Panel::Log, Panel::Viewport]
+        );
+        assert!(dock.is_visible(Panel::CommonSettings) && !dock.is_visible(Panel::MeshMapSettings));
+
+        let back: Dock = serde_json::from_str(&serde_json::to_string(&dock).unwrap()).unwrap();
         assert_eq!(back, dock);
     }
 

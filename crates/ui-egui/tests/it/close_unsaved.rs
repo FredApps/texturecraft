@@ -56,8 +56,23 @@ fn cancel_keeps_the_app_open() {
 fn closing_without_changes_does_not_ask() {
     let mut h = harness(false);
     request_close(&mut h);
-    assert!(!sent(&h, &ViewportCommand::CancelClose));
+    // macOS keeps the window for `-[NSApplication terminate:]` to close; elsewhere it closes now.
+    assert_eq!(sent(&h, &ViewportCommand::CancelClose), cfg!(target_os = "macos"));
     assert!(h.state().ui.windows.unsaved.is_none());
+}
+
+/// `ui` does not run while the window is minimized, so the close decision is made in `logic`.
+#[test]
+fn closing_a_minimized_window_with_changes_brings_it_back_to_ask() {
+    let mut h = harness(true);
+    let root = h.input_mut().viewports.entry(ViewportId::ROOT).or_default();
+    root.minimized = Some(true);
+    root.events.push(ViewportEvent::Close);
+    h.step();
+    assert!(sent(&h, &ViewportCommand::CancelClose), "the close waits for an answer");
+    assert!(sent(&h, &ViewportCommand::Minimized(false)), "the window comes back");
+    assert!(sent(&h, &ViewportCommand::Focus));
+    assert_eq!(h.state().ui.windows.unsaved, Some(Unsaved::Quit));
 }
 
 /// A project picked or dropped in the browser arrives as bytes; it waits on the same dialog.
@@ -89,4 +104,18 @@ fn closing_the_project_with_changes_asks_first() {
     h.run_steps(2);
     assert_ne!(name(&h), "Edited", "Don't save closes the project");
     assert!(h.state().ui.windows.unsaved.is_none() && !h.state().session.modified);
+}
+
+/// The dialog fits one sentence and one button row instead of growing to the screen height
+#[test]
+fn the_dialog_fits_its_contents() {
+    // The title bar, one line, one button row and margins take 119 px at 1x and the bug made it 420; the 31 px left over absorbs font and theme tweaks
+    const MAX_HEIGHT: f32 = 150.0;
+
+    let mut h = harness(true);
+    request_close(&mut h);
+    h.run_steps(2);
+
+    let dialog = h.ctx.memory(|m| m.area_rect(egui::Id::unique("unsaved"))).expect("the dialog is shown");
+    assert!(dialog.height() < MAX_HEIGHT, "the dialog is {} px tall", dialog.height());
 }

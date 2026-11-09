@@ -4,15 +4,18 @@ use crate::i18n::tr;
 use crate::widgets::icon_button;
 use egui::Ui;
 use egui_phosphor::regular as icon;
-use serde_json::json;
+use serde_json::{Map, Value, json};
 use texturecraft_engine::core::{
     BakeAntialiasing, BakePaintTarget, BakeResolution, BakeSettings, CageType, CommonBakeSettings, MeshMatchMode, SkewCorrectionMethod,
 };
 
-pub(super) fn show(app: &mut TextureCraftApp, ui: &mut Ui, settings: &mut BakeSettings) {
+/// The output and high-poly sections, then cage (needs a high poly) and skew (needs a distance cage)
+pub(super) fn show(app: &mut TextureCraftApp, ui: &mut Ui, settings: &mut BakeSettings) -> Option<Value> {
+    let mut reset = Map::new();
     ui.push_id("common", |ui| {
+        // Restore Defaults keeps whether the texture set is included in the bake
         let is_enabled = settings.common.is_enabled;
-        if section(ui, tr("Common Parameters"), None, |ui| {
+        if section(ui, tr("Common Parameters"), |ui| {
             output_size(ui, &mut settings.common);
             choice(
                 ui,
@@ -29,11 +32,17 @@ pub(super) fn show(app: &mut TextureCraftApp, ui: &mut Ui, settings: &mut BakeSe
             ui.checkbox(&mut settings.common.apply_diffusion, tr("Apply Diffusion"));
         }) {
             settings.common = CommonBakeSettings { is_enabled, ..CommonBakeSettings::default() };
+            let mut defaults = json!(settings.common);
+            if let Some(fields) = defaults.as_object_mut() {
+                fields.remove("is_enabled");
+            }
+            reset.insert("common".into(), defaults);
         }
     });
+
     ui.add_space(8.0);
     ui.push_id("high_poly", |ui| {
-        if section(ui, tr("High-Poly Parameters"), None, |ui| {
+        if section(ui, tr("High-Poly Parameters"), |ui| {
             ui.checkbox(&mut settings.high_poly.use_low_as_high, tr("Use Low Poly Mesh as High Poly Mesh"));
             high_poly_files(app, ui);
             if !app.session.bake_meshes.high.is_empty() {
@@ -50,12 +59,14 @@ pub(super) fn show(app: &mut TextureCraftApp, ui: &mut Ui, settings: &mut BakeSe
             }
         }) {
             settings.high_poly = Default::default();
+            reset.insert("high_poly".into(), json!(settings.high_poly));
         }
     });
+
     if !app.session.bake_meshes.high.is_empty() {
         ui.add_space(8.0);
         ui.push_id("cage", |ui| {
-            if section(ui, tr("Cage"), None, |ui| {
+            if section(ui, tr("Cage"), |ui| {
                 choice(
                     ui,
                     tr("Cage Type"),
@@ -74,12 +85,14 @@ pub(super) fn show(app: &mut TextureCraftApp, ui: &mut Ui, settings: &mut BakeSe
                 }
             }) {
                 settings.cage = Default::default();
+                reset.insert("cage".into(), json!(settings.cage));
             }
         });
+
         if settings.cage.kind == CageType::DistanceBased {
             ui.add_space(8.0);
             ui.push_id("skew", |ui| {
-                if section(ui, tr("Skew Correction"), None, |ui| {
+                if section(ui, tr("Skew Correction"), |ui| {
                     choice(
                         ui,
                         tr("Skew Correction Method"),
@@ -95,16 +108,20 @@ pub(super) fn show(app: &mut TextureCraftApp, ui: &mut Ui, settings: &mut BakeSe
                     number(ui, tr("Edge Contrast"), &mut settings.skew.edge_contrast, 0.0..=1.0, 2);
                 }) {
                     settings.skew = Default::default();
+                    reset.insert("skew".into(), json!(settings.skew));
                 }
             });
         }
     }
+
+    (!reset.is_empty()).then_some(Value::Object(reset))
 }
 
 fn output_size(ui: &mut Ui, settings: &mut CommonBakeSettings) {
     ui.label(tr("Output Size"));
     ui.horizontal(|ui| {
-        let dropdown_width = ((ui.available_width() - 24.0 - ui.spacing().item_spacing.x * 2.0) / 2.0).max(40.0);
+        let button_size = ui.spacing().interact_size.y;
+        let dropdown_width = ((ui.available_width() - button_size - ui.spacing().item_spacing.x * 2.0) / 2.0).max(40.0);
         let resolution = |ui: &mut Ui, id: &str, value: &mut BakeResolution| {
             egui::ComboBox::from_id_salt(id).width(dropdown_width).selected_text(value.pixels().to_string()).show_ui(ui, |ui| {
                 for resolution in BakeResolution::ALL {
@@ -112,6 +129,7 @@ fn output_size(ui: &mut Ui, settings: &mut CommonBakeSettings) {
                 }
             });
         };
+
         resolution(ui, "output_width", &mut settings.resolution);
         let locked = settings.resolution_height.is_none();
         let mut height = settings.resolution_height.unwrap_or(settings.resolution);
@@ -119,7 +137,8 @@ fn output_size(ui: &mut Ui, settings: &mut CommonBakeSettings) {
         if !locked {
             settings.resolution_height = Some(height);
         }
-        if icon_button(ui, if locked { icon::LOCK_SIMPLE } else { icon::LOCK_SIMPLE_OPEN }, tr("Lock Output Size"), locked, 24.0).clicked() {
+
+        if icon_button(ui, if locked { icon::LOCK_SIMPLE } else { icon::LOCK_SIMPLE_OPEN }, tr("Lock Output Size"), locked, button_size).clicked() {
             settings.resolution_height = if locked { Some(settings.resolution) } else { None };
         }
     });
@@ -131,12 +150,15 @@ fn high_poly_files(app: &mut TextureCraftApp, ui: &mut Ui) {
     let mut remove = None;
     for (index, name) in meshes.iter().enumerate() {
         ui.horizontal(|ui| {
-            ui.add_sized([ui.available_width() - 24.0, 24.0], egui::Label::new(name).truncate()).on_hover_text(name);
-            if icon_button(ui, icon::TRASH, tr("Remove"), false, 20.0).clicked() {
+            let button_size = ui.spacing().interact_size.y;
+            let label_width = (ui.available_width() - button_size - ui.spacing().item_spacing.x).max(0.0);
+            ui.add_sized([label_width, ui.spacing().interact_size.y], egui::Label::new(name).truncate()).on_hover_text(name);
+            if icon_button(ui, icon::TRASH, tr("Remove"), false, button_size).clicked() {
                 remove = Some(index);
             }
         });
     }
+
     if meshes.is_empty() {
         hint(ui, tr("No High-Poly Meshes"));
     }
@@ -152,11 +174,13 @@ fn cage_file(app: &mut TextureCraftApp, ui: &mut Ui) {
     ui.label(tr("Cage Scene"));
     let cage = app.session.bake_meshes.cage.as_ref().map(|mesh| mesh.name.clone());
     ui.horizontal(|ui| {
-        ui.add_sized([ui.available_width() - 52.0, 24.0], egui::Label::new(cage.as_deref().unwrap_or("")).truncate());
-        if icon_button(ui, icon::FOLDER_OPEN, tr("Load Cage"), false, 20.0).clicked() {
+        let button_size = ui.spacing().interact_size.y;
+        let label_width = (ui.available_width() - 2.0 * (button_size + ui.spacing().item_spacing.x)).max(0.0);
+        ui.add_sized([label_width, ui.spacing().interact_size.y], egui::Label::new(cage.as_deref().unwrap_or("")).truncate());
+        if icon_button(ui, icon::FOLDER_OPEN, tr("Load Cage"), false, button_size).clicked() {
             crate::web_files::import_bake_mesh(app, &ui.ctx().clone(), true);
         }
-        if cage.is_some() && icon_button(ui, icon::TRASH, tr("Remove Cage"), false, 20.0).clicked() {
+        if cage.is_some() && icon_button(ui, icon::TRASH, tr("Remove Cage"), false, button_size).clicked() {
             app.run("bake.cage.clear", json!({}));
         }
     });

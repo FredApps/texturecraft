@@ -28,6 +28,15 @@ pub fn specs() -> Vec<CommandSpec> {
         ),
         cmd!("camera.remove", "Remove camera", [], None, "{index? | name?}", has_cameras, remove),
         cmd!("camera.rename", "Rename camera", [], None, "{index? | name?, to}", has_cameras, rename),
+        cmd!("camera.bookmark1", "Go to camera 1", ["Viewport"], Some("Ctrl+1"), "{}", always, |s, _| bookmark(s, 0)),
+        cmd!("camera.bookmark2", "Go to camera 2", ["Viewport"], Some("Ctrl+2"), "{}", always, |s, _| bookmark(s, 1)),
+        cmd!("camera.bookmark3", "Go to camera 3", ["Viewport"], Some("Ctrl+3"), "{}", always, |s, _| bookmark(s, 2)),
+        cmd!("camera.bookmark4", "Go to camera 4", ["Viewport"], Some("Ctrl+4"), "{}", always, |s, _| bookmark(s, 3)),
+        cmd!("camera.bookmark5", "Go to camera 5", ["Viewport"], Some("Ctrl+5"), "{}", always, |s, _| bookmark(s, 4)),
+        cmd!("camera.bookmark6", "Go to camera 6", ["Viewport"], Some("Ctrl+6"), "{}", always, |s, _| bookmark(s, 5)),
+        cmd!("camera.bookmark7", "Go to camera 7", ["Viewport"], Some("Ctrl+7"), "{}", always, |s, _| bookmark(s, 6)),
+        cmd!("camera.bookmark8", "Go to camera 8", ["Viewport"], Some("Ctrl+8"), "{}", always, |s, _| bookmark(s, 7)),
+        cmd!("camera.bookmark9", "Go to camera 9", ["Viewport"], Some("Ctrl+9"), "{}", always, |s, _| bookmark(s, 8)),
         cmd!("viewport.focusAt", "Focus depth of field here", [], None, "{x, y (viewport pixels), viewport?: [w, h]}", always, focus_at),
     ]
 }
@@ -132,6 +141,14 @@ fn select(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(crate::view_cmds::camera_json(s))
 }
 
+/// Shortcut slot `slot` (0-based): the n-th saved camera, in list order.
+fn bookmark(s: &mut Session, slot: usize) -> Result<Value> {
+    if slot >= s.doc.project.cameras.len() {
+        return Err(bad("camera.bookmark", "no saved camera in that slot (see camera.list)"));
+    }
+    select(s, &json!({ "index": slot }))
+}
+
 fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     let i = which(s, "camera.remove", p)?;
     s.edit("Remove camera", |s| {
@@ -200,6 +217,25 @@ mod tests {
         assert!(execute(&mut s, "camera.rename", &json!({"index": 0})).is_err(), "`to` is required");
         execute(&mut s, "edit.undo", &Value::Null).unwrap();
         assert_eq!(s.doc.project.cameras.len(), 2, "removing is undoable");
+    }
+
+    #[test]
+    fn number_shortcuts_go_to_the_first_nine_cameras() {
+        let mut s = session();
+        assert!(execute(&mut s, "camera.bookmark1", &Value::Null).is_err(), "no cameras yet");
+        execute(&mut s, "camera.set", &json!({"yaw": 30})).unwrap();
+        let first = s.camera;
+        execute(&mut s, "camera.add", &json!({"name": "A"})).unwrap();
+        execute(&mut s, "camera.orbit", &json!({"dx": 50})).unwrap();
+        execute(&mut s, "camera.add", &json!({"name": "B"})).unwrap();
+        execute(&mut s, "camera.bookmark1", &Value::Null).unwrap();
+        assert_eq!(s.camera, first);
+        execute(&mut s, "camera.bookmark2", &Value::Null).unwrap();
+        assert_eq!(execute(&mut s, "camera.list", &Value::Null).unwrap()["current"], 1);
+        assert!(execute(&mut s, "camera.bookmark3", &Value::Null).is_err(), "empty slot");
+        let ids: Vec<_> = crate::command_specs().iter().filter(|c| c.id.starts_with("camera.bookmark")).collect();
+        assert_eq!(ids.len(), 9);
+        assert!(ids.iter().all(|c| c.shortcut.is_some()));
     }
 
     #[test]

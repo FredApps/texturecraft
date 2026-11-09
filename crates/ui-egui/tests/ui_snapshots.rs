@@ -14,6 +14,12 @@ use texturecraft_ui_egui::state::Mode;
 use texturecraft_ui_egui::theme::Brightness;
 use texturecraft_ui_egui::titlebar::TitleBar;
 
+/// Click a map's row in Mesh Map Bakers, which shows its settings
+fn select_map(harness: &mut Harness<'_, TextureCraftApp>, name: &str) {
+    harness.get_by_role_and_label(egui::Role::Button, name).click();
+    harness.run_steps(3);
+}
+
 fn save(h: &mut Harness<'_, TextureCraftApp>, dir: &Path, name: &str) {
     h.run_steps(6);
     let img = h.render().unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -58,22 +64,20 @@ fn window_snapshots() {
     }
     harness.state_mut().ui.mode = Mode::Baking;
     save(&mut harness, &output_dir, "mode-bake");
-    harness.state_mut().ui.dock.focus(Panel::BakeMaps);
-    harness.run_steps(3);
-    harness.get_by_label("Ambient Occlusion").scroll_to_me();
+    select_map(&mut harness, "Ambient Occlusion");
     save(&mut harness, &output_dir, "mode-bake-maps");
     harness.state_mut().ui.prefs.brightness = Brightness::Light;
     save(&mut harness, &output_dir, "mode-bake-maps-light");
     harness.state_mut().ui.prefs.brightness = Brightness::MediumDark;
-    harness.get_by_label("Opacity").scroll_to_me();
+    select_map(&mut harness, "Opacity");
     save(&mut harness, &output_dir, "mode-bake-unchecked");
     harness.state_mut().ui.dock.focus(Panel::TextureSetList);
     save(&mut harness, &output_dir, "bake-texture-sets");
-    harness.state_mut().ui.dock.focus(Panel::BakeSettings);
+    harness.state_mut().ui.dock.focus(Panel::CommonSettings);
     save(&mut harness, &output_dir, "bake-settings");
     harness.state_mut().session.add_high_poly_bytes("High Poly.obj", b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n".to_vec()).unwrap();
     save(&mut harness, &output_dir, "bake-settings-high-poly");
-    harness.get_by_label("Cage").scroll_to_me();
+    harness.get_by_role_and_label(egui::Role::ComboBox, "Cage Type").scroll_to_me();
     save(&mut harness, &output_dir, "bake-settings-cage-skew");
     harness.get_by_label("Edge Contrast").scroll_to_me();
     save(&mut harness, &output_dir, "bake-settings-skew");
@@ -90,11 +94,9 @@ fn window_snapshots() {
         settings.maps.height.parameters.normalization = HeightNormalization::Manual;
         settings.maps.height.parameters.scaling_divisor = 100.0;
     }
-    harness.state_mut().ui.dock.focus(Panel::BakeMaps);
-    harness.run_steps(3);
-    harness.get_by_label("Curvature").scroll_to_me();
+    select_map(&mut harness, "Curvature");
     save(&mut harness, &output_dir, "bake-curvature-mesh");
-    harness.get_by_label("Scaling Divisor").scroll_to_me();
+    select_map(&mut harness, "Height");
     save(&mut harness, &output_dir, "bake-height-manual");
     harness.state_mut().session.bake_meshes.high.clear();
     harness.state_mut().ui.mode = Mode::Painting;
@@ -157,4 +159,146 @@ fn window_snapshots() {
     save(&mut harness, &output_dir, "brush-ctrl-drag");
     harness.event(egui::Event::PointerButton { pos: cursor_position, button, pressed: false, modifiers });
     harness.event(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
+}
+
+#[test]
+#[ignore]
+fn bake_uv_tiles_snapshot() {
+    let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else {
+        eprintln!("set TC_UI_SNAPSHOTS=<dir> to write the pictures");
+        return;
+    };
+
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let mut session =
+        texturecraft_engine::Session::new_project("UV tile baking", texturecraft_engine::geom::primitives::udim_plane(), "builtin:udim_plane", None, 256)
+            .unwrap();
+    texturecraft_engine::execute(&mut session, "textureSet.tile.resolution", &serde_json::json!({"tile": 1002, "resolution": 128})).unwrap();
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1600.0, 960.0))
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .build_eframe(|context| TextureCraftApp::new(context, session));
+    harness.state_mut().ui.mode = Mode::Baking;
+    save(&mut harness, &output_dir, "bake-uv-tiles");
+
+    harness.get_by_value("128 × 128*").click();
+    save(&mut harness, &output_dir, "bake-tile-resolution-menu");
+    harness.get_by_label("Remove resolution override").click();
+    save(&mut harness, &output_dir, "bake-tile-resolution-inherited");
+    assert!(harness.query_by_value("128 × 128*").is_none());
+    assert!(harness.state().session.doc.project.texture_sets[0].tile_resolutions.is_empty());
+    let inherited_resolution = harness.get_by_label("UV tile 1002 resolution").rect().center();
+    harness.hover_at(inherited_resolution);
+    save(&mut harness, &output_dir, "bake-tile-resolution-hover");
+    assert_eq!(harness.get_all_by_value("256 × 256").count(), 2);
+    harness.hover_at(egui::pos2(900.0, 500.0));
+    harness.state_mut().session.undo().unwrap();
+    harness.run_steps(3);
+
+    harness.get_by_role_and_label(egui::Role::CheckBox, "1002").click();
+    save(&mut harness, &output_dir, "bake-uv-tiles-partial");
+    assert!(harness.state().session.doc.project.texture_sets[0].bake_excluded_tiles.contains(&1002));
+
+    harness.get_by_label("Show or hide the texture set").click();
+    save(&mut harness, &output_dir, "bake-uv-tiles-hidden");
+    assert!(!harness.state().session.doc.project.texture_sets[0].visible);
+    assert!(harness.state().session.doc.project.texture_sets[0].bake.common.is_enabled);
+}
+
+#[test]
+#[ignore]
+fn smart_mask_shelf_snapshot() {
+    let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else {
+        eprintln!("set TC_UI_SNAPSHOTS=<dir> to write the picture");
+        return;
+    };
+
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let session =
+        texturecraft_engine::Session::new_project("Mask previews", texturecraft_engine::geom::primitives::cube(2.0), "builtin:cube", None, 128).unwrap();
+    let mut harness =
+        Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    harness.state_mut().ui.shelf_tab = 2;
+    let context = harness.ctx.clone();
+    let started = std::time::Instant::now();
+    loop {
+        harness.run_steps(1);
+        let thumbnails = &mut harness.state_mut().thumbs;
+        if texturecraft_engine::smart_masks::SMART_MASKS.iter().all(|preset| thumbnails.smart_mask(&context, preset.id).is_some()) {
+            break;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(60), "smart mask thumbnails did not arrive");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    eprintln!("all smart mask thumbnails ready after {:.3} s", started.elapsed().as_secs_f64());
+    save(&mut harness, &output_dir, "smart-mask-shelf");
+
+    let mask = &texturecraft_engine::smart_masks::SMART_MASKS[0];
+    harness.get_by_role_and_label(egui::Role::Button, mask.label).hover();
+    let preview = texturecraft_ui_egui::shelf_preview::ShelfPreview::SmartMask(mask.id);
+    let started = std::time::Instant::now();
+    loop {
+        harness.run_steps(1);
+        if harness.state_mut().thumbs.rendered_big(&context, &preview, 256).is_some() {
+            break;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(60), "smart mask hover preview did not arrive");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    harness.run_steps(60);
+    assert_eq!(harness.query_all_by_label(mask.label).count(), 2, "the popup shows the mask name");
+    save(&mut harness, &output_dir, "smart-mask-hover");
+}
+
+#[test]
+#[ignore]
+fn smart_material_shelf_snapshot() {
+    use texturecraft_engine::materials::MATERIALS;
+    use texturecraft_ui_egui::shelf_preview::ShelfPreview;
+
+    let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else {
+        eprintln!("set TC_UI_SNAPSHOTS=<dir> to write the pictures");
+        return;
+    };
+
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let session =
+        texturecraft_engine::Session::new_project("Smart material previews", texturecraft_engine::geom::primitives::cube(2.0), "builtin:cube", None, 128)
+            .unwrap();
+    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|context| {
+        let render_state = context.wgpu_render_state.as_ref().expect("the snapshot uses wgpu");
+        eprintln!("snapshot adapter: {:?}", render_state.adapter.get_info());
+        TextureCraftApp::new(context, session)
+    });
+    harness.state_mut().ui.shelf_tab = 1;
+    let context = harness.ctx.clone();
+    let started = std::time::Instant::now();
+    loop {
+        harness.run_steps(1);
+        let thumbnails = &mut harness.state_mut().thumbs;
+        if MATERIALS.iter().filter(|material| material.smart).all(|material| thumbnails.material(&context, material.id).is_some()) {
+            break;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(120), "smart material thumbnails did not arrive");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    eprintln!("all smart material thumbnails ready after {:.3} s", started.elapsed().as_secs_f64());
+    save(&mut harness, &output_dir, "smart-material-shelf");
+
+    let material = MATERIALS.iter().find(|material| material.id == "steel_painted_worn").unwrap();
+    harness.get_by_role_and_label(egui::Role::Button, material.label).hover();
+    let preview = ShelfPreview::material(material.id);
+    let started = std::time::Instant::now();
+    loop {
+        harness.run_steps(1);
+        if harness.state_mut().thumbs.rendered_big(&context, &preview, 256).is_some() {
+            break;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(60), "smart material hover preview did not arrive");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    harness.run_steps(60);
+    assert_eq!(harness.query_all_by_label(material.label).count(), 2, "the popup shows the material name");
+    save(&mut harness, &output_dir, "smart-material-hover");
 }
