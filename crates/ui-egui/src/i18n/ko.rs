@@ -1054,4 +1054,10 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Value Bounds Max", "값 상한"),
     ("Value Bounds Min", "값 하한"),
     ("Vertex Color", "정점 색상"),
+    ("Cores kept for the UI", "UI용으로 남겨 둘 코어"),
+    ("Max RAM while saving", "저장 시 최대 RAM"),
+    (
+        "Saving uses the other cores and at most this share of the free RAM. At least one core always works.",
+        "저장은 나머지 코어와 여유 RAM의 이 비율까지만 사용합니다. 최소 한 개의 코어는 항상 작동합니다.",
+    ),
 ];

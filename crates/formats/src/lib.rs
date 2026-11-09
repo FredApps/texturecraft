@@ -54,7 +54,7 @@ pub use export::write_files;
 #[cfg(not(target_arch = "wasm32"))]
 pub use mesh_import::{import_mesh, read_mesh_file};
 #[cfg(not(target_arch = "wasm32"))]
-pub use project_file::{load_project, save_project};
+pub use project_file::{DEFAULT_RAM_PERCENT, DEFAULT_RESERVED_CORES, load_project, save_project, set_save_resources};
 
 #[derive(Debug, thiserror::Error)]
 pub enum FormatError {

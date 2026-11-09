@@ -28,7 +28,12 @@ use texturecraft_texel::{TILE_AREA, TileImage};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
+use self::entries::Entry;
 use crate::{FormatError, MAX_IMAGE_SIZE, Result, malformed};
+
+mod entries;
+#[cfg(not(target_arch = "wasm32"))]
+pub use entries::{DEFAULT_RAM_PERCENT, DEFAULT_RESERVED_CORES, set_save_resources};
 
 const KIND: &str = "project file";
 const MAGIC: &[u8; 4] = b"TCTX";
@@ -38,8 +43,6 @@ const MAX_JSON: u64 = 256 << 20;
 const MAX_THUMBNAIL: u64 = 64 << 20;
 const MAX_RESOURCE: u64 = 512 << 20;
 const MAX_ENTRIES: usize = 100_000;
-/// Total decompressed bytes accepted from one project file (zip-bomb guard).
-const MAX_TOTAL: u64 = 8 << 30;
 /// Largest image (texels) of a texture set or baked map: UV-tiled sets hold several tiles.
 const MAX_TEXELS: u64 = 1 << 28;
 
@@ -80,7 +83,6 @@ pub fn sanitize_resource_name(name: &str) -> String {
 // Save.
 
 pub fn save_project_bytes(pf: &ProjectFile) -> Result<Vec<u8>> {
-    check_loadable(pf, MAX_TOTAL)?;
     let mut out = Cursor::new(Vec::new());
     write_project(&mut out, pf)?;
     Ok(out.into_inner())
@@ -89,14 +91,6 @@ pub fn save_project_bytes(pf: &ProjectFile) -> Result<Vec<u8>> {
 /// Save atomically: `<path>.tmp` first, then rename over `path`.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn save_project(path: &std::path::Path, pf: &ProjectFile) -> Result<()> {
-    save_project_limited(path, pf, MAX_TOTAL)
-}
-
-/// [`save_project`] with the size [`load`] would accept as a parameter (tests lower it).
-#[cfg(not(target_arch = "wasm32"))]
-fn save_project_limited(path: &std::path::Path, pf: &ProjectFile, limit: u64) -> Result<()> {
-    // Before the temp file exists, so a refusal leaves the file on disk as it was.
-    check_loadable(pf, limit)?;
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = std::path::PathBuf::from(tmp);
@@ -111,49 +105,6 @@ fn save_project_limited(path: &std::path::Path, pf: &ProjectFile, limit: u64) ->
         let _ = std::fs::remove_file(&tmp);
     }
     res
-}
-
-/// Decompressed bytes that [`load`] counts against [`MAX_TOTAL`] when it reads `pf` back: the
-/// payload of every entry it reads, without the `.bin` headers. Keep in step with `load`
-/// (`load_size_matches_what_load_counts` checks it). Pixels of layers that are in no stack are
-/// dropped by `load` without counting, so they are not counted here either.
-fn load_size(pf: &ProjectFile) -> Result<u64> {
-    let json = serde_json::to_vec_pretty(&pf.project).map_err(|e| FormatError::Invalid(e.to_string()))?;
-    let mut n = json.len() as u64;
-    n += pf.mesh.iter().map(|(_, b)| b.len() as u64).sum::<u64>();
-    n += pf.high_poly.iter().map(|(_, b)| b.len() as u64).sum::<u64>();
-    n += pf.cage.iter().map(|(_, b)| b.len() as u64).sum::<u64>();
-    n += pf.thumbnail.iter().map(|b| b.len() as u64).sum::<u64>();
-    n += pf.resources.values().map(|b| b.len() as u64).sum::<u64>();
-    n += pf.bake_paint.values().map(|m| m.values.len() as u64 * 4).sum::<u64>();
-    let tiles = |img: &TileImage| (img.allocated_count() as u64) * (TILE_AREA * img.comps() * 2) as u64;
-    n += pf.pixels.layers.iter().filter(|((id, _), _)| texture_set_of(&pf.project, *id).is_some()).map(|(_, img)| tiles(img)).sum::<u64>();
-    n += pf.pixels.masks.iter().filter(|(id, _)| texture_set_of(&pf.project, **id).is_some()).map(|(_, img)| tiles(img)).sum::<u64>();
-    // `load` skips the baked maps of a texture set that no longer exists.
-    for maps in pf.baked.iter().filter(|(ts, _)| **ts < pf.project.texture_sets.len()).map(|(_, m)| m) {
-        for (m, data) in &maps.maps {
-            let h = maps.height(*m);
-            if h != 0 && data.len() == (maps.resolution as usize) * (h as usize) * m.components() {
-                n += data.len() as u64 * 4;
-            }
-        }
-    }
-    Ok(n)
-}
-
-/// Refuse to save a project that [`load`] would reject as too large, before anything is written.
-fn check_loadable(pf: &ProjectFile, limit: u64) -> Result<()> {
-    let size = load_size(pf)?;
-    if size > limit {
-        let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
-        return Err(FormatError::TooLarge(format!(
-            "the project holds {:.2} GiB ({size} bytes) of data once unpacked, but TextureCraft opens project files only up to {:.2} GiB ({limit} bytes), so nothing was saved and an existing file is unchanged. \
-             Remove paint layers or baked maps to make it smaller",
-            gib(size),
-            gib(limit)
-        )));
-    }
-    Ok(())
 }
 
 fn zip_err(e: zip::result::ZipError) -> FormatError {
@@ -208,21 +159,42 @@ fn unique_entry_name(dir: &str, name: &str, used: &mut HashSet<String>) -> Strin
     entry
 }
 
-fn write_project<W: Write + Seek>(out: W, pf: &ProjectFile) -> Result<()> {
-    let mut zip = ZipWriter::new(out);
+/// Floats converted to bytes at a time when a baked map streams into the compressor.
+const BAKED_CHUNK: usize = 1 << 16;
+
+fn write_baked(w: &mut dyn Write, res: u32, h: u32, comps: usize, data: &[f32]) -> std::io::Result<()> {
+    w.write_all(&header(res, h, comps, 0))?;
+    let mut buf = Vec::with_capacity(BAKED_CHUNK * 4);
+    for chunk in data.chunks(BAKED_CHUNK) {
+        buf.clear();
+        buf.extend(chunk.iter().flat_map(|v| v.to_le_bytes()));
+        w.write_all(&buf)?;
+    }
+    Ok(())
+}
+
+/// The zip entries of a project file, in file order. Bodies run later, possibly on other threads.
+fn entries(pf: &ProjectFile) -> Result<Vec<Entry<'_>>> {
     let deflate = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated).large_file(true);
     let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
     let json = serde_json::to_vec_pretty(&pf.project).map_err(|e| FormatError::Invalid(e.to_string()))?;
-    zip.start_file("project.json", deflate).map_err(zip_err)?;
-    zip.write_all(&json)?;
+    let mut out = vec![Entry { name: "project.json".into(), options: deflate, weight: json.len() as u64, body: Box::new(move |w| w.write_all(&json)) }];
     if let Some((ext, bytes)) = &pf.mesh {
-        zip.start_file(format!("mesh.{}", sanitize_ext(ext)), deflate).map_err(zip_err)?;
-        zip.write_all(bytes)?;
+        out.push(Entry {
+            name: format!("mesh.{}", sanitize_ext(ext)),
+            options: deflate,
+            weight: bytes.len() as u64,
+            body: Box::new(move |w| w.write_all(bytes)),
+        });
     }
     let mut used = HashSet::new();
     for (dir, (name, bytes)) in pf.high_poly.iter().map(|m| ("highpoly", m)).chain(pf.cage.iter().map(|m| ("cage", m))) {
-        zip.start_file(unique_entry_name(dir, name, &mut used), deflate).map_err(zip_err)?;
-        zip.write_all(bytes)?;
+        out.push(Entry {
+            name: unique_entry_name(dir, name, &mut used),
+            options: deflate,
+            weight: bytes.len() as u64,
+            body: Box::new(move |w| w.write_all(bytes)),
+        });
     }
     for ((texture_set, target), map) in &pf.bake_paint {
         if map.width == 0 || map.height == 0 || map.values.len() as u64 != u64::from(map.width) * u64::from(map.height) {
@@ -232,23 +204,29 @@ fn write_project<W: Write + Seek>(out: W, pf: &ProjectFile) -> Result<()> {
             BakePaintTarget::Cage => "cage",
             BakePaintTarget::Skew => "skew",
         };
-        zip.start_file(format!("bake_paint/{texture_set}_{target_name}.bin"), deflate).map_err(zip_err)?;
-        zip.write_all(&header(map.width, map.height, 1, 0))?;
-        for value in &map.values {
-            zip.write_all(&value.to_le_bytes())?;
-        }
+        out.push(Entry {
+            name: format!("bake_paint/{texture_set}_{target_name}.bin"),
+            options: deflate,
+            weight: map.values.len() as u64 * 4,
+            body: Box::new(move |w| write_baked(w, map.width, map.height, 1, &map.values)),
+        });
     }
     let mut layers: Vec<_> = pf.pixels.layers.iter().collect();
     layers.sort_by_key(|(k, _)| **k);
     for ((id, c), img) in layers {
-        zip.start_file(format!("pixels/layer_{}_{}.bin", id.0, c.id()), deflate).map_err(zip_err)?;
-        write_tiles(&mut zip, img)?;
+        let weight = (img.allocated_count() * (TILE_AREA * img.comps() * 2 + 8)) as u64;
+        out.push(Entry {
+            name: format!("pixels/layer_{}_{}.bin", id.0, c.id()),
+            options: deflate,
+            weight,
+            body: Box::new(move |mut w| write_tiles(&mut w, img)),
+        });
     }
     let mut masks: Vec<_> = pf.pixels.masks.iter().collect();
     masks.sort_by_key(|(k, _)| **k);
     for (id, img) in masks {
-        zip.start_file(format!("pixels/mask_{}.bin", id.0), deflate).map_err(zip_err)?;
-        write_tiles(&mut zip, img)?;
+        let weight = (img.allocated_count() * (TILE_AREA * img.comps() * 2 + 8)) as u64;
+        out.push(Entry { name: format!("pixels/mask_{}.bin", id.0), options: deflate, weight, body: Box::new(move |mut w| write_tiles(&mut w, img)) });
     }
     for (ts, maps) in &pf.baked {
         let r = maps.resolution;
@@ -258,21 +236,33 @@ fn write_project<W: Write + Seek>(out: W, pf: &ProjectFile) -> Result<()> {
             if h == 0 || data.len() != (r as usize) * (h as usize) * m.components() {
                 continue;
             }
-            zip.start_file(format!("baked/{ts}_{}.bin", m.id()), deflate).map_err(zip_err)?;
-            zip.write_all(&header(r, h, m.components(), 0))?;
-            let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-            zip.write_all(&bytes)?;
+            let comps = m.components();
+            out.push(Entry {
+                name: format!("baked/{ts}_{}.bin", m.id()),
+                options: deflate,
+                weight: data.len() as u64 * 4,
+                body: Box::new(move |w| write_baked(w, r, h, comps, data)),
+            });
         }
     }
     if let Some(png) = &pf.thumbnail {
-        zip.start_file("thumbnail.png", stored).map_err(zip_err)?;
-        zip.write_all(png)?;
+        out.push(Entry { name: "thumbnail.png".into(), options: stored, weight: png.len() as u64, body: Box::new(move |w| w.write_all(png)) });
     }
     used.clear();
     for (name, bytes) in &pf.resources {
-        zip.start_file(unique_entry_name("resources", name, &mut used), stored).map_err(zip_err)?;
-        zip.write_all(bytes)?;
+        out.push(Entry {
+            name: unique_entry_name("resources", name, &mut used),
+            options: stored,
+            weight: bytes.len() as u64,
+            body: Box::new(move |w| w.write_all(bytes)),
+        });
     }
+    Ok(out)
+}
+
+fn write_project<W: Write + Seek>(out: W, pf: &ProjectFile) -> Result<()> {
+    let mut zip = ZipWriter::new(out);
+    entries::write_entries(&mut zip, entries(pf)?)?;
     zip.finish().map_err(zip_err)?;
     Ok(())
 }
@@ -290,26 +280,12 @@ pub fn load_project(path: &std::path::Path) -> Result<ProjectFile> {
     crate::guard(KIND, || load(std::io::BufReader::new(file)))
 }
 
-/// Counts decompressed bytes against [`MAX_TOTAL`].
-struct Budget(u64);
-
-impl Budget {
-    fn take(&mut self, n: u64) -> Result<()> {
-        self.0 = self.0.saturating_add(n);
-        if self.0 > MAX_TOTAL {
-            return Err(FormatError::TooLarge(format!("project file decompresses to more than {MAX_TOTAL} bytes")));
-        }
-        Ok(())
-    }
-}
-
-fn read_all(r: &mut impl Read, cap: u64, budget: &mut Budget, what: &str) -> Result<Vec<u8>> {
+fn read_all(r: &mut impl Read, cap: u64, what: &str) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     r.take(cap.saturating_add(1)).read_to_end(&mut out).map_err(|e| malformed(KIND, format!("{what}: {e}")))?;
     if out.len() as u64 > cap {
         return Err(FormatError::TooLarge(format!("{what} is larger than {cap} bytes")));
     }
-    budget.take(out.len() as u64)?;
     Ok(out)
 }
 
@@ -345,7 +321,7 @@ fn expect_end(r: &mut impl Read, what: &str) -> Result<()> {
     }
 }
 
-fn read_tiles(r: &mut impl Read, size: (u32, u32), comps: usize, budget: &mut Budget, what: &str) -> Result<TileImage> {
+fn read_tiles(r: &mut impl Read, size: (u32, u32), comps: usize, what: &str) -> Result<TileImage> {
     let (w, h, c, count) = read_header(r, what)?;
     if (w, h) != size || c != comps {
         return Err(malformed(KIND, format!("{what}: {w}×{h}×{c} does not match the texture set ({}×{}×{comps})", size.0, size.1)));
@@ -363,7 +339,6 @@ fn read_tiles(r: &mut impl Read, size: (u32, u32), comps: usize, budget: &mut Bu
             return Err(malformed(KIND, format!("{what}: bad or repeated tile ({tx}, {ty})")));
         }
         read_exact(r, &mut buf, what)?;
-        budget.take(buf.len() as u64)?;
         let data: Vec<u16> = buf.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
         img.set_tile(tx, ty, Some(Arc::new(data)));
     }
@@ -372,13 +347,12 @@ fn read_tiles(r: &mut impl Read, size: (u32, u32), comps: usize, budget: &mut Bu
 }
 
 /// A baked map: (width, height, data).
-fn read_baked(r: &mut impl Read, comps: usize, budget: &mut Budget, what: &str) -> Result<(u32, u32, Vec<f32>)> {
+fn read_baked(r: &mut impl Read, comps: usize, what: &str) -> Result<(u32, u32, Vec<f32>)> {
     let (w, h, c, _) = read_header(r, what)?;
     if w == 0 || h == 0 || u64::from(w) * u64::from(h) > MAX_TEXELS || c != comps {
         return Err(malformed(KIND, format!("{what}: bad size {w}×{h}×{c}")));
     }
     let len = (w as usize) * (h as usize) * comps;
-    budget.take(len as u64 * 4)?;
     let mut bytes = vec![0u8; len * 4];
     read_exact(r, &mut bytes, what)?;
     expect_end(r, what)?;
@@ -392,18 +366,12 @@ fn texture_set_of(project: &Project, id: LayerId) -> Option<usize> {
 }
 
 fn load<R: Read + Seek>(reader: R) -> Result<ProjectFile> {
-    load_counted(reader).map(|(pf, _)| pf)
-}
-
-/// [`load`], also returning the decompressed bytes it counted against [`MAX_TOTAL`].
-fn load_counted<R: Read + Seek>(reader: R) -> Result<(ProjectFile, u64)> {
     let mut zip = ZipArchive::new(reader).map_err(zip_err)?;
     if zip.len() > MAX_ENTRIES {
         return Err(FormatError::TooLarge(format!("project file has more than {MAX_ENTRIES} entries")));
     }
 
-    let mut budget = Budget(0);
-    let json = read_all(&mut zip.by_name("project.json").map_err(zip_err)?, MAX_JSON, &mut budget, "project.json")?;
+    let json = read_all(&mut zip.by_name("project.json").map_err(zip_err)?, MAX_JSON, "project.json")?;
     #[derive(serde::Deserialize)]
     struct Version {
         format_version: u32,
@@ -438,20 +406,20 @@ fn load_counted<R: Read + Seek>(reader: R) -> Result<(ProjectFile, u64)> {
         let name = f.name().map_err(zip_err)?.into_owned();
         let size_of = |id: LayerId| texture_set_of(&pf.project, id).and_then(|ts| pf.project.texture_sets.get(ts)).map(|t| t.size());
         if name == "thumbnail.png" {
-            pf.thumbnail = Some(read_all(&mut f, MAX_THUMBNAIL, &mut budget, &name)?);
+            pf.thumbnail = Some(read_all(&mut f, MAX_THUMBNAIL, &name)?);
         } else if let Some(res_name) = name.strip_prefix("resources/") {
             if res_name.is_empty() || sanitize_resource_name(res_name) != res_name {
                 return Err(malformed(KIND, format!("bad resource name {name}")));
             }
 
-            let bytes = read_all(&mut f, MAX_RESOURCE, &mut budget, &name)?;
+            let bytes = read_all(&mut f, MAX_RESOURCE, &name)?;
             pf.resources.insert(res_name.to_string(), bytes);
         } else if let Some((dir, file)) = name.split_once('/').filter(|(d, _)| *d == "highpoly" || *d == "cage") {
             if file.is_empty() || sanitize_resource_name(file) != file {
                 return Err(malformed(KIND, format!("bad mesh name {name}")));
             }
 
-            let entry = (file.to_string(), read_all(&mut f, crate::mesh_import::MAX_MESH_FILE_BYTES, &mut budget, &name)?);
+            let entry = (file.to_string(), read_all(&mut f, crate::mesh_import::MAX_MESH_FILE_BYTES, &name)?);
             match dir {
                 "cage" => pf.cage = Some(entry),
                 _ => pf.high_poly.push(entry),
@@ -468,10 +436,10 @@ fn load_counted<R: Read + Seek>(reader: R) -> Result<(ProjectFile, u64)> {
                 "skew" => BakePaintTarget::Skew,
                 _ => return Err(malformed(KIND, format!("unknown bake paint target in {name}"))),
             };
-            let (width, height, values) = read_baked(&mut f, 1, &mut budget, &name)?;
+            let (width, height, values) = read_baked(&mut f, 1, &name)?;
             pf.bake_paint.insert((texture_set, target), BakePaintData { width, height, values });
         } else if let Some(ext) = name.strip_prefix("mesh.").filter(|e| !e.contains('/')) {
-            let bytes = read_all(&mut f, crate::mesh_import::MAX_MESH_FILE_BYTES, &mut budget, &name)?;
+            let bytes = read_all(&mut f, crate::mesh_import::MAX_MESH_FILE_BYTES, &name)?;
             pf.mesh = Some((ext.to_string(), bytes));
         } else if let Some(rest) = name.strip_prefix("pixels/layer_").and_then(|r| r.strip_suffix(".bin")) {
             let (id, chan) = rest.split_once('_').ok_or_else(|| malformed(KIND, format!("bad entry name {name}")))?;
@@ -480,13 +448,13 @@ fn load_counted<R: Read + Seek>(reader: R) -> Result<(ProjectFile, u64)> {
             // Drop pixels of layers that are no longer in any stack
             let Some(size) = size_of(id) else { continue };
 
-            let img = read_tiles(&mut f, size, c.components() + 1, &mut budget, &name)?;
+            let img = read_tiles(&mut f, size, c.components() + 1, &name)?;
             pf.pixels.layers.insert((id, c), img);
         } else if let Some(rest) = name.strip_prefix("pixels/mask_").and_then(|r| r.strip_suffix(".bin")) {
             let id = LayerId(rest.parse().map_err(|_| malformed(KIND, format!("bad entry name {name}")))?);
             let Some(size) = size_of(id) else { continue };
 
-            let img = read_tiles(&mut f, size, 2, &mut budget, &name)?;
+            let img = read_tiles(&mut f, size, 2, &name)?;
             pf.pixels.masks.insert(id, img);
         } else if let Some(rest) = name.strip_prefix("baked/").and_then(|r| r.strip_suffix(".bin")) {
             let (ts, map) = rest.split_once('_').ok_or_else(|| malformed(KIND, format!("bad entry name {name}")))?;
@@ -500,7 +468,7 @@ fn load_counted<R: Read + Seek>(reader: R) -> Result<(ProjectFile, u64)> {
                 continue;
             }
 
-            let (res, height, data) = read_baked(&mut f, m.components(), &mut budget, &name)?;
+            let (res, height, data) = read_baked(&mut f, m.components(), &name)?;
             let maps = pf.baked.entry(ts).or_default();
             if maps.maps.is_empty() {
                 maps.resolution = res;
@@ -518,7 +486,7 @@ fn load_counted<R: Read + Seek>(reader: R) -> Result<(ProjectFile, u64)> {
         );
     }
 
-    Ok((pf, budget.0))
+    Ok(pf)
 }
 
 #[cfg(test)]

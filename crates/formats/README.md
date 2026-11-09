@@ -147,8 +147,8 @@ Baked maps: the same header with 0 tiles, then `width × height × components` f
 
 Loading runs `Project::validate`, refuses a newer `format_version` (`FormatError::NewerVersion`),
 checks every tile against its texture set's resolution and component count, rejects repeated or
-out-of-range tiles and trailing data, drops pixels of layers that are in no stack, and caps the
-total decompressed size at 8 GiB.
+out-of-range tiles and trailing data, drops pixels of layers that are in no stack. Single resources
+and meshes have size limits; the project as a whole has none.
 
 Unreadable bake settings fall back to defaults field by field while readable settings and project
 content are retained. Legacy baked-map filenames remain readable; unsupported baked-map types are
