@@ -15,6 +15,8 @@ eframe = { workspace = true, features = ["default_fonts", "wgpu", "persistence"]
 egui = { workspace = true }
 craft-ui = { workspace = true }
 craft-window = { workspace = true }
+craft-keymap = { workspace = true }
+craft-quit = { workspace = true }
 egui-phosphor = { version = "0.14", features = ["regular", "fill"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -22,7 +24,6 @@ rayon = { workspace = true }
 log = { workspace = true }
 base64 = "0.22"
 image = { workspace = true }
-rfd = { workspace = true }
 zip = { workspace = true }
 
 # The OS UI language for the first run (MIT OR Apache-2.0; the browser asks `navigator.language`).
@@ -30,6 +31,10 @@ zip = { workspace = true }
 sys-locale = "0.3"
 # Floating panels open as OS windows.
 craft-ui = { workspace = true, features = ["native-windows"] }
+# Help > Check for Updates and the check at start (updates_ui.rs).
+craft-update = { workspace = true }
+# Native file dialogs (file_dialogs.rs); the browser build has none.
+craft-dialogs = { workspace = true }
 
 # build.rs: the interface faces lose their Private Use Area, where the icon font draws (the
 # versions craft-libs' craft-fonts-build subsets with).
@@ -39,6 +44,7 @@ skrifa = { version = "0.48", default-features = false, features = ["std"] }
 
 # Browser file I/O (web_files.rs): async pickers and Blob downloads.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+rfd = { workspace = true }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"

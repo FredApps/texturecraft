@@ -11,7 +11,9 @@ use texturecraft_engine::Session;
 use texturecraft_engine::compose::{DisplayKind, ImageRes, tile_bytes};
 use texturecraft_engine::core::BakedMap;
 use texturecraft_engine::geom::Mesh;
-use texturecraft_render::{Frame, Renderer, wgpu};
+use texturecraft_render::{BakeVisualization, Frame, Renderer, wgpu};
+
+use crate::bake_scene::{BakeSceneLink, CageUpload};
 
 /// Content shown through the aux texture.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -25,6 +27,9 @@ pub enum AuxView {
 /// A texture set's texels across and down, and its mesh material.
 pub type SetLayout = ((u32, u32), usize);
 
+/// The low poly's UV seam edges (vertex pairs) per material
+pub type UvSeamEdges = Vec<Vec<(u32, u32)>>;
+
 /// What the renderer must catch up with before drawing.
 #[derive(Default)]
 pub struct SceneSync {
@@ -36,6 +41,16 @@ pub struct SceneSync {
     pub env: Option<(String, Option<Arc<ImageRes>>)>,
     pub tiles: Vec<(usize, DisplayKind, u32, u32, Vec<u8>)>,
     pub aux: Vec<(usize, u32, Vec<u8>)>,
+    /// Bake mode's high poly (`None` removes it) and the id it is sent under
+    pub bake_high: Option<(Option<Arc<Mesh>>, u64)>,
+    /// Which vertices of the high poly (by its id) the bake's rays miss (1) or reach (0)
+    pub bake_high_missed: Option<(u64, Vec<f32>)>,
+    /// Changed cages: texture set, the cage or `None` to remove it, its topology
+    pub bake_cages: Vec<(usize, Option<CageUpload>, u64)>,
+    /// Texture sets left after some were removed: their cages go too
+    pub bake_cage_count: Option<usize>,
+    /// The low poly's UV seams per material, for mesh id
+    pub uv_seams: Option<(u64, UvSeamEdges)>,
 }
 
 /// Lives in egui's callback resources.
@@ -78,6 +93,7 @@ pub struct GpuLink {
     pub adapter: String,
     /// Most tiles waiting to be composited since compositing last caught up (progress).
     composite_total: usize,
+    bake_scene: BakeSceneLink,
 }
 
 /// Compositing time per frame: a full recomposite of a large texture set spreads over frames.
@@ -124,6 +140,7 @@ pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
         aux: BTreeMap::new(),
         adapter: format!("{} ({:?})", info.name, info.backend),
         composite_total: 0,
+        bake_scene: BakeSceneLink::default(),
     }
 }
 
@@ -133,131 +150,157 @@ impl GpuLink {
         std::mem::take(&mut *self.reports.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
-    /// Collect everything the GPU needs this frame (runs the compositor first).
+    /// Whether bake mode's visualization is still being worked out off the UI thread
+    pub fn bake_busy(&self) -> bool {
+        self.bake_scene.busy()
+    }
+
     /// Compositing progress (0..1) while tiles wait to be composited.
     pub fn composite_progress(&self, s: &Session) -> Option<f32> {
         let pending = s.pending_tiles();
         (pending > 0 && self.composite_total > 0).then(|| 1.0 - pending as f32 / self.composite_total as f32)
     }
 
-    /// `spent_ms`: time this frame already took before the sync.
-    pub fn sync(&mut self, s: &mut Session, aux_map: Option<AuxView>, shift: u32, spent_ms: f64) -> SceneSync {
-        let start = crate::now_ms();
+    /// Collect everything the GPU needs this frame, running the compositor first: `bake` is what bake mode's 3D view draws besides the low poly, `spent_ms` the time this frame already took
+    pub fn sync(&mut self, session: &mut Session, aux_map: Option<AuxView>, bake: Option<BakeVisualization>, shift: u32, spent_ms: f64) -> SceneSync {
+        let start_ms = crate::now_ms();
         let mut queued = 0usize;
-        let left = |queued: usize| FRAME_BUDGET_MS - spent_ms - (crate::now_ms() - start) - queued as f64 * UPLOAD_MS_PER_TILE;
-        let pending = s.pending_tiles();
+        let time_left_ms = |queued: usize| FRAME_BUDGET_MS - spent_ms - (crate::now_ms() - start_ms) - queued as f64 * UPLOAD_MS_PER_TILE;
+        let pending = session.pending_tiles();
         self.composite_total = if pending == 0 { 0 } else { self.composite_total.max(pending) };
-        s.update_for(COMPOSITE_BUDGET_MS.min(left(0)).max(MIN_SLICE_MS), crate::now_ms);
+        session.update_for(COMPOSITE_BUDGET_MS.min(time_left_ms(0)).max(MIN_SLICE_MS), crate::now_ms);
+
         let mut out = SceneSync::default();
         if self.lost.swap(false, Ordering::AcqRel) {
             self.mesh_id = 0;
             self.sets.clear();
             self.env = Default::default();
+            self.bake_scene.resend();
             self.reset.store(true, Ordering::Release);
         }
-        if self.mesh_id != s.mesh_id {
-            out.mesh = Some((s.mesh.clone(), s.mesh_id));
-            self.mesh_id = s.mesh_id;
+
+        if self.mesh_id != session.mesh_id {
+            out.mesh = Some((session.mesh.clone(), session.mesh_id));
+            self.mesh_id = session.mesh_id;
             self.aux.clear();
         }
-        let sets: Vec<SetLayout> = s.doc.project.texture_sets.iter().map(|t| (t.size(), t.material)).collect();
+
+        let sets: Vec<SetLayout> = session.doc.project.texture_sets.iter().map(|texture_set| (texture_set.size(), texture_set.material)).collect();
         if sets != self.sets || shift != self.shift || out.mesh.is_some() {
-            out.sets = Some((sets.clone(), s.mesh.materials.len().max(1), shift));
+            out.sets = Some((sets.clone(), session.mesh.materials.len().max(1), shift));
             self.sets = sets;
             self.shift = shift;
         }
-        let d = &s.doc.project.display;
-        let image = d.environment_resource().and_then(|n| s.images.get(n));
-        let ptr = image.map_or(0, |i| Arc::as_ptr(i) as usize);
-        if self.env.0 != d.environment || self.env.1 != ptr {
-            self.env = (d.environment.clone(), ptr);
-            out.env = Some((d.environment.clone(), image.cloned()));
+
+        let display = &session.doc.project.display;
+        let image = display.environment_resource().and_then(|name| session.images.get(name));
+        let image_identity = image.map_or(0, |image| Arc::as_ptr(image) as usize);
+        if self.env.0 != display.environment || self.env.1 != image_identity {
+            self.env = (display.environment.clone(), image_identity);
+            out.env = Some((display.environment.clone(), image.cloned()));
         }
+
         if self.reset.swap(false, Ordering::AcqRel) {
-            for c in &mut s.caches {
-                c.upload.extend(texturecraft_engine::compose::all_tiles(c.size.0, c.size.1));
+            for cache in &mut session.caches {
+                cache.upload.extend(texturecraft_engine::compose::all_tiles(cache.size.0, cache.size.1));
             }
             self.aux.clear();
         }
-        for ts in 0..s.caches.len() {
-            let tiles = s.take_uploads(ts);
+
+        for texture_set in 0..session.caches.len() {
+            let tiles = session.take_uploads(texture_set);
             if tiles.is_empty() {
                 continue;
             }
+
             let mut done = 0;
-            if let Some(cache) = s.caches.get(ts) {
+            if let Some(cache) = session.caches.get(texture_set) {
                 let empty = Default::default();
-                let baked = s.doc.baked.get(&ts).unwrap_or(&empty);
-                let comp = &cache.composite;
-                // In chunks while the frame has time (at least one chunk); the rest waits.
+                let baked = session.doc.baked.get(&texture_set).unwrap_or(&empty);
+                let composite = &cache.composite;
+                // In chunks while the frame has time (at least one chunk); the rest waits
                 for chunk in tiles.chunks(UPLOAD_CHUNK) {
                     let bytes: Vec<_> = chunk
                         .par_iter()
-                        .flat_map_iter(|&(tx, ty)| DisplayKind::ALL.into_iter().map(move |k| (k, tx, ty)))
-                        .map(|(k, tx, ty)| (ts, k, tx, ty, tile_bytes(comp, baked, k, tx, ty)))
+                        .flat_map_iter(|&(tile_x, tile_y)| DisplayKind::ALL.into_iter().map(move |kind| (kind, tile_x, tile_y)))
+                        .map(|(kind, tile_x, tile_y)| (texture_set, kind, tile_x, tile_y, tile_bytes(composite, baked, kind, tile_x, tile_y)))
                         .collect();
                     queued += bytes.len();
                     out.tiles.extend(bytes);
                     done += chunk.len();
-                    if left(queued) < MIN_SLICE_MS {
+                    if time_left_ms(queued) < MIN_SLICE_MS {
                         break;
                     }
                 }
             }
-            if let (Some(rest), Some(cache)) = (tiles.get(done..), s.caches.get_mut(ts)) {
+            if let (Some(rest), Some(cache)) = (tiles.get(done..), session.caches.get_mut(texture_set)) {
                 cache.upload.extend(rest.iter().copied());
             }
         }
+
         match aux_map {
-            Some(AuxView::MeshMap(m)) => {
-                for ts in 0..s.caches.len() {
-                    let rev = s.doc.baked.get(&ts).and_then(|b| b.maps.get(&m)).map(|d| Arc::as_ptr(d) as u64).unwrap_or(0);
-                    let key = (format!("{m:?}"), rev);
-                    if self.aux.get(&ts) == Some(&key) {
+            Some(AuxView::MeshMap(map)) => {
+                for texture_set in 0..session.caches.len() {
+                    let revision = session.doc.baked.get(&texture_set).and_then(|baked| baked.maps.get(&map)).map(|data| Arc::as_ptr(data) as u64).unwrap_or(0);
+                    let key = (format!("{map:?}"), revision);
+                    if self.aux.get(&texture_set) == Some(&key) {
                         continue;
                     }
-                    let Some(cache) = s.caches.get(ts) else { continue };
+                    let Some(cache) = session.caches.get(texture_set) else { continue };
 
-                    let res = texturecraft_render::aux_size(cache.size);
+                    let resolution = texturecraft_render::aux_size(cache.size);
                     out.aux.push((
-                        ts,
-                        res,
-                        texturecraft_render::mesh_maps::mesh_map_rgba(s.doc.baked.get(&ts), m, res, cache.size, &cache.composite.block_scales),
+                        texture_set,
+                        resolution,
+                        texturecraft_render::mesh_maps::mesh_map_rgba(
+                            session.doc.baked.get(&texture_set),
+                            map,
+                            resolution,
+                            cache.size,
+                            &cache.composite.block_scales,
+                        ),
                     ));
-                    self.aux.insert(ts, key);
+                    self.aux.insert(texture_set, key);
                 }
             }
             Some(AuxView::Mask(id)) => {
-                if let Some((ts, _, _)) = s.doc.project.locate(id) {
-                    let key = (format!("mask{}", id.0), s.revision);
-                    if self.aux.get(&ts) != Some(&key) && !s.stroke_active() {
-                        let res = s.caches.get(ts).map_or(1024, |c| texturecraft_render::aux_size(c.size));
-                        if let Some(rgba) = s.mask_view_rgba(id, res) {
-                            out.aux.push((ts, res, rgba));
+                if let Some((texture_set, _, _)) = session.doc.project.locate(id) {
+                    let key = (format!("mask{}", id.0), session.revision);
+                    if self.aux.get(&texture_set) != Some(&key) && !session.stroke_active() {
+                        let resolution =
+                            session.caches.get(texture_set).map_or(MASK_VIEW_FALLBACK_RESOLUTION, |cache| texturecraft_render::aux_size(cache.size));
+                        if let Some(rgba) = session.mask_view_rgba(id, resolution) {
+                            out.aux.push((texture_set, resolution, rgba));
                         }
-                        self.aux.insert(ts, key);
+                        self.aux.insert(texture_set, key);
                     }
                 }
             }
             Some(AuxView::QuickMask) => {
-                for ts in 0..s.caches.len() {
-                    let Some(cache) = s.caches.get(ts) else { continue };
-                    let key = (format!("quickmask{}", s.quick_mask.revision), cache.revision);
-                    if self.aux.get(&ts) == Some(&key) {
+                for texture_set in 0..session.caches.len() {
+                    let Some(cache) = session.caches.get(texture_set) else { continue };
+
+                    let key = (format!("quickmask{}", session.quick_mask.revision), cache.revision);
+                    if self.aux.get(&texture_set) == Some(&key) {
                         continue;
                     }
-                    let res = texturecraft_render::aux_size(cache.size);
-                    if let Some(rgba) = s.quick_mask_rgba(ts, res) {
-                        out.aux.push((ts, res, rgba));
+                    let resolution = texturecraft_render::aux_size(cache.size);
+                    if let Some(rgba) = session.quick_mask_rgba(texture_set, resolution) {
+                        out.aux.push((texture_set, resolution, rgba));
                     }
-                    self.aux.insert(ts, key);
+                    self.aux.insert(texture_set, key);
                 }
             }
             None => {}
         }
+
+        self.bake_scene.sync(session, bake, &mut out);
         out
     }
 }
+
+/// Mask view resolution for a texture set without a composite cache
+const MASK_VIEW_FALLBACK_RESOLUTION: u32 = 1024;
 
 /// Paint callback for one view.
 pub struct ViewCallback {
@@ -295,39 +338,64 @@ impl CallbackTrait for ViewCallback {
             if let Some((mesh, id)) = &sync.mesh {
                 gpu.renderer.set_mesh(device, queue, mesh, *id);
             }
-            if let Some((sets, mats, shift)) = &sync.sets {
+            if let Some((sets, material_count, shift)) = &sync.sets {
                 gpu.renderer.set_display_shift(*shift);
-                let reset = gpu.renderer.set_texture_sets(device, queue, sets, *mats);
+                let reset = gpu.renderer.set_texture_sets(device, queue, sets, *material_count);
                 if !reset.is_empty() {
                     gpu.reset.store(true, Ordering::Release);
                 }
             }
-            for (ts, k, tx, ty, bytes) in &sync.tiles {
-                gpu.renderer.upload_tile(device, queue, *ts, *k, *tx, *ty, bytes);
+            for (texture_set, kind, tile_x, tile_y, bytes) in &sync.tiles {
+                gpu.renderer.upload_tile(device, queue, *texture_set, *kind, *tile_x, *tile_y, bytes);
             }
-            for (ts, size, bytes) in &sync.aux {
-                gpu.renderer.upload_aux(device, queue, *ts, *size, bytes);
+            for (texture_set, size, bytes) in &sync.aux {
+                gpu.renderer.upload_aux(device, queue, *texture_set, *size, bytes);
+            }
+            if let Some((high, id)) = &sync.bake_high
+                && let Err(error) = gpu.renderer.set_bake_high(device, queue, high.as_deref(), *id)
+            {
+                let mut reports = gpu.reports.lock().unwrap_or_else(PoisonError::into_inner);
+                if reports.errors.len() < MAX_GPU_ERRORS && !reports.errors.contains(&error) {
+                    reports.errors.push(error);
+                }
+                gpu.ctx.request_repaint();
+            }
+            if let Some((id, missed)) = &sync.bake_high_missed {
+                gpu.renderer.set_bake_high_missed(queue, *id, missed);
+            }
+            if let Some(count) = sync.bake_cage_count {
+                gpu.renderer.truncate_bake_cages(count);
+            }
+            for (texture_set, cage, topology) in &sync.bake_cages {
+                let cage = cage.as_ref().map(|upload| (upload.corners.as_slice(), upload.shell.edges.as_slice()));
+                gpu.renderer.set_bake_cage(device, queue, *texture_set, cage, *topology);
+            }
+            if let Some((mesh_id, seams)) = &sync.uv_seams {
+                gpu.renderer.set_uv_seams(device, queue, *mesh_id, seams);
             }
         }
-        // Also installs (or rejects) full-size textures WebGPU answered for since last frame.
+
+        // Also installs (or rejects) full-size textures WebGPU answered for since last frame
         gpu.renderer.prepare(device, queue, encoder, &self.frame);
         let failed = gpu.renderer.take_memory_failures();
         if !failed.is_empty() {
-            let mut r = gpu.reports.lock().unwrap_or_else(PoisonError::into_inner);
-            for ts in failed {
-                if !r.memory.contains(&ts) {
-                    r.memory.push(ts);
+            let mut reports = gpu.reports.lock().unwrap_or_else(PoisonError::into_inner);
+            for texture_set in failed {
+                if !reports.memory.contains(&texture_set) {
+                    reports.memory.push(texture_set);
                 }
             }
-            // This frame's report drain already ran: the next frame shows the toast.
+            // This frame's report drain already ran: the next frame shows the toast
             gpu.ctx.request_repaint();
         }
         if gpu.renderer.awaiting_gpu() {
             gpu.ctx.request_repaint();
         }
-        let ppp = screen.pixels_per_point;
-        let r = self.rect;
-        gpu.renderer.set_blit_rect(queue, self.frame.view_id, [r.min.x * ppp, r.min.y * ppp, r.width() * ppp, r.height() * ppp], screen.size_in_pixels);
+
+        let pixels_per_point = screen.pixels_per_point;
+        let rect = self.rect;
+        let blit_rect = [rect.min.x * pixels_per_point, rect.min.y * pixels_per_point, rect.width() * pixels_per_point, rect.height() * pixels_per_point];
+        gpu.renderer.set_blit_rect(queue, self.frame.view_id, blit_rect, screen.size_in_pixels);
         Vec::new()
     }
 

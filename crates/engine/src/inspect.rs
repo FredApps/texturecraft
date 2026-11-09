@@ -42,6 +42,10 @@ fn effect_json(session: &Session, effect: &Effect, content: bool) -> Value {
     match &effect.kind {
         EffectKind::Generator(generator) => out["generator"] = generator_json(generator),
         EffectKind::Levels(levels) => out["levels"] = json!([levels.in_low, levels.in_high, levels.gamma, levels.out_low, levels.out_high]),
+        EffectKind::ColorSelection { colors, tolerance } => {
+            out["colors"] = json!(colors);
+            out["tolerance"] = json!(tolerance);
+        }
         EffectKind::Path(paths) => {
             out["paths"] = json!(
                 paths.iter().map(|path| json!({ "points": path.points.len(), "uv": path.uv, "closed": path.closed, "fill": path.fill })).collect::<Vec<_>>()

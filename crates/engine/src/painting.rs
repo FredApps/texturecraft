@@ -12,7 +12,17 @@ use texturecraft_paint::{
 };
 
 use crate::session::{ActiveStroke, CloneFrom, Session, StackTarget, Tool};
+use crate::uv_stroke_state::UvStrokeState;
 use crate::{EngineError, Result};
+
+/// Shortest distance between 2D view stamps, so a stamp with no radius (a pen at zero pressure) can't stall a stroke.
+const MIN_UV_STAMP_STEP: f32 = 1e-5;
+
+/// 2D view stamps rasterized together, bounding the memory of one batch.
+const UV_STAMP_BATCH: usize = 4096;
+
+/// Covers a UV diagonal at the minimum step (about 142k stamps), including light pen pressure, while bounding hostile coordinates
+const MAX_UV_STAMPS_PER_SAMPLE: usize = 150_000;
 
 impl Session {
     /// Camera visibility for a stroke at `viewport` (cached until the camera, size or mesh change).
@@ -234,7 +244,7 @@ impl Session {
             stroke,
             canvas,
             depth,
-            uv: uv_mode.then_some((None, 0.0)),
+            uv: uv_mode.then(UvStrokeState::default),
             camera: self.camera,
             viewport,
             values,
@@ -317,40 +327,49 @@ impl Session {
 
     /// Add a 2D view sample (texture coordinates). Brush size is relative to the UV square.
     pub fn continue_stroke_uv(&mut self, uv: Vec2, pressure: f32) {
-        let Some(st) = self.stroke.as_mut() else { return };
-        let Some((last, carry)) = st.uv.as_mut() else { return };
-        let Some(cache) = self.caches.get_mut(st.ts) else { return };
-        let b = &st.stroke.settings;
-        let p = pressure.clamp(0.0, 1.0);
-        let radius = b.size * 2.0 * if p < 1.0 { b.min_size + (1.0 - b.min_size) * p } else { 1.0 };
-        let step = (b.spacing * 2.0 * radius).max(1e-5);
-        let mut points = Vec::new();
-        match *last {
-            None => points.push(uv),
-            Some(prev) => {
-                let seg = uv - prev;
-                let len = seg.length();
-                let mut t = step - *carry;
-                while t <= len && points.len() < 4096 {
-                    points.push(prev + seg * (t / len.max(1e-9)));
-                    t += step;
-                }
-                *carry = len - (t - step);
-            }
-        }
-        // Follow path: turn the stamp with the stroke direction (y up on screen, v grows down).
-        let angle = match *last {
-            Some(prev) if b.follow_path && uv != prev => b.angle + (prev.y - uv.y).atan2(uv.x - prev.x).to_degrees() - 90.0,
-            _ => b.angle,
+        let Some(active) = self.stroke.as_mut() else { return };
+        let Some(progress) = active.uv.as_mut() else { return };
+        let Some(cache) = self.caches.get_mut(active.ts) else { return };
+
+        let settings = &active.stroke.settings;
+        let pressure = pressure.clamp(0.0, 1.0);
+        let size_scale = if pressure < 1.0 { settings.min_size + (1.0 - settings.min_size) * pressure } else { 1.0 };
+        let radius = settings.size * 2.0 * size_scale;
+        let step = (settings.spacing * 2.0 * radius).max(MIN_UV_STAMP_STEP);
+
+        // Follow path: turn the stamp with the stroke direction (y up on screen, v grows down)
+        let angle = match progress.last {
+            Some(previous) if settings.follow_path && uv != previous => settings.angle + (previous.y - uv.y).atan2(uv.x - previous.x).to_degrees() - 90.0,
+            _ => settings.angle,
         };
-        *last = Some(uv);
-        let n0 = st.stroke.stamps.len() as u32;
-        let stamps: Vec<texturecraft_paint::UvStamp> = points
-            .iter()
-            .enumerate()
-            .map(|(i, c)| texturecraft_paint::UvStamp { center: *c, radius, angle, flow: b.flow, hardness: b.hardness, seed: n0 + i as u32 })
-            .collect();
-        texturecraft_paint::rasterize_uv(&mut st.canvas, &cache.gbuf, Self::shape(&self.images, b), &stamps);
+
+        // The first sample is one stamp; a later one stamps every `step` along the segment from the previous
+        let (start, segment, mut distance) = match progress.last.replace(uv) {
+            None => (uv, Vec2::ZERO, 0.0),
+            // Pressure can shrink the step below the carry from the preceding sample
+            Some(previous) => (previous, uv - previous, (step - progress.carry).max(0.0)),
+        };
+        let length = segment.length();
+        let shape = Self::shape(&self.images, settings);
+        let mut batch = Vec::new();
+        let mut stamped = 0;
+        while distance <= length && stamped < MAX_UV_STAMPS_PER_SAMPLE {
+            let batch_size = UV_STAMP_BATCH.min(MAX_UV_STAMPS_PER_SAMPLE - stamped);
+            batch.clear();
+            while distance <= length && batch.len() < batch_size {
+                let center = start + segment * (distance / length.max(f32::MIN_POSITIVE));
+                let seed = progress.stamps.wrapping_add((stamped + batch.len()) as u32);
+                batch.push(texturecraft_paint::UvStamp { center, radius, angle, flow: settings.flow, hardness: settings.hardness, seed });
+                distance += step;
+            }
+
+            stamped += batch.len();
+            texturecraft_paint::rasterize_uv(&mut active.canvas, &cache.gbuf, shape, &batch);
+        }
+
+        // At most one step, so a segment cut off at the stamp limit can't push the next one's stamps backwards
+        progress.carry = (length - (distance - step)).min(step);
+        progress.stamps = progress.stamps.wrapping_add(stamped as u32);
         self.stroke_painted();
     }
 

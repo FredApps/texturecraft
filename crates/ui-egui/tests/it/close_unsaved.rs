@@ -56,8 +56,23 @@ fn cancel_keeps_the_app_open() {
 fn closing_without_changes_does_not_ask() {
     let mut h = harness(false);
     request_close(&mut h);
-    assert!(!sent(&h, &ViewportCommand::CancelClose));
+    // macOS keeps the window for `-[NSApplication terminate:]` to close; elsewhere it closes now.
+    assert_eq!(sent(&h, &ViewportCommand::CancelClose), cfg!(target_os = "macos"));
     assert!(h.state().ui.windows.unsaved.is_none());
+}
+
+/// `ui` does not run while the window is minimized, so the close decision is made in `logic`.
+#[test]
+fn closing_a_minimized_window_with_changes_brings_it_back_to_ask() {
+    let mut h = harness(true);
+    let root = h.input_mut().viewports.entry(ViewportId::ROOT).or_default();
+    root.minimized = Some(true);
+    root.events.push(ViewportEvent::Close);
+    h.step();
+    assert!(sent(&h, &ViewportCommand::CancelClose), "the close waits for an answer");
+    assert!(sent(&h, &ViewportCommand::Minimized(false)), "the window comes back");
+    assert!(sent(&h, &ViewportCommand::Focus));
+    assert_eq!(h.state().ui.windows.unsaved, Some(Unsaved::Quit));
 }
 
 /// A project picked or dropped in the browser arrives as bytes; it waits on the same dialog.

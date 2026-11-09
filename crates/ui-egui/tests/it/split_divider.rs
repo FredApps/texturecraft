@@ -5,6 +5,7 @@ use egui_kittest::Harness;
 use texturecraft_engine::core::Channel;
 use texturecraft_ui_egui::TextureCraftApp;
 use texturecraft_ui_egui::state::UiState;
+use texturecraft_ui_egui::ui_state_store::UiStateStore;
 
 /// Narrowest a split view may get, as in `viewport.rs`
 const MIN_VIEW_WIDTH: f32 = 16.0;
@@ -144,16 +145,15 @@ fn the_divider_position_survives_a_restart_and_old_saved_states_load_centred() {
     let mut storage = MemoryStorage::default();
     let mut ui_state = UiState::default();
     ui_state.split_ratio = 0.3;
-    eframe::set_value(&mut storage, "ui", &ui_state);
-    let restored = eframe::get_value::<UiState>(&storage, "ui").expect("saved state loads");
+    UiStateStore::default().save(&ui_state, &mut storage);
+    let restored = UiStateStore::default().load(Some(&storage)).expect("saved state loads");
     assert_eq!(restored.split_ratio, 0.3);
 
     // A state saved before the divider existed has no ratio
-    let saved = storage.0.get("ui").cloned().unwrap();
-    let without_ratio = saved.replace("split_ratio:0.3,", "");
-    assert_ne!(without_ratio, saved, "the saved state names the ratio: {saved}");
-    storage.0.insert("ui".to_owned(), without_ratio);
-    let restored = eframe::get_value::<UiState>(&storage, "ui").expect("an older saved state loads");
+    let mut saved: serde_json::Value = serde_json::from_str(&storage.0["ui.json"]).unwrap();
+    assert!(saved.as_object_mut().unwrap().remove("split_ratio").is_some(), "the saved state names the ratio: {saved}");
+    storage.0.insert("ui.json".to_owned(), saved.to_string());
+    let restored = UiStateStore::default().load(Some(&storage)).expect("an older saved state loads");
     assert_eq!(restored.split_ratio, 0.5);
 }
 

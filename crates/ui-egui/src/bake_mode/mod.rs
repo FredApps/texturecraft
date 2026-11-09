@@ -1,9 +1,13 @@
 //! Bake Mode presentation; persisted settings live in core and edits use engine commands
 
 mod bake_paint_brush;
+mod bake_visualization_panel;
+mod bake_visualization_toggles;
 mod breadcrumb;
 mod common_settings;
 pub use bake_paint_brush::BakePaintBrush;
+pub(crate) use bake_visualization_panel::bake_visualization_panel;
+pub use bake_visualization_toggles::BakeVisualizationToggles;
 mod controls;
 mod map_settings;
 mod mesh_map_bakers;

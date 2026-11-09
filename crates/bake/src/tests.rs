@@ -14,6 +14,12 @@ use texturecraft_geom::primitives;
 
 use super::*;
 
+#[path = "test/cage_shell.rs"]
+mod cage_shell;
+
+#[path = "test/high_poly_reach.rs"]
+mod high_poly_reach;
+
 #[path = "test/setting.rs"]
 mod setting;
 
@@ -22,6 +28,9 @@ mod normal_map_curvature;
 
 #[path = "test/tile_selection.rs"]
 mod tile_selection;
+
+#[path = "test/vertex_reach.rs"]
+mod vertex_reach;
 
 fn settings(resolution: u32, maps: &[BakedMap]) -> BakeSettings {
     with_rays(

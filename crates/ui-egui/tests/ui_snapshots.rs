@@ -77,7 +77,7 @@ fn window_snapshots() {
     save(&mut harness, &output_dir, "bake-settings");
     harness.state_mut().session.add_high_poly_bytes("High Poly.obj", b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n".to_vec()).unwrap();
     save(&mut harness, &output_dir, "bake-settings-high-poly");
-    harness.get_by_label("Cage").scroll_to_me();
+    harness.get_by_role_and_label(egui::Role::ComboBox, "Cage Type").scroll_to_me();
     save(&mut harness, &output_dir, "bake-settings-cage-skew");
     harness.get_by_label("Edge Contrast").scroll_to_me();
     save(&mut harness, &output_dir, "bake-settings-skew");

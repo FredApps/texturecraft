@@ -11,6 +11,7 @@
 pub mod bake;
 pub mod brush_preset_cmds;
 pub mod camera_cmds;
+pub mod color_selection_cmds;
 pub mod commands;
 pub mod decal_cmds;
 pub mod effect_clipboard;
@@ -30,6 +31,8 @@ mod material_preview_pixel;
 pub mod materials;
 pub mod materialx_cmds;
 pub mod meshmap_cmds;
+mod meshmap_file_name;
+pub mod meshmap_import_cmds;
 mod orb_camera;
 pub mod orb_preview;
 pub mod painting;
@@ -51,6 +54,7 @@ pub mod template_cmds;
 pub mod text_cmds;
 pub mod tool_cmds;
 mod triangle_partition;
+mod uv_stroke_state;
 pub mod uv_tile_cmds;
 pub mod view_cmds;
 

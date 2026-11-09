@@ -162,8 +162,8 @@ print(call("command.run", {"id": "layer.add.fill", "params": {"color": [0.8, 0.1
   File › Save.
 
 Through `command_run`, every `file.*` command but `file.close` and `file.removeUnused` (and
-`file.reimportMesh` without a `path`) is refused, and so is any command given a `path` or `dir` (`resource.import`,
-`material.save`, `material.load`, …), in both modes: use the workspace tools below. `resource.text`
+`file.reimportMesh` without a `path`) is refused, and so is any command given a `path` or `dir`, at the top level or in
+a `files` entry (`resource.import`, `material.save`, `material.load`, `textureSet.meshMap.import`, …), in both modes: use the workspace tools below. `resource.text`
 takes a font family, not a path: it reads only the system's font folders.
 
 | Tool | Params | Notes |
@@ -179,7 +179,7 @@ takes a font family, not a path: it reads only the system's font folders.
 | `mesh_reimport` | `{path?, preserveStrokes?}` | Reimport the mesh from a file, or (no path) from the project's own copy; bridge mode supports only the latter |
 | `mesh_export` | `{path, format?}` | The mesh as obj, glb, usda, usdc or usdz below the write root (obj: its .mtl and textures, usda / usdc: textures next to it) → `{path, textures?}` |
 | `bake_mesh_add` | `{path, cage?}` | Add a high-definition mesh for baking, or set the cage → `{name, meshes}` |
-| `resource_import` | `{path}` | Image resource (png, jpg, tga, tif, bmp, webp, exr, hdr) → its name, for `layer.add.image` / `tool.stencil`, or as a mesh map instead of baking it: `textureSet.meshMap.set {ts?, map, image}` (`textureSet.meshMap.clear {ts?, map}` empties the slot) |
+| `resource_import` | `{path}` | Image resource (png, jpg, tga, tif, bmp, webp, exr, hdr) → its name, for `layer.add.image` / `tool.stencil`, or as a mesh map instead of baking it: `textureSet.meshMap.set {ts?, map, image}` (`textureSet.meshMap.clear {ts?, map}` empties the slot); call it once per baked map file (the desktop app's `textureSet.meshMap.import`, which takes host paths, is refused through `command_run`) |
 | `material_save` | `{path, layer?, name?}` | A layer or folder as a `.tcmat` smart material below the write root |
 | `material_load` | `{path}` | Add a `.tcmat` smart material, a MaterialCraft `.mcmat` material or a `.mcraft` package above the selection |
 | `textures_export` | `{dir, preset?, ts?, format?, padding?, size?}` | Writes files below the write root |

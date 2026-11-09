@@ -295,8 +295,8 @@ pub(crate) struct ActiveStroke {
     pub canvas: StrokeCanvas,
     /// Camera visibility for 3D strokes (None for strokes in the 2D view).
     pub depth: Option<Arc<EyeDepth>>,
-    /// 2D view strokes: last UV point and the distance carried to the next stamp.
-    pub uv: Option<(Option<Vec2>, f32)>,
+    /// 2D view strokes: where the stroke is between samples.
+    pub uv: Option<crate::uv_stroke_state::UvStrokeState>,
     pub camera: OrbitCamera,
     pub viewport: Vec2,
     pub values: BTreeMap<Channel, [f32; 3]>,
@@ -318,6 +318,9 @@ pub struct Session {
     pub mesh: Arc<Mesh>,
     /// Unique per loaded mesh and UV layout (GPU caches compare it).
     pub mesh_id: u64,
+    /// Unique per open project: a mesh reimport or UV layout change keeps it, and opening, closing
+    /// or creating a project replaces it.
+    pub project_id: u64,
     /// The mesh with its own UVs (`mesh` maps UV-tiled sets into their atlas).
     pub(crate) source: Arc<Mesh>,
     pub bvh: Arc<Bvh>,
@@ -384,6 +387,7 @@ impl Session {
         Ok(Session {
             doc,
             mesh_id: next_mesh_id(),
+            project_id: next_mesh_id(),
             source,
             mesh,
             bvh: Arc::new(bvh),

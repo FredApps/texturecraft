@@ -4,6 +4,9 @@ use glam::{Vec2, Vec3, Vec4};
 
 use crate::{GeomError, Result};
 
+/// An edge by the bits of its two end positions, the lower one first
+type EdgePositions = ([u32; 3], [u32; 3]);
+
 /// A contiguous index range drawn with one material.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SubMesh {
@@ -105,6 +108,47 @@ impl Mesh {
                 edges.into_iter().filter(|(_, real, n)| *real || *n == 1).map(|(k, ..)| k).collect()
             })
             .collect()
+    }
+
+    /// Edges where the UV layout splits: two triangles meet there in 3D but not in UV space, per material in `0..materials.len().max(1)`
+    pub fn uv_seam_edges(&self) -> Vec<Vec<(u32, u32)>> {
+        // Signed zero denotes the same position on either side of an imported seam
+        let bits = |position: Vec3| position.to_array().map(|coordinate| if coordinate == 0.0 { 0 } else { coordinate.to_bits() });
+        let mut seams = vec![Vec::new(); self.materials.len().max(1)];
+        // Match across materials before grouping the lines for texture-set visibility
+        let mut sides: std::collections::HashMap<EdgePositions, Vec<(u32, u32, usize)>> = std::collections::HashMap::new();
+        for material in 0..seams.len() {
+            for triangle in self.triangles_of(material) {
+                let Some(corners) = self.indices.get(triangle * 3..triangle * 3 + 3) else { continue };
+
+                for (from, to) in [(corners[0], corners[1]), (corners[1], corners[2]), (corners[2], corners[0])] {
+                    let (Some(from_position), Some(to_position)) = (self.positions.get(from as usize), self.positions.get(to as usize)) else { continue };
+
+                    let (from_bits, to_bits) = (bits(*from_position), bits(*to_position));
+                    let (edge, pair) = if from_bits <= to_bits { ((from_bits, to_bits), (from, to)) } else { ((to_bits, from_bits), (to, from)) };
+                    sides.entry(edge).or_default().push((pair.0, pair.1, material));
+                }
+            }
+        }
+
+        let uv = |index: u32| self.uvs.get(index as usize).copied();
+        for pairs in sides.into_values() {
+            let Some(&(first_from, first_to, _)) = pairs.first() else { continue };
+
+            if pairs.iter().any(|&(from, to, _)| (uv(from), uv(to)) != (uv(first_from), uv(first_to))) {
+                for (from, to, material) in pairs {
+                    if let Some(edges) = seams.get_mut(material) {
+                        edges.push((from.min(to), from.max(to)));
+                    }
+                }
+            }
+        }
+        for edges in &mut seams {
+            edges.sort_unstable();
+            edges.dedup();
+        }
+
+        seams
     }
 
     /// Material of triangle `t`.
@@ -431,6 +475,55 @@ mod tests {
         a.append(&m);
         assert_eq!(a.diagonals, vec![0, 0b100, 0b001]);
         assert_eq!(crate::primitives::plane(1.0, 2).wire_edges()[0].len(), 12, "a 2×2 grid of quads has 12 edges");
+    }
+
+    #[test]
+    fn uv_seams_are_where_the_uv_layout_splits() {
+        let mesh = quad();
+        assert_eq!(mesh.uv_seam_edges(), vec![Vec::<(u32, u32)>::new()], "one UV island has no seam");
+
+        // Vertex 4 copies vertex 0's position with another UV: the diagonal (0, 2) / (4, 2) is cut
+        let mut seam = mesh.clone();
+        seam.positions.push(seam.positions[0]);
+        seam.normals.push(seam.normals[0]);
+        seam.tangents.push(seam.tangents[0]);
+        seam.uvs.push(Vec2::new(0.9, 0.9));
+        seam.indices[3] = 4;
+        assert_eq!(seam.uv_seam_edges(), vec![vec![(0, 2), (2, 4)]]);
+
+        // The same split with the same UV is a hard edge, not a seam
+        let mut hard = seam.clone();
+        hard.uvs[4] = hard.uvs[0];
+        assert_eq!(hard.uv_seam_edges(), vec![Vec::<(u32, u32)>::new()]);
+    }
+
+    #[test]
+    fn uv_seams_join_positions_with_opposite_signed_zero() {
+        let mut mesh = quad();
+        mesh.positions.push(Vec3::new(-0.0, 0.0, 0.0));
+        mesh.normals.push(mesh.normals[0]);
+        mesh.tangents.push(mesh.tangents[0]);
+        mesh.uvs.push(Vec2::new(0.9, 0.9));
+        mesh.indices[3] = 4;
+        assert_eq!(mesh.positions[0], mesh.positions[4]);
+        assert_eq!(mesh.uv_seam_edges(), vec![vec![(0, 2), (2, 4)]]);
+    }
+
+    #[test]
+    fn uv_seams_between_materials_belong_to_both_materials() {
+        let mut mesh = quad();
+        mesh.positions.push(mesh.positions[0]);
+        mesh.normals.push(mesh.normals[0]);
+        mesh.tangents.push(mesh.tangents[0]);
+        mesh.uvs.push(Vec2::new(0.9, 0.9));
+        mesh.indices[3] = 4;
+        mesh.materials.push("second".into());
+        mesh.submeshes[0].count = 3;
+        mesh.submeshes.push(SubMesh { name: "second".into(), material: 1, start: 3, count: 3 });
+
+        assert_eq!(mesh.uv_seam_edges(), vec![vec![(0, 2)], vec![(2, 4)]]);
+        mesh.uvs[4] = mesh.uvs[0];
+        assert_eq!(mesh.uv_seam_edges(), vec![Vec::<(u32, u32)>::new(); 2], "a material boundary alone is not a UV seam");
     }
 
     #[test]
