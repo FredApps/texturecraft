@@ -703,6 +703,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Reset", "Reimposta"),
     ("Reset UI", "Ripristina interfaccia"),
     ("Reset all", "Ripristina tutto"),
+    ("Reset to defaults", "Ripristina i valori predefiniti"),
     ("Reset to {shortcut}", "Ripristina {shortcut}"),
     ("Resizing", "Ridimensionamento"),
     ("Restore every default shortcut", "Ripristina tutte le scorciatoie predefinite"),

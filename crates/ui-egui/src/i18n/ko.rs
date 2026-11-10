@@ -676,6 +676,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Reset", "초기화"),
     ("Reset UI", "UI 초기화"),
     ("Reset all", "모두 초기화"),
+    ("Reset to defaults", "기본값으로 초기화"),
     ("Reset to {shortcut}", "{shortcut}(으)로 초기화"),
     ("Resizing", "크기 조정 중"),
     ("Restore every default shortcut", "모든 기본 단축키를 복원합니다"),

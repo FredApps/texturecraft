@@ -667,6 +667,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Reset", "إعادة تعيين"),
     ("Reset UI", "إعادة ضبط واجهة المستخدم"),
     ("Reset all", "إعادة ضبط الكل"),
+    ("Reset to defaults", "إعادة الضبط إلى الإعدادات الافتراضية"),
     ("Reset to {shortcut}", "إعادة الضبط إلى {shortcut}"),
     ("Resizing", "تغيير الحجم"),
     ("Restore every default shortcut", "استعادة كل الاختصارات الافتراضية"),

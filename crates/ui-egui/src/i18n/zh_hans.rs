@@ -634,6 +634,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Reset", "重置"),
     ("Reset UI", "重置界面"),
     ("Reset all", "全部重置"),
+    ("Reset to defaults", "恢复默认值"),
     ("Reset to {shortcut}", "重置为 {shortcut}"),
     ("Resizing", "正在调整大小"),
     ("Restore every default shortcut", "恢复所有默认快捷键"),
