@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use texturecraft_compose::{BakedMaps, BelowCache, Composite, PaintTarget, PixelStore, StackKey, StrokePreview, covered_tiles, pad_tiles};
+use texturecraft_compose::{BakedMaps, BelowCache, COARSE_STRIDES, Composite, PaintTarget, PixelStore, StackKey, StrokePreview, covered_tiles, pad_tiles};
 use texturecraft_core::{Channel, Layer, LayerId, LayerKind, Project, TextureSet};
 use texturecraft_geom::glam::Vec2;
 use texturecraft_geom::{Bvh, Mesh, OrbitCamera, UvGBuffer};
@@ -43,14 +43,24 @@ pub struct SetCache {
     /// Tiles to recomposite at low priority: what they show is already right (a committed
     /// stroke's live preview), but it was composited from the stroke, not the layer pixels.
     pub settle: BTreeSet<(u32, u32)>,
+    /// Tiles shown from a coarse pass ([`texturecraft_compose::composite_tiles_coarse`]) with
+    /// the stride they were composited at; they still need the finer ones and the exact one. A
+    /// big recomposite (a material applied) first looks right everywhere at a small part of the
+    /// cost, then sharpens level by level ([`texturecraft_compose::COARSE_STRIDES`]), each level
+    /// over every tile before the next, so the surface is always at one consistent level.
+    pub refine: BTreeMap<(u32, u32), u32>,
+    /// The dirty tiles go through a coarse pass: decided when a big recomposite starts and
+    /// kept until `dirty` drains, so its last few tiles do not go exact at the full price.
+    pub coarse_pass: bool,
     /// Tiles whose display textures must be re-uploaded.
     pub upload: BTreeSet<(u32, u32)>,
     /// Bumps on every composite change (thumbnails, exports, caches).
     pub revision: u64,
     /// Everything but the layer being edited, per tile (repaints evaluate only that layer).
     pub below: BelowCache,
-    /// Tiles per composite chunk that fit the last frame's budget (0: not measured yet).
-    pub chunk: usize,
+    /// Wall-clock milliseconds per tile of the last exact composite chunk (0: not measured
+    /// yet): the first chunk of a budgeted update is sized from it and that update's budget.
+    pub tile_ms: f64,
 }
 
 impl SetCache {
@@ -69,10 +79,12 @@ impl SetCache {
             composite: Composite { block_scales: ts.block_scales(), ..Composite::with_size(&ts.channel_list(), w, h) },
             dirty: all.clone(),
             settle: BTreeSet::new(),
+            refine: BTreeMap::new(),
+            coarse_pass: false,
             upload: all,
             revision: 0,
             below: BelowCache::default(),
-            chunk: 0,
+            tile_ms: 0.0,
         }
     }
 
@@ -715,23 +727,60 @@ impl Session {
                 carried: s.canvas.pickup.as_ref().map(|p| p.values.clone()).unwrap_or_default(),
             })
         });
+        // A coarse look first only when there is a frame budget to spread a big change over, and
+        // never under a live stroke (it keeps the exact, cached repaint of the hot layer).
+        let coarse_allowed = budget_ms.is_finite() && self.stroke.is_none();
         let active = self.ts();
         let order = std::iter::once(active).chain((0..self.caches.len()).filter(|ts| *ts != active));
         let mut changed = false;
         for ts in order {
             let Some(cache) = self.caches.get_mut(ts) else { continue };
             cache.below.set_hot(hot);
-            cache.below.pass = cache.dirty.len() + cache.settle.len();
+            cache.below.pass = cache.dirty.len() + cache.settle.len() + cache.refine.len();
             // Instances in sets of the stroke's size show the live stroke too.
             let preview = preview.as_ref().filter(|_| Some(cache.size) == stroke_size);
-            // Start at the size that fit the budget last time: with a heavy stack (smart
-            // materials at 8K) one tile per thread alone would take several frames' budget.
-            let mut chunk = if budget_ms.is_finite() && cache.chunk > 0 { cache.chunk } else { first };
+            // Start at the size this budget fits at the last measured pace: with a heavy stack
+            // (smart materials at 8K) one tile per thread alone would take several frames'
+            // budget. Never above one tile per thread: work can turn heavy from one frame to the
+            // next.
+            let exact_chunk =
+                |cache: &SetCache| if budget_ms.is_finite() && cache.tile_ms > 0.0 { ((budget_ms / cache.tile_ms) as usize).clamp(1, first) } else { first };
+            let mut chunk = exact_chunk(cache);
+            // A stack with neighbourhood filters computes them at full resolution even for a
+            // coarse composite, so it gains little from one: straight to the exact composite.
+            let may_coarse = coarse_allowed && !cache.dirty.is_empty() && !texturecraft_compose::has_neighbourhood_filters(&self.doc.project, ts);
+            // The stride of the previous chunk (1: exact), to restart the chunk size on a change.
+            let mut last_stride = 1;
             loop {
                 if cache.dirty.is_empty() {
-                    if cache.settle.is_empty() || clock() - start >= budget_ms.min(SETTLE_BUDGET_MS) {
-                        break;
+                    cache.coarse_pass = false;
+                }
+                // The work of this chunk: fresh dirty tiles (coarsest look or exact), the next
+                // level of the coarsest refining tiles, or settling tiles.
+                let (stride, refining, settling): (u32, Option<u32>, bool) = if !cache.dirty.is_empty() {
+                    // A big change gets a coarse look first, for the whole of it.
+                    if may_coarse && cache.dirty.len() > COARSE_MIN_TILES {
+                        cache.coarse_pass = true;
                     }
+                    let coarse = may_coarse && cache.coarse_pass;
+                    (if coarse { COARSE_STRIDES[0] } else { 1 }, None, false)
+                } else if let Some(at) = cache.refine.values().copied().max() {
+                    (finer_stride(at), Some(at), false)
+                } else if !cache.settle.is_empty() && clock() - start < budget_ms.min(SETTLE_BUDGET_MS) {
+                    (1, None, true)
+                } else {
+                    break;
+                };
+                // A level costs about its stride² less per texel than the exact composite: a
+                // new level starts at the exact pace, and the chunks grow from what it measures.
+                if stride != last_stride {
+                    chunk = exact_chunk(cache);
+                    last_stride = stride;
+                }
+                if let Some(at) = refining {
+                    let mut level: BTreeSet<(u32, u32)> = cache.refine.iter().filter(|(_, s)| **s == at).map(|(t, _)| *t).collect();
+                    cache.dirty.extend(next_chunk(&mut level, chunk));
+                } else if settling {
                     // Small chunks: the settle slice of the budget is short.
                     cache.dirty.extend(next_chunk(&mut cache.settle, chunk.min(first)));
                 }
@@ -739,6 +788,7 @@ impl Session {
                 let tiles = next_chunk(&mut cache.dirty, chunk);
                 for t in &tiles {
                     cache.settle.remove(t);
+                    cache.refine.remove(t);
                 }
                 let empty = BakedMaps::default();
                 let inputs = texturecraft_compose::Inputs {
@@ -753,7 +803,12 @@ impl Session {
                     images: &self.images,
                     bounds: self.mesh.bounds(),
                 };
-                texturecraft_compose::composite_tiles_cached(&inputs, &mut cache.composite, &tiles, Some(&mut cache.below));
+                if stride > 1 {
+                    texturecraft_compose::composite_tiles_coarse(&inputs, &mut cache.composite, &tiles, stride);
+                    cache.refine.extend(tiles.iter().map(|t| (*t, stride)));
+                } else {
+                    texturecraft_compose::composite_tiles_cached(&inputs, &mut cache.composite, &tiles, Some(&mut cache.below));
+                }
                 // The composited tiles and the neighbours their padding reached change.
                 let padded = pad_tiles(&mut cache.composite, &cache.dilation, &tiles);
                 cache.upload.extend(tiles.iter().copied().chain(padded));
@@ -763,9 +818,8 @@ impl Session {
                 let left = budget_ms - (now - start);
                 // As many tiles as fit in what is left, at the pace of this chunk.
                 let per_tile = (now - t0) / tiles.len().max(1) as f64;
-                if budget_ms.is_finite() && per_tile > 0.0 {
-                    // Never above one tile per thread: work can turn heavy from one frame to the next.
-                    cache.chunk = ((budget_ms / per_tile) as usize).clamp(1, first);
+                if budget_ms.is_finite() && per_tile > 0.0 && stride == 1 {
+                    cache.tile_ms = per_tile;
                 }
                 if left <= 0.0 {
                     return changed;
@@ -782,7 +836,7 @@ impl Session {
 
     /// Tiles still waiting to be composited, over every texture set (settling ones included).
     pub fn pending_tiles(&self) -> usize {
-        self.caches.iter().map(|c| c.dirty.len() + c.settle.len()).sum()
+        self.caches.iter().map(|c| c.dirty.len() + c.settle.len() + c.refine.len()).sum()
     }
 
     /// The layer a stroke target belongs to (an effect's owner).
@@ -894,6 +948,9 @@ impl Memory {
 
 /// Most tiles per composite chunk (a 1024² region).
 const CHUNK: usize = 256;
+/// A recomposite of more tiles than this (a material applied, not a brush stroke) is shown from
+/// a coarse pass first when it is spread over frames.
+const COARSE_MIN_TILES: usize = 64;
 /// The most a budgeted update spends on settling tiles (what they show is already right).
 pub const SETTLE_BUDGET_MS: f64 = 6.0;
 
@@ -910,6 +967,11 @@ fn next_chunk(dirty: &mut BTreeSet<(u32, u32)>, n: usize) -> Vec<(u32, u32)> {
         dirty.remove(t);
     }
     tiles
+}
+
+/// The stride of the level after `stride` in [`COARSE_STRIDES`] (1: the exact composite).
+fn finer_stride(stride: u32) -> u32 {
+    COARSE_STRIDES.iter().copied().find(|s| *s < stride).unwrap_or(1)
 }
 
 /// Valid texture set resolutions: powers of two from 128 to 8192.
