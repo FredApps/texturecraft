@@ -2,19 +2,24 @@
 //! tile by tile in parallel. This is the reference implementation (the oracle) for the viewport
 //! and for export.
 
+pub(crate) mod thumbnail;
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use rayon::prelude::*;
 use texturecraft_core::{
-    BakedMap, BlendMode, BlockScales, Channel, ChannelKind, CompareOp, Effect, EffectKind, Fill, Filter, Generator, GeneratorKind, HeightMask, Layer, LayerId,
-    LayerKind, Mask, MaskBackground, NormalFormat, Project, Projection, Source, TextureSet, TileGrid, blend1, blend3, lum, mix3, per_unit,
+    BakedMap, BlendMode, BlockScales, Channel, ChannelKind, CompareOp, CurvatureDetail, CurvatureMode, Effect, EffectKind, Fill, Filter, Generator,
+    GeneratorKind, HeightMask, Layer, LayerId, LayerKind, Mask, MaskBackground, NormalFormat, Project, Projection, Source, TextureSet, TileGrid, blend1,
+    blend3, lum, mix3, per_unit,
 };
 use texturecraft_geom::glam::{Vec2, Vec3};
 use texturecraft_geom::{Mesh, NO_TRI, UvGBuffer};
 use texturecraft_texel::{DilationMap, TILE, TILE_AREA, TileImage, from_u16, noise, to_u16, to_u16_signed};
 
 use crate::below::{Band, BelowCache, Level};
+use crate::curvature_sizes::CurvatureSizes;
 use crate::pattern::{Coords, decal_uv, image_samples, procedural, world_noise};
 use crate::store::{BakedMaps, ImageStore, PixelStore, decode};
 
@@ -204,6 +209,8 @@ struct EffectPlan<'a> {
     opacity: f32,
     data: Option<Cow<'a, [u16]>>,
     preview: bool,
+    /// The curvature detail sizes a generator with detail reads.
+    curvature_sizes: Option<Arc<CurvatureSizes>>,
 }
 
 struct MaskPlan<'a> {
@@ -303,6 +310,12 @@ fn direction(angle: f32) -> [f32; 2] {
     let (sn, cs) = angle.to_radians().sin_cos();
     [cs, -sn]
 }
+
+/// Gain on the curvature map's own deviation from flat (±0.5 reaches black and white).
+const MAP_GAIN: f32 = 2.0;
+
+/// Gain per texel of a detail size: blurring spreads an edge over about twice its radius, so wider sizes need proportionally more to reach full strength.
+const GAIN_PER_DETAIL_TEXEL: f32 = 2.0 * std::f32::consts::SQRT_2;
 
 /// Samples along a directional or slope blur at most (beyond, samples spread out).
 const LINE_SAMPLES: i32 = 24;
@@ -421,16 +434,19 @@ fn gather(op: Op, orig: &[f32], cover: &[f32], comps: usize, (x0, y0, w, h): (u3
 /// the region it is computed in, so tiles composited in any grouping agree exactly.
 const FIX: f64 = (1u64 << 24) as f64;
 
-/// Three running-sum box blurs (≈ Gaussian) of a `w × h` image along rows then along columns.
-/// Rows (and columns, transposed) blur in parallel.
-fn blur(data: &mut [f32], w: usize, h: usize, r: usize) {
-    let fix = |v: &f32| if v.is_finite() { (f64::from(v.clamp(-1e6, 1e6)) * FIX).round() as i64 } else { 0 };
-    let mut v: Vec<i64> = data.par_iter().map(fix).collect();
-    blur_rows(&mut v, w, r);
-    let mut t = transpose(&v, w, h);
-    blur_rows(&mut t, h, r);
-    data.par_iter_mut().zip(transpose(&t, h, w)).for_each(|(d, s)| *d = (s as f64 / FIX) as f32);
+/// Three running-sum box blurs (≈ Gaussian) of a `width × height` image along its rows, then its columns, each in parallel.
+pub(crate) fn blur(data: &mut [f32], width: usize, height: usize, radius: usize) {
+    let to_fixed = |value: &f32| if value.is_finite() { (f64::from(value.clamp(-1e6, 1e6)) * FIX).round() as i64 } else { 0 };
+    let mut fixed: Vec<i64> = data.par_iter().map(to_fixed).collect();
+    blur_rows(&mut fixed, width, radius);
+
+    let mut columns = transpose(&fixed, width, height);
+    blur_rows(&mut columns, height, radius);
+    data.par_iter_mut().zip(transpose(&columns, height, width)).for_each(|(target, blurred)| *target = (blurred as f64 / FIX) as f32);
 }
+
+/// The box blurs `blur` runs along each axis
+pub(crate) const BLUR_BOX_PASSES: usize = 3;
 
 /// Three box blurs of radius `r` along every row (`w` long) of `data`.
 fn blur_rows(data: &mut [i64], w: usize, r: usize) {
@@ -439,7 +455,7 @@ fn blur_rows(data: &mut [i64], w: usize, r: usize) {
     }
     data.par_chunks_mut(w).for_each(|row| {
         let mut tmp = vec![0i64; row.len()];
-        for _ in 0..3 {
+        for _ in 0..BLUR_BOX_PASSES {
             box_line(row, &mut tmp, r);
             row.copy_from_slice(&tmp);
         }
@@ -760,26 +776,51 @@ fn fields_of(inp: &Inputs, channels: &[Channel], list: &[LayerId], tiles: &[(u32
     if tiles.is_empty() || inp.gbuf.width == 0 {
         return out;
     }
-    let res = inp.gbuf.width;
+
+    let working_width = inp.gbuf.width;
     let mut order = Vec::new();
     draw_order(inp.project, list, 0, &mut order);
+    prepare_curvature_sizes(inp, &order);
+
     for id in order {
         let Some(layer) = inp.project.content_layer(id) else { continue };
-        if let Some(m) = layer_mask(inp.project, id).filter(|m| m.enabled && neighbourhood(&m.effects, res).is_some())
-            && let Some(f) = field(inp, channels, &out, id, Job::Mask(m), tiles)
+
+        if let Some(mask) = layer_mask(inp.project, id).filter(|mask| mask.enabled && neighbourhood(&mask.effects, working_width).is_some())
+            && let Some(filtered) = field(inp, channels, &out, id, Job::Mask(mask), tiles)
         {
-            out.insert(FieldKey::Mask(id), f);
+            out.insert(FieldKey::Mask(id), filtered);
         }
-        if layer.is_group() || neighbourhood(&layer.content_effects, res).is_none() {
+
+        if layer.is_group() || neighbourhood(&layer.content_effects, working_width).is_none() {
             continue;
         }
-        for ch in channels.iter().filter(|c| layer.channels.contains_key(c)) {
-            if let Some(f) = field(inp, channels, &out, id, Job::Content(*ch), tiles) {
-                out.insert(FieldKey::Content(id, *ch), f);
+        for channel in channels.iter().filter(|channel| layer.channels.contains_key(channel)) {
+            if let Some(filtered) = field(inp, channels, &out, id, Job::Content(*channel), tiles) {
+                out.insert(FieldKey::Content(id, *channel), filtered);
             }
         }
     }
     out
+}
+
+/// Build the curvature detail sizes every visible generator of `layers` reads, once, before tiles composite in parallel.
+fn prepare_curvature_sizes(inp: &Inputs, layers: &[LayerId]) {
+    let visible = layers.iter().filter(|id| inp.project.layers.get(id).is_some_and(|layer| layer.visible));
+    let masks = visible.filter_map(|id| layer_mask(inp.project, *id)).filter(|mask| mask.enabled);
+    prepare_mask_curvature_sizes(inp, masks);
+}
+
+/// Build the curvature detail sizes the visible generators of `masks` read, once, before tiles composite in parallel.
+fn prepare_mask_curvature_sizes<'a>(inp: &Inputs, masks: impl Iterator<Item = &'a Mask>) {
+    let mut needed = [false; CurvatureDetail::BLURRED_SIZES];
+    for effect in masks.flat_map(|mask| &mask.effects).filter(|effect| effect.visible) {
+        if let EffectKind::Generator(Generator { detail: Some(detail), .. }) = &effect.kind {
+            for (slot, in_use) in needed.iter_mut().zip(detail.blurred_sizes_in_use()) {
+                *slot |= in_use;
+            }
+        }
+    }
+    CurvatureSizes::of(inp, &needed);
 }
 
 struct Node<'a> {
@@ -799,21 +840,26 @@ struct Node<'a> {
 
 /// Plans of the visible effects of a stack: mask effects (`channel` None) or the content
 /// effects of one channel (paint effects then read that channel's pixels).
-fn effect_plans<'a>(inp: &Inputs<'a>, effects: &'a [Effect], tx: u32, ty: u32, channel: Option<Channel>) -> Vec<EffectPlan<'a>> {
+fn effect_plans<'a>(inp: &Inputs<'a>, effects: &'a [Effect], tile_x: u32, tile_y: u32, channel: Option<Channel>) -> Vec<EffectPlan<'a>> {
     effects
         .iter()
-        .filter(|e| e.visible)
-        .map(|e| {
-            let (img, target) = match channel {
-                Some(c) => (inp.pixels.layer(e.id, c), PaintTarget::Layer(e.id)),
-                None => (inp.pixels.masks.get(&e.id), PaintTarget::Mask(e.id)),
+        .filter(|effect| effect.visible)
+        .map(|effect| {
+            let (image, target) = match channel {
+                Some(channel) => (inp.pixels.layer(effect.id, channel), PaintTarget::Layer(effect.id)),
+                None => (inp.pixels.masks.get(&effect.id), PaintTarget::Mask(effect.id)),
+            };
+            let curvature_sizes = match &effect.kind {
+                EffectKind::Generator(Generator { detail: Some(detail), .. }) => CurvatureSizes::of(inp, &detail.blurred_sizes_in_use()),
+                _ => None,
             };
             EffectPlan {
-                kind: &e.kind,
-                blend: e.blend,
-                opacity: e.opacity,
-                data: if e.kind.painted() { tile_of(inp, img, tx, ty, channel) } else { None },
+                kind: &effect.kind,
+                blend: effect.blend,
+                opacity: effect.opacity,
+                data: if effect.kind.painted() { tile_of(inp, image, tile_x, tile_y, channel) } else { None },
                 preview: previews(inp, target),
+                curvature_sizes,
             }
         })
         .collect()
@@ -1170,94 +1216,142 @@ impl<'a, 'b> Texel<'a, 'b> {
         }
     }
 
-    fn generator(&mut self, g: &Generator) -> f32 {
-        let c = self.coords();
-        let s = match g.kind {
-            GeneratorKind::EdgeWear => (self.baked(BakedMap::Curvature).unwrap_or(0.5) - 0.5) * 2.0,
-            GeneratorKind::Curvature => self.baked(BakedMap::Curvature).unwrap_or(0.5),
-            GeneratorKind::Dirt => 1.0 - self.baked(BakedMap::AmbientOcclusion).unwrap_or(1.0),
-            GeneratorKind::AmbientOcclusion => self.baked(BakedMap::AmbientOcclusion).unwrap_or(1.0),
-            GeneratorKind::ThinAreas => 1.0 - self.baked(BakedMap::Thickness).unwrap_or(1.0),
-            GeneratorKind::Position => c.pos.dot(Vec3::from(g.direction).try_normalize().unwrap_or(Vec3::Y)) * 0.5 + 0.5,
-            GeneratorKind::Direction => c.nrm.dot(Vec3::from(g.direction).try_normalize().unwrap_or(Vec3::Y)) * 0.5 + 0.5,
+    fn generator(&mut self, generator: &Generator, curvature_sizes: Option<&CurvatureSizes>) -> f32 {
+        let coords = self.coords();
+        let signal = match (generator.kind, &generator.detail) {
+            (GeneratorKind::Curvature | GeneratorKind::EdgeWear, Some(detail)) => self.curvature_detail(detail, curvature_sizes),
+            (GeneratorKind::EdgeWear, None) => (self.baked(BakedMap::Curvature).unwrap_or(0.5) - 0.5) * 2.0,
+            (GeneratorKind::Curvature, None) => self.baked(BakedMap::Curvature).unwrap_or(0.5),
+            (GeneratorKind::Dirt, _) => 1.0 - self.baked(BakedMap::AmbientOcclusion).unwrap_or(1.0),
+            (GeneratorKind::AmbientOcclusion, _) => self.baked(BakedMap::AmbientOcclusion).unwrap_or(1.0),
+            (GeneratorKind::ThinAreas, _) => 1.0 - self.baked(BakedMap::Thickness).unwrap_or(1.0),
+            (GeneratorKind::Position, _) => coords.pos.dot(Vec3::from(generator.direction).try_normalize().unwrap_or(Vec3::Y)) * 0.5 + 0.5,
+            (GeneratorKind::Direction, _) => coords.nrm.dot(Vec3::from(generator.direction).try_normalize().unwrap_or(Vec3::Y)) * 0.5 + 0.5,
         };
-        let s = if g.noise_amount > 0.0 { s + (world_noise(c.pos, g.noise_scale, g.seed) - 0.5) * g.noise_amount } else { s };
-        let th = 1.0 - g.level.clamp(0.0, 1.0);
-        let soft = g.softness.max(1e-3);
-        let t = ((s - (th - soft)) / (2.0 * soft)).clamp(0.0, 1.0);
-        let v = t * t * (3.0 - 2.0 * t);
-        if g.invert { 1.0 - v } else { v }
+        let signal = if generator.noise_amount > 0.0 {
+            let noise = world_noise(coords.pos, generator.noise_scale, generator.seed);
+            if let (GeneratorKind::Curvature | GeneratorKind::EdgeWear, Some(detail)) = (generator.kind, &generator.detail) {
+                // Break up curvature without inventing edges or cavities on a flat surface
+                let neutral = if detail.mode == CurvatureMode::Raw { 0.5 } else { 0.0 };
+                neutral + (signal - neutral) * (1.0 - noise * generator.noise_amount).max(0.0)
+            } else {
+                signal + (noise - 0.5) * generator.noise_amount
+            }
+        } else {
+            signal
+        };
+
+        // A smooth step from black to white over 2 × softness around 1 − level
+        let threshold = 1.0 - generator.level.clamp(0.0, 1.0);
+        let softness = generator.softness.max(1e-3);
+        let ramp = ((signal - (threshold - softness)) / (2.0 * softness)).clamp(0.0, 1.0);
+        let value = ramp * ramp * (3.0 - 2.0 * ramp);
+        if generator.invert { 1.0 - value } else { value }
     }
 
-    fn mask(&mut self, m: &MaskPlan) -> f32 {
-        let mut v = m.background;
-        let mut skip = 0;
-        if let Some((k, field)) = m.start
-            && let Some(f) = field.get(self.x, self.y).and_then(|d| d.first().copied())
-        {
-            v = f;
-            skip = k + 1;
+    /// The curvature of `detail`'s mode at this texel: each detail size's edges and cavities, weighted and combined like a screen blend.
+    fn curvature_detail(&self, detail: &CurvatureDetail, curvature_sizes: Option<&CurvatureSizes>) -> f32 {
+        let combine = |edges: f32, cavities: f32| match detail.mode {
+            CurvatureMode::Edges => edges,
+            CurvatureMode::Cavities => cavities,
+            CurvatureMode::Both => 1.0 - (1.0 - edges) * (1.0 - cavities),
+            CurvatureMode::Raw => 0.5 + 0.5 * (edges - cavities),
+        };
+
+        // Without curvature to read the texel is flat: no edges or cavities
+        let Some(curvature) = self.baked(BakedMap::Curvature) else { return combine(0.0, 0.0) };
+
+        let working_size = (self.res, self.inp.gbuf.height);
+        let texel_uv = [(self.x as f32 + 0.5) / working_size.0.max(1) as f32, (self.y as f32 + 0.5) / working_size.1.max(1) as f32];
+        let Some(baked_uv) = self.inp.block_scales.bake_uv(texel_uv, working_size) else { return combine(0.0, 0.0) };
+
+        let baked_size = (self.inp.baked.resolution, self.inp.baked.height(BakedMap::Curvature));
+        let (baked_x, baked_y) = ((baked_uv[0] * baked_size.0 as f32) as u32, (baked_uv[1] * baked_size.1 as f32) as u32);
+        let blurred = |index: usize| {
+            curvature_sizes.and_then(|sizes| sizes.levels.get(index)).and_then(Option::as_deref).map_or(0.0, |level| level.sample(baked_x, baked_y))
+        };
+        let (mut edges, mut cavities) = (0.0f32, 0.0f32);
+        for (index, (size, weight)) in CurvatureDetail::SIZES.iter().zip(detail.weights).enumerate() {
+            let deviation = if index == 0 { curvature - 0.5 } else { blurred(index - 1) };
+
+            let response = deviation * if *size == 0.0 { MAP_GAIN } else { GAIN_PER_DETAIL_TEXEL * size };
+            let weight = weight.clamp(0.0, 1.0);
+            edges = 1.0 - (1.0 - edges) * (1.0 - weight * response.clamp(0.0, 1.0));
+            cavities = 1.0 - (1.0 - cavities) * (1.0 - weight * (-response).clamp(0.0, 1.0));
         }
-        for e in m.effects.iter().skip(skip) {
-            let o = e.opacity.clamp(0.0, 1.0);
-            match e.kind {
+
+        combine(edges, cavities)
+    }
+
+    fn mask(&mut self, plan: &MaskPlan) -> f32 {
+        let mut value = plan.background;
+        let mut skip = 0;
+        if let Some((filtered_index, field)) = plan.start
+            && let Some(filtered) = field.get(self.x, self.y).and_then(|texel| texel.first().copied())
+        {
+            value = filtered;
+            skip = filtered_index + 1;
+        }
+
+        for effect in plan.effects.iter().skip(skip) {
+            let opacity = effect.opacity.clamp(0.0, 1.0);
+            match effect.kind {
                 EffectKind::Paint | EffectKind::Path(_) => {
-                    let (mut pv, mut cov) = match e.data.as_deref() {
-                        Some(d) => (from_u16(d.get(self.o * 2).copied().unwrap_or(0)), from_u16(d.get(self.o * 2 + 1).copied().unwrap_or(0))),
+                    let (mut painted, mut cov) = match effect.data.as_deref() {
+                        Some(data) => (from_u16(data.get(self.o * 2).copied().unwrap_or(0)), from_u16(data.get(self.o * 2 + 1).copied().unwrap_or(0))),
                         None => (0.0, 0.0),
                     };
-                    if e.preview
-                        && let Some(p) = self.inp.preview
+                    if effect.preview
+                        && let Some(preview) = self.inp.preview
                     {
-                        let a = (self.stroke * p.opacity).clamp(0.0, 1.0);
-                        if p.erase {
-                            pv *= 1.0 - a;
-                            cov *= 1.0 - a;
+                        let stroke = (self.stroke * preview.opacity).clamp(0.0, 1.0);
+                        if preview.erase {
+                            painted *= 1.0 - stroke;
+                            cov *= 1.0 - stroke;
                         } else {
-                            pv = p.mask_value * a + pv * (1.0 - a);
-                            cov = a + cov * (1.0 - a);
+                            painted = preview.mask_value * stroke + painted * (1.0 - stroke);
+                            cov = stroke + cov * (1.0 - stroke);
                         }
                     }
                     if cov > 0.0 {
-                        let val = pv / cov.max(1e-5);
-                        v += (blend1(e.blend, v, val) - v) * cov * o;
+                        let layer_value = painted / cov.max(1e-5);
+                        value += (blend1(effect.blend, value, layer_value) - value) * cov * opacity;
                     }
                 }
                 EffectKind::Fill { source, projection } => {
-                    let val = self.source(source, projection, ChannelKind::Scalar)[0];
-                    v += (blend1(e.blend, v, val) - v) * o * self.cover(std::iter::once(source), projection);
+                    let fill = self.source(source, projection, ChannelKind::Scalar)[0];
+                    value += (blend1(effect.blend, value, fill) - value) * opacity * self.cover(std::iter::once(source), projection);
                 }
-                EffectKind::Generator(g) => {
-                    let val = self.generator(g);
-                    v += (blend1(e.blend, v, val) - v) * o;
+                EffectKind::Generator(generator) => {
+                    let generated = self.generator(generator, effect.curvature_sizes.as_deref());
+                    value += (blend1(effect.blend, value, generated) - value) * opacity;
                 }
-                EffectKind::Levels(l) => v += (l.apply(v) - v) * o,
-                EffectKind::Filter(f) => {
-                    // A mask is gray (HSL only changes its lightness); neighbourhood filters come
-                    // precomputed through `MaskPlan::start`.
-                    let val = f.point(ChannelKind::Scalar, [v; 3]).map_or(v, |x| x[0]);
-                    v += (val - v) * o;
+                EffectKind::Levels(levels) => value += (levels.apply(value) - value) * opacity,
+                EffectKind::Filter(filter) => {
+                    // A mask is gray (HSL only changes its lightness); neighbourhood filters come precomputed through `MaskPlan::start`
+                    let filtered = filter.point(ChannelKind::Scalar, [value; 3]).map_or(value, |gray| gray[0]);
+                    value += (filtered - value) * opacity;
                 }
                 EffectKind::ColorSelection { colors, tolerance } => {
                     let id = self.baked_color(BakedMap::Id);
-                    let hit = id.is_some_and(|c| colors.iter().any(|k| (k[0] - c[0]).abs().max((k[1] - c[1]).abs()).max((k[2] - c[2]).abs()) <= *tolerance));
-                    let val = if hit { 1.0 } else { 0.0 };
-                    v += (blend1(e.blend, v, val) - v) * o;
+                    let within = |picked: &[f32; 3], color: [f32; 3]| (0..3).all(|component| (picked[component] - color[component]).abs() <= *tolerance);
+                    let selected = if id.is_some_and(|color| colors.iter().any(|picked| within(picked, color))) { 1.0 } else { 0.0 };
+                    value += (blend1(effect.blend, value, selected) - value) * opacity;
                 }
-                EffectKind::Compare { op, value, tolerance } => {
+                EffectKind::Compare { op, value: compared, tolerance } => {
                     let pass = match op {
-                        CompareOp::LesserThan => v < *value,
-                        CompareOp::GreaterThan => v > *value,
-                        CompareOp::WithinTolerance => (v - value).abs() <= *tolerance,
+                        CompareOp::LesserThan => value < *compared,
+                        CompareOp::GreaterThan => value > *compared,
+                        CompareOp::WithinTolerance => (value - compared).abs() <= *tolerance,
                     };
-                    let val = if pass { 1.0 } else { 0.0 };
-                    v += (val - v) * o;
+                    let result = if pass { 1.0 } else { 0.0 };
+                    value += (result - value) * opacity;
                 }
-                // Content-only effects.
+                // Content-only effects
                 EffectKind::Material(_) | EffectKind::Anchor => {}
             }
         }
-        v.clamp(0.0, 1.0)
+        value.clamp(0.0, 1.0)
     }
 
     /// Composite `nodes` over `acc`, recording anchors. Returns true when it reached the `stop`
@@ -1902,6 +1996,10 @@ pub fn mask_image(inputs: &Inputs, id: LayerId, size: u32) -> Option<Vec<u8>> {
     let channels = inputs.project.texture_set(inputs.ts).map(|set| set.channel_list()).unwrap_or_default();
     let (width, height) = (inputs.gbuf.width, inputs.gbuf.height);
     let coordinates = all_tiles(width, height);
+
+    // A hidden layer's mask is left out of the stack's preparation
+    prepare_mask_curvature_sizes(inputs, std::iter::once(mask));
+
     let fields = neighbourhood_fields(inputs, &channels, &coordinates);
     let tiles: HashMap<(u32, u32), Vec<u8>> = coordinates
         .par_iter()
@@ -1955,6 +2053,10 @@ pub fn mask_at(inputs: &Inputs, id: LayerId, texels: &[(u32, u32)]) -> Option<Ve
     }
 
     let channels = inputs.project.texture_set(inputs.ts).map(|set| set.channel_list()).unwrap_or_default();
+
+    // A hidden layer's mask is left out of the stack's preparation
+    prepare_mask_curvature_sizes(inputs, std::iter::once(mask));
+
     // Filters and anchors can depend on texels outside the requested tiles
     let fields = neighbourhood_fields(inputs, &channels, &all_tiles(inputs.gbuf.width, inputs.gbuf.height));
     let values: Vec<(usize, f32)> = requested
@@ -2107,60 +2209,67 @@ pub type FlatTile = (Channel, (u32, u32), Vec<u16>);
 /// Flatten one paint or fill layer: its content (with content effects) times its mask, as
 /// premultiplied (value, coverage) tiles per enabled channel, ready to become a plain paint
 /// layer. Groups are not supported (None).
-pub fn flatten_layer(inp: &Inputs, id: LayerId, tiles: &[(u32, u32)]) -> Option<Vec<FlatTile>> {
-    let set = inp.project.texture_set(inp.ts).ok()?;
-    if inp.project.content_layer(id)?.is_group() {
+pub fn flatten_layer(inputs: &Inputs, id: LayerId, tiles: &[(u32, u32)]) -> Option<Vec<FlatTile>> {
+    let set = inputs.project.texture_set(inputs.ts).ok()?;
+    if inputs.project.content_layer(id)?.is_group() {
         return None;
     }
+
     let channels: Vec<Channel> = set.channel_list();
-    // Plan the layer forced visible so hidden layers flatten too.
-    let mut solo = inp.project.clone();
+
+    // Plan the layer forced visible so hidden layers flatten too
+    let mut solo = inputs.project.clone();
     if let Some(l) = solo.layers.get_mut(&id) {
         l.visible = true;
     }
-    let solo_inp = Inputs { project: &solo, preview: None, block_scales: inp.block_scales.clone(), ..*inp };
-    let fields = neighbourhood_fields(&solo_inp, &channels, tiles);
+    let visible_inputs = Inputs { project: &solo, preview: None, block_scales: inputs.block_scales.clone(), ..*inputs };
+    let fields = neighbourhood_fields(&visible_inputs, &channels, tiles);
+
     let out: Vec<Vec<FlatTile>> = tiles
         .par_iter()
         .map(|&(tx, ty)| {
-            let nodes = plan(&solo_inp, &[id], &channels, tx, ty, 0, Some(&fields));
+            let nodes = plan(&visible_inputs, &[id], &channels, tx, ty, 0, Some(&fields));
             let Some(n) = nodes.first() else { return Vec::new() };
-            let full = anchor_plan(&solo_inp, id, &channels, tx, ty, Some(&fields));
-            let mut bufs: Vec<(Channel, Vec<u16>, bool)> =
+            let full = anchor_plan(&visible_inputs, id, &channels, tx, ty, Some(&fields));
+            let mut buffers: Vec<(Channel, Vec<u16>, bool)> =
                 n.chans.iter().filter_map(|c| Channel::ALL.get(c.ch).map(|ch| (*ch, vec![0u16; TILE_AREA * (c.comps + 1)], false))).collect();
-            for (ch, buf, _) in &mut bufs {
+            for (ch, buffer, _) in &mut buffers {
                 if ch.kind() == ChannelKind::Signed {
-                    for px in buf.chunks_exact_mut(2) {
-                        px[0] = to_u16_signed(0.0);
+                    for pixel in buffer.as_chunks_mut::<2>().0 {
+                        pixel[0] = to_u16_signed(0.0);
                     }
                 }
             }
-            for (x, y, o) in tile_texels(inp.gbuf, tx, ty) {
-                let mut tex = Texel::new(&solo_inp, x, y, o, 0.0);
+
+            for (x, y, o) in tile_texels(inputs.gbuf, tx, ty) {
+                let mut tex = Texel::new(&visible_inputs, x, y, o, 0.0);
                 if !full.is_empty() {
                     tex.anchors_below(&full, id);
                 }
                 let m = tex.node_mask(n);
-                for (c, (ch, buf, any)) in n.chans.iter().zip(bufs.iter_mut()) {
+                for (c, (ch, buffer, any)) in n.chans.iter().zip(buffers.iter_mut()) {
                     let Some((v, cov)) = tex.content(&n.content, c) else { continue };
                     let a = (cov * m).clamp(0.0, 1.0);
                     if a <= 0.0 {
                         continue;
                     }
+
                     *any = true;
                     let comps = c.comps;
-                    let Some(px) = buf.get_mut(o * (comps + 1)..(o + 1) * (comps + 1)) else { continue };
-                    for (slot, pv) in px.iter_mut().zip(v.iter().take(comps)) {
+                    let Some(pixel) = buffer.get_mut(o * (comps + 1)..(o + 1) * (comps + 1)) else { continue };
+                    for (slot, pv) in pixel.iter_mut().zip(v.iter().take(comps)) {
                         *slot = if ch.kind() == ChannelKind::Signed { to_u16_signed(pv * a) } else { to_u16(pv * a) };
                     }
-                    if let Some(slot) = px.get_mut(comps) {
+                    if let Some(slot) = pixel.get_mut(comps) {
                         *slot = to_u16(a);
                     }
                 }
             }
-            bufs.into_iter().filter(|(_, _, any)| *any).map(|(ch, buf, _)| (ch, (tx, ty), buf)).collect()
+
+            buffers.into_iter().filter(|(_, _, any)| *any).map(|(ch, buffer, _)| (ch, (tx, ty), buffer)).collect()
         })
         .collect();
+
     Some(out.into_iter().flatten().collect())
 }
 
@@ -2457,6 +2566,80 @@ mod tests {
         effects.push(warp_on_top);
         let blurred_then_warped = row(&fixture);
         assert!(blurred_then_warped.iter().zip(&warped).any(|(chained, single)| (chained - single).abs() > 0.1), "the blur under the warp still runs");
+    }
+
+    #[test]
+    fn larger_curvature_detail_sizes_reach_further_from_an_edge() {
+        let mut fixture = fixture();
+        fixture.gbuf = UvGBuffer::new(&fixture.mesh, 0, 256, 256);
+        fixture.project.texture_sets[0].resolution = 256;
+        let ridge: Vec<f32> = (0..256 * 256).map(|texel| if texel % 256 == 128 { 1.0 } else { 0.5 }).collect();
+        fixture.baked = BakedMaps { resolution: 256, maps: [(BakedMap::Curvature, Arc::new(ridge))].into() };
+        let layer = fill_layer(&mut fixture.project, [1.0; 3], 1.0);
+        let row_with = |fixture: &mut Fixture, weights: [f32; 7]| -> Vec<f32> {
+            let detail = CurvatureDetail { mode: CurvatureMode::Edges, weights };
+            let generator = Generator { level: 0.5, softness: 0.5, noise_amount: 0.0, detail: Some(detail), ..Generator::new(GeneratorKind::Curvature) };
+            let mut mask = Mask::new(MaskBackground::Black);
+            mask.effects.push(Effect::new(fixture.project.alloc_id(), EffectKind::Generator(generator)));
+            fixture.project.layer_mut(layer).unwrap().mask = Some(mask);
+            let images = Default::default();
+            let inputs = Inputs {
+                project: &fixture.project,
+                ts: 0,
+                mesh: &fixture.mesh,
+                gbuf: &fixture.gbuf,
+                pixels: &fixture.pixels,
+                baked: &fixture.baked,
+                block_scales: BlockScales::default(),
+                preview: None,
+                images: &images,
+                bounds: fixture.mesh.bounds(),
+            };
+            mask_at(&inputs, layer, &(120..137).map(|x| (x, 128)).collect::<Vec<_>>()).unwrap()
+        };
+
+        // The row starts at x 120: the ridge is its ninth texel, five texels left of it the fourth
+        let (ridge, five_texels_away) = (8, 3);
+        let finest = row_with(&mut fixture, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let largest = row_with(&mut fixture, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]);
+        assert!(finest[ridge] > 0.99 && finest[five_texels_away] < 0.01, "the map itself marks only the ridge: {finest:?}");
+        assert!(largest[ridge] > 0.99 && largest[five_texels_away] > 0.5, "the largest size reaches texels away from it: {largest:?}");
+    }
+
+    #[test]
+    fn curvature_detail_noise_keeps_flat_areas_neutral() {
+        let mut fixture = fixture();
+        fixture.baked = BakedMaps { resolution: 64, maps: [(BakedMap::Curvature, Arc::new(vec![0.5; 64 * 64]))].into() };
+        let layer = fill_layer(&mut fixture.project, [1.0; 3], 1.0);
+        let texels: Vec<_> = (0..64).map(|x| (x, 32)).collect();
+
+        for kind in [GeneratorKind::Curvature, GeneratorKind::EdgeWear] {
+            for mode in CurvatureMode::ALL {
+                let detail = CurvatureDetail { mode, weights: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0] };
+                let generator = Generator { level: 0.5, softness: 0.5, noise_amount: 2.0, detail: Some(detail), ..Generator::new(kind) };
+                let mut mask = Mask::new(MaskBackground::Black);
+                mask.effects.push(Effect::new(fixture.project.alloc_id(), EffectKind::Generator(generator)));
+                fixture.project.layer_mut(layer).unwrap().mask = Some(mask);
+
+                let values = assert_sparse_mask_matches_image(&fixture, layer, &texels).unwrap();
+                let expected = if mode == CurvatureMode::Raw { 0.5 } else { 0.0 };
+                assert!(values.iter().all(|value| (value - expected).abs() < 0.001), "{kind:?} {mode:?} paints noise on flat curvature: {values:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn raw_curvature_reads_mid_gray_without_a_curvature_map() {
+        let mut fixture = fixture();
+        let layer = fill_layer(&mut fixture.project, [1.0; 3], 1.0);
+        let detail = CurvatureDetail { mode: CurvatureMode::Raw, ..CurvatureDetail::default() };
+        let generator = Generator { level: 0.5, softness: 0.5, noise_amount: 0.0, detail: Some(detail), ..Generator::new(GeneratorKind::Curvature) };
+        let mut mask = Mask::new(MaskBackground::Black);
+        mask.effects.push(Effect::new(fixture.project.alloc_id(), EffectKind::Generator(generator)));
+        fixture.project.layer_mut(layer).unwrap().mask = Some(mask);
+
+        let values = assert_sparse_mask_matches_image(&fixture, layer, &[(32, 32)]).unwrap();
+        assert!(values.iter().all(|value| (value - 0.5).abs() < 0.01), "flat curvature is mid gray in raw mode, not black: {values:?}");
     }
 
     #[test]

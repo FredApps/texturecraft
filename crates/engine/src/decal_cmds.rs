@@ -25,7 +25,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit decal",
             [],
             None,
-            "{layer? | effect?: a mask fill effect id (a decal placed as a mask; with `layer`, it must be in that layer), x?, y?, viewport? | position?, normal? (re-place it), up?: [x,y,z], size?: height | [w,h], rotation?: degrees, offset?: [right, up] (world units from where it was placed), depth?, image?: replaces the image in the channel or mask it was placed in, merge?: true continues the previous Edit decal undo step (drags)}",
+            "{layer? | effect?: a mask fill effect id (a decal placed as a mask; with `layer`, it must be in that layer), x?, y?, viewport? | position?, normal? (re-place it on its own texture set), up?: [x,y,z], size?: height | [w,h], rotation?: degrees, offset?: [right, up] (world units from where it was placed), depth?, image?: replaces the image in the channel or mask it was placed in, merge?: true continues the previous Edit decal undo step (drags)}",
             has_layer,
             set
         ),
@@ -42,22 +42,23 @@ fn vec3(p: &Value, key: &str) -> Option<Vec3> {
     }
 }
 
-/// Where a decal goes and the texture set it lands on, from `x`/`y` (viewport pixels, the view center by default) or `position` + `normal` (on the active set); None when `optional` and neither is given
-fn placement(s: &Session, cmd: &str, p: &Value, optional: bool) -> Result<Option<(Vec3, Vec3, usize)>> {
-    if let Some(position) = vec3(p, "position") {
-        let normal = vec3(p, "normal").and_then(Vec3::try_normalize).ok_or_else(|| bad(cmd, "`position` needs a non-zero `normal`"))?;
-        return Ok(Some((position, normal, s.ts())));
+/// Resolve a viewport hit or explicit world position, using `texture_set` for explicit positions.
+/// Returns None when placement is optional and no position or viewport point is given.
+fn placement(session: &Session, command: &str, params: &Value, texture_set: usize, optional: bool) -> Result<Option<(Vec3, Vec3, usize)>> {
+    if let Some(position) = vec3(params, "position") {
+        let normal = vec3(params, "normal").and_then(Vec3::try_normalize).ok_or_else(|| bad(command, "`position` needs a non-zero `normal`"))?;
+        return Ok(Some((position, normal, texture_set)));
     }
 
-    let viewport = viewport_of(s, p);
-    let at = match (f32p(p, "x"), f32p(p, "y")) {
+    let viewport = viewport_of(session, params);
+    let point = match (f32p(params, "x"), f32p(params, "y")) {
         (Some(x), Some(y)) => Vec2::new(x, y),
         _ if optional => return Ok(None),
         _ => viewport * 0.5,
     };
-    let hit = s.pick(at, viewport).ok_or_else(|| bad(cmd, "nothing under that point: place the decal on the mesh"))?;
-    let ts = s.texture_set_of_material(hit.material).ok_or_else(|| bad(cmd, "that surface has no texture set"))?;
-    Ok(Some((hit.pos, hit.nrm, ts)))
+    let hit = session.pick(point, viewport).ok_or_else(|| bad(command, "nothing under that point: place the decal on the mesh"))?;
+    let hit_set = session.texture_set_of_material(hit.material).ok_or_else(|| bad(command, "that surface has no texture set"))?;
+    Ok(Some((hit.pos, hit.nrm, hit_set)))
 }
 
 /// A new decal's height, relative to the mesh diagonal
@@ -105,7 +106,7 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
     let image = strp(p, "image").ok_or_else(|| bad(cmd, "`image` is required"))?.to_string();
     let resource = s.images.get(&image).ok_or_else(|| bad(cmd, format!("no image resource `{image}` (import it first)")))?;
     let aspect = resource.width as f32 / resource.height.max(1) as f32;
-    let (center, normal, ts) = placement(s, cmd, p, false)?.ok_or_else(|| bad(cmd, "no placement"))?;
+    let (center, normal, ts) = placement(s, cmd, p, s.ts(), false)?.ok_or_else(|| bad(cmd, "no placement"))?;
 
     // None: the image masks a new fill layer
     let target = match strp(p, "channel") {
@@ -178,65 +179,68 @@ fn decal_of(s: &Session, cmd: &str, id: LayerId, effect: Option<LayerId>) -> Res
     }
 }
 
-fn set(s: &mut Session, p: &Value) -> Result<Value> {
-    let cmd = "layer.decal.set";
-    let effect = u64p(p, "effect").map(LayerId);
-    let id = match effect {
-        Some(effect) => s.doc.project.effect(effect).map(|(owner, _)| owner).ok_or_else(|| bad(cmd, format!("no effect {}", effect.0)))?,
-        None => s.doc.project.content_layer(layer_param(s, cmd, p)?).map(|layer| layer.id).ok_or_else(|| bad(cmd, "no layer"))?,
+fn set(session: &mut Session, params: &Value) -> Result<Value> {
+    let command = "layer.decal.set";
+    let effect = u64p(params, "effect").map(LayerId);
+    let layer_id = match effect {
+        Some(effect) => session.doc.project.effect(effect).map(|(owner, _)| owner).ok_or_else(|| bad(command, format!("no effect {}", effect.0)))?,
+        None => session.doc.project.content_layer(layer_param(session, command, params)?).map(|layer| layer.id).ok_or_else(|| bad(command, "no layer"))?,
     };
-    if let (Some(effect), Some(layer)) = (effect, u64p(p, "layer"))
-        && layer != id.0
+    if let (Some(effect), Some(layer)) = (effect, u64p(params, "layer"))
+        && layer != layer_id.0
     {
-        return Err(bad(cmd, format!("effect {} is not in layer {layer}", effect.0)));
+        return Err(bad(command, format!("effect {} is not in layer {layer}", effect.0)));
     }
 
-    let mut decal = decal_of(s, cmd, id, effect)?;
-    let mesh_diagonal = mesh_size(s);
-    if let Some((center, normal, ts)) = placement(s, cmd, p, true)? {
-        // A decal layer stays in its texture set
-        if ts != s.ts() {
-            return Err(bad(cmd, "that surface belongs to another texture set"));
+    let mut decal = decal_of(session, command, layer_id, effect)?;
+    let texture_set =
+        session.doc.project.locate(layer_id).map(|(texture_set, _, _)| texture_set).ok_or_else(|| bad(command, "the decal has no texture set"))?;
+    let mesh_diagonal = mesh_size(session);
+    if let Some((center, normal, hit_set)) = placement(session, command, params, texture_set, true)? {
+        // Selecting another set must not let this decal leave its layer's stack
+        if hit_set != texture_set {
+            return Err(bad(command, "that surface belongs to another texture set"));
         }
 
         (decal.center, decal.normal, decal.offset) = (center.to_array(), normal.to_array(), [0.0; 2]);
     }
-    if p.get("up").is_some() {
-        decal.up = decal_up(s, cmd, p, Vec3::from(decal.normal))?.to_array();
+    if params.get("up").is_some() {
+        decal.up = decal_up(session, command, params, Vec3::from(decal.normal))?.to_array();
     }
-    if let Some(size) = size_param(p, decal.size[0] / decal.size[1].max(1e-6), mesh_diagonal) {
+    if let Some(size) = size_param(params, decal.size[0] / decal.size[1].max(1e-6), mesh_diagonal) {
         decal.size = size;
     }
-    if let Some(rotation) = f32p(p, "rotation") {
+    if let Some(rotation) = f32p(params, "rotation") {
         decal.rotation = rotation.rem_euclid(360.0);
     }
-    if let Some(offset) = p.get("offset").and_then(Value::as_array) {
+    if let Some(offset) = params.get("offset").and_then(Value::as_array) {
         let values: Vec<f32> = offset.iter().filter_map(Value::as_f64).map(|value| value as f32).filter(|value| value.is_finite()).collect();
-        let [right, up] = values.as_slice() else { return Err(bad(cmd, "`offset` must be [right, up]")) };
+        let [right, up] = values.as_slice() else { return Err(bad(command, "`offset` must be [right, up]")) };
 
         decal.offset = [right.clamp(-mesh_diagonal, mesh_diagonal), up.clamp(-mesh_diagonal, mesh_diagonal)];
     }
-    if let Some(depth) = f32p(p, "depth") {
+    if let Some(depth) = f32p(params, "depth") {
         decal.depth = depth.clamp(mesh_diagonal * MIN_SIZE, mesh_diagonal * MAX_SIZE);
     }
 
-    let image = strp(p, "image").map(str::to_string);
+    let image = strp(params, "image").map(str::to_string);
     if let Some(name) = &image
-        && !s.doc.resources.contains_key(name)
+        && !session.doc.resources.contains_key(name)
     {
-        return Err(bad(cmd, format!("no image resource `{name}`")));
+        return Err(bad(command, format!("no image resource `{name}`")));
     }
 
-    s.edit("Edit decal", |s| {
+    session.edit("Edit decal", |session| {
         if let Some(effect) = effect {
-            if let Some(EffectKind::Fill { source, projection }) = s.doc.project.effect_mut(effect).map(|effect| &mut effect.kind) {
+            if let Some(EffectKind::Fill { source, projection }) = session.doc.project.effect_mut(effect).map(|effect| &mut effect.kind) {
                 *projection = Projection::Decal(decal);
                 if let Some(image) = image {
                     *source = Source::image(image);
                 }
             }
-        } else if let LayerKind::Fill(fill) = &mut s.doc.project.layer_mut(id)?.kind {
+        } else if let LayerKind::Fill(fill) = &mut session.doc.project.layer_mut(layer_id)?.kind {
             fill.projection = Projection::Decal(decal);
+
             // The new image goes where the decal's image is (the channel it was placed in)
             let placed = fill.sources.values().find_map(|source| match source {
                 Source::Image { name, .. } => Some(name.clone()),
@@ -260,5 +264,5 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         }
         Ok(())
     })?;
-    Ok(json!({ "layer": id.0, "decal": decal }))
+    Ok(json!({ "layer": layer_id.0, "decal": decal }))
 }

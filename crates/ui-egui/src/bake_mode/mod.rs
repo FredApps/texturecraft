@@ -1,9 +1,13 @@
 //! Bake Mode presentation; persisted settings live in core and edits use engine commands
 
 mod bake_paint_brush;
+mod bake_visualization_panel;
+mod bake_visualization_toggles;
 mod breadcrumb;
 mod common_settings;
 pub use bake_paint_brush::BakePaintBrush;
+pub(crate) use bake_visualization_panel::bake_visualization_panel;
+pub use bake_visualization_toggles::BakeVisualizationToggles;
 mod controls;
 mod map_settings;
 mod mesh_map_bakers;
@@ -180,16 +184,64 @@ fn edit_settings(
     app.run("bake.settings", json!({ "ts": texture_sets, "patch": patch }));
 }
 
+/// What the 3D view shows while a bake runs: the newest finished map, one finished map or the material
+fn preview_control(app: &mut TextureCraftApp, ui: &mut Ui) {
+    use texturecraft_engine::PreviewShow;
+
+    let Some(preview) = app.session.bake_preview.as_ref() else { return };
+
+    let show = preview.show;
+
+    // Finished maps of the set baking now can be pinned; the others are still neutral
+    let rows: Vec<(BakedMap, bool)> =
+        preview.current_set().map(|set| set.order.iter().map(|&map| (map, set.baked.maps.contains_key(&map))).collect()).unwrap_or_default();
+    let text = match show {
+        PreviewShow::Follow => tr("Follow Newest Map").to_owned(),
+        PreviewShow::Material => tr("Material").to_owned(),
+        PreviewShow::Pin(map) => trf("Mesh map: {map}", &[("map", &tr(crate::i18n::baked_map_label(map)))]),
+    };
+
+    let mut choice = None;
+    egui::ComboBox::from_id_salt("bake_preview_show")
+        .selected_text(text)
+        .show_ui(ui, |ui| {
+            if ui.selectable_label(show == PreviewShow::Follow, tr("Follow Newest Map")).clicked() {
+                choice = Some(PreviewShow::Follow);
+            }
+            for (map, done) in rows {
+                let label = trf("Mesh map: {map}", &[("map", &tr(crate::i18n::baked_map_label(map)))]);
+                if ui.add_enabled(done, egui::Button::selectable(show == PreviewShow::Pin(map), label)).clicked() {
+                    choice = Some(PreviewShow::Pin(map));
+                }
+            }
+            if ui.selectable_label(show == PreviewShow::Material, tr("Material")).clicked() {
+                choice = Some(PreviewShow::Material);
+            }
+        })
+        .response
+        .on_hover_text(tr(
+            "What the 3D view shows while the bake runs: the newest finished map, one finished map, or the material. Maps not baked yet show a neutral value.",
+        ));
+
+    if let Some(show) = choice {
+        app.run("bake.preview", json!({ "show": show.id() }));
+    }
+}
+
 pub(crate) fn bake_bar(app: &mut TextureCraftApp, ctx: &egui::Context, viewport: egui::Rect) {
     egui::Area::new(egui::Id::unique("bake_bar")).constrain_to(viewport).anchor(egui::Align2::CENTER_BOTTOM, vec2(0.0, -16.0)).default_width(0.0).show(
         ctx,
         |ui| {
+            if let Some(status) = app.bake_status() {
+                ui.vertical_centered(|ui| ui.label(egui::RichText::new(status).strong()));
+            }
             ui.horizontal(|ui| {
                 if let Some(progress) = app.bake_progress() {
                     ui.add(egui::ProgressBar::new(progress).desired_width(220.0).show_percentage());
                     if ui.button(tr("Cancel")).clicked() {
                         app.cancel_bake();
                     }
+                    preview_control(app, ui);
                 } else {
                     let texture_sets: Vec<usize> = app
                         .session

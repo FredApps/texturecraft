@@ -110,8 +110,45 @@ pub fn handle(app: &mut TextureCraftApp, ctx: &egui::Context, method: &str, p: &
                 "uiMs": app.ui_ms,
                 "titleBar": app.title_bar.name(),
                 "baking": app.bake_progress(),
+                "bakeStatus": app.bake_status(),
+                "bakePreview": texturecraft_engine::bake_preview::preview_json(&app.session),
                 "toasts": app.toasts.iter().map(|t| json!({"text": t.text, "error": t.error})).collect::<Vec<_>>(),
             }))
+        }
+        "ui.bake.start" => {
+            // Bake in the background like the Bake button: the 3D view shows the maps as they finish
+            let count = app.session.doc.project.texture_sets.len();
+            let sets: Vec<usize> = match p.get("ts") {
+                Some(value) => match serde_json::from_value::<Vec<usize>>(if value.is_array() { value.clone() } else { json!([value]) }) {
+                    Ok(list) if list.iter().all(|&index| index < count) => list,
+                    _ => return err(format!("`ts` must be texture set indices below {count}")),
+                },
+                None => app
+                    .session
+                    .doc
+                    .project
+                    .texture_sets
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, texture_set)| texture_set.bake.common.is_enabled)
+                    .map(|(index, _)| index)
+                    .collect(),
+            };
+            if app.bake.is_some() {
+                return err("a bake is already running");
+            }
+
+            if sets.is_empty() {
+                return err("no texture set to bake: tick one in Bake mode or pass `ts`");
+            }
+
+            app.ui.mode = crate::state::Mode::Baking;
+            app.start_bake(sets);
+            ok(texturecraft_engine::bake_preview::preview_json(&app.session))
+        }
+        "ui.bake.cancel" => {
+            app.cancel_bake();
+            ok(Value::Null)
         }
         "ui.menu.list" => ok(json!(
             crate::menus::CATALOG
