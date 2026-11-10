@@ -113,6 +113,12 @@ pub struct GpuTracer {
     env: Option<EnvGpu>,
     materials: Option<Materials>,
     acc: Option<Accum>,
+    /// The accumulation buffers of the size before the last size change. Rendering switches
+    /// between two sizes (small while the camera moves, full when it stops), and allocating
+    /// ~100 MB of buffers on every switch costs tens of milliseconds, a visible hitch.
+    spare_acc: Option<Accum>,
+    /// How many sets of accumulation buffers were allocated (for tests).
+    acc_allocations: u32,
     scene: Option<SceneConst>,
     bind: Option<wgpu::BindGroup>,
     samples: u32,
@@ -309,6 +315,8 @@ impl GpuTracer {
             env: None,
             materials: None,
             acc: None,
+            spare_acc: None,
+            acc_allocations: 0,
             scene: None,
             bind: None,
             samples: 0,
@@ -323,6 +331,7 @@ impl GpuTracer {
     /// Free the scene and accumulation memory, keeping the compiled pipelines.
     pub fn release(&mut self) {
         (self.geometry, self.env, self.materials, self.acc, self.scene, self.bind) = (None, None, None, None, None, None);
+        self.spare_acc = None;
         self.samples = 0;
     }
 
@@ -508,8 +517,16 @@ impl GpuTracer {
             }
             return Ok(());
         }
-        self.acc = None;
         self.bind = None;
+        // Back to the size before the last change: reuse that set (cleared) instead of allocating.
+        if let Some(spare) = self.spare_acc.take_if(|a| (a.width, a.height) == (w, h)) {
+            for b in spare.acc.iter().chain(&spare.illum) {
+                encoder.clear_buffer(b, 0, None);
+            }
+            self.spare_acc = self.acc.replace(spare);
+            return Ok(());
+        }
+        self.spare_acc = self.acc.take();
         let bytes = u64::from(w) * u64::from(h) * 16;
         let limits = device.limits();
         if bytes > limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) {
@@ -529,6 +546,7 @@ impl GpuTracer {
             acc: ["tc_acc_hit", "tc_acc_albedo", "tc_acc_normal", "tc_acc_env"].map(buf),
             illum: ["tc_illum_a", "tc_illum_b"].map(buf),
         })?);
+        self.acc_allocations += 1;
         Ok(())
     }
 
@@ -814,6 +832,21 @@ mod tests {
         staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         h.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
         bytemuck::cast_slice(&staging.slice(..).get_mapped_range().unwrap()).to_vec()
+    }
+
+    #[test]
+    fn switching_between_two_sizes_reuses_the_accumulation_buffers() {
+        let Some((h, mut t)) = gpu() else { return };
+        let mut enc = h.device.create_command_encoder(&Default::default());
+        for (w, ht) in [(64, 48), (32, 24), (64, 48), (32, 24), (64, 48)] {
+            t.reset(&h.device, &mut enc, w, ht).unwrap();
+            let a = t.acc.as_ref().unwrap();
+            assert_eq!((a.width, a.height), (w, ht));
+        }
+        assert_eq!(t.acc_allocations, 2, "two sizes, two allocations, however often it switches");
+        t.reset(&h.device, &mut enc, 16, 16).unwrap();
+        assert_eq!(t.acc_allocations, 3, "a third size allocates (and drops the oldest set)");
+        h.queue.submit([enc.finish()]);
     }
 
     const WHITE: [(Channel, [f32; 3]); 3] = [(Channel::BaseColor, [1.0; 3]), (Channel::Metallic, [0.0; 3]), (Channel::Roughness, [0.5; 3])];
