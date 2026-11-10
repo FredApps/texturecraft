@@ -100,18 +100,20 @@ fn open_quad_is_unoccluded() {
 
 #[test]
 fn inside_of_a_closed_box_is_occluded() {
-    let mut m = primitives::cube(2.0);
-    for t in m.indices.chunks_exact_mut(3) {
-        t.swap(1, 2);
+    let mut mesh = primitives::cube(2.0);
+    for triangle in mesh.indices.as_chunks_mut::<3>().0 {
+        triangle.swap(1, 2);
     }
-    for n in &mut m.normals {
-        *n = -*n;
+    for normal in &mut mesh.normals {
+        *normal = -*normal;
     }
-    m.compute_tangents();
-    let s = with_rays(settings(64, &[BakedMap::AmbientOcclusion]), 64, 4.0);
-    let out = run(&m, &s).unwrap();
-    let ao = mean(covered_values(&m, &out, BakedMap::AmbientOcclusion).into_iter().map(|v| v.1));
-    assert!(ao < 0.3, "{ao}");
+    mesh.compute_tangents();
+    let parameters = with_rays(settings(64, &[BakedMap::AmbientOcclusion]), 64, 4.0);
+
+    let output = run(&mesh, &parameters).unwrap();
+
+    let mean_occlusion = mean(covered_values(&mesh, &output, BakedMap::AmbientOcclusion).into_iter().map(|v| v.1));
+    assert!(mean_occlusion < 0.3, "{mean_occlusion}");
 }
 
 #[test]

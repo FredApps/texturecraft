@@ -241,25 +241,24 @@ impl GpuLink {
         match aux_map {
             Some(AuxView::MeshMap(map)) => {
                 for texture_set in 0..session.caches.len() {
-                    let revision = session.doc.baked.get(&texture_set).and_then(|baked| baked.maps.get(&map)).map(|data| Arc::as_ptr(data) as u64).unwrap_or(0);
-                    let key = (format!("{map:?}"), revision);
+                    // While a bake shows, its streamed maps (neutral where not baked yet) replace the document's
+                    let preview = session.bake_preview_baked(texture_set);
+                    let baked = preview.or_else(|| session.doc.baked.get(&texture_set));
+                    let have = baked.and_then(|baked| baked.maps.get(&map));
+                    let revision = have.map(|data| Arc::as_ptr(data) as u64).unwrap_or(0);
+                    let key = (format!("{map:?}{}", if preview.is_some() { "~" } else { "" }), revision);
                     if self.aux.get(&texture_set) == Some(&key) {
                         continue;
                     }
                     let Some(cache) = session.caches.get(texture_set) else { continue };
 
                     let resolution = texturecraft_render::aux_size(cache.size);
-                    out.aux.push((
-                        texture_set,
-                        resolution,
-                        texturecraft_render::mesh_maps::mesh_map_rgba(
-                            session.doc.baked.get(&texture_set),
-                            map,
-                            resolution,
-                            cache.size,
-                            &cache.composite.block_scales,
-                        ),
-                    ));
+                    let rgba = if preview.is_some() && have.is_none() {
+                        texturecraft_render::mesh_maps::neutral_rgba(map, resolution)
+                    } else {
+                        texturecraft_render::mesh_maps::mesh_map_rgba(baked, map, resolution, cache.size, &cache.composite.block_scales)
+                    };
+                    out.aux.push((texture_set, resolution, rgba));
                     self.aux.insert(texture_set, key);
                 }
             }

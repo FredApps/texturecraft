@@ -341,6 +341,8 @@ pub struct Session {
     pub target: StackTarget,
     pub camera: OrbitCamera,
     pub view: ViewMode,
+    /// The live bake preview while the app bakes (see [`crate::bake_preview`]).
+    pub bake_preview: Option<crate::bake_preview::BakePreview>,
     /// Viewport size (pixels) used by scripted strokes.
     pub viewport: Vec2,
     pub(crate) stroke: Option<ActiveStroke>,
@@ -403,6 +405,7 @@ impl Session {
             target: StackTarget::Content,
             camera,
             view: ViewMode::Material,
+            bake_preview: None,
             viewport: Vec2::new(1280.0, 800.0),
             stroke: None,
             clipboard: None,

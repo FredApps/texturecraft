@@ -9,7 +9,7 @@ use std::sync::{Arc, OnceLock};
 use texturecraft_core::BakePaintTarget;
 
 use super::{BakeCageInputs, MergedHigh};
-use crate::{BakeMesh, BakeTask};
+use crate::{BakeMesh, BakeTask, StreamedBake};
 use serde_json::{Value, json};
 use texturecraft_bake::tracing::Tracer;
 use texturecraft_bake::{BakeOutput, BakePaintMap, MAX_RAYS, Progress};
@@ -207,15 +207,28 @@ impl Session {
         Ok(())
     }
 
+    /// Apply a streamed bake like [`Session::apply_bake`], keeping the maps' shared buffers (the
+    /// preview that showed them holds the same ones)
+    pub fn apply_streamed_bake(&mut self, texture_set: usize, output: StreamedBake) -> Result<()> {
+        let tracer = output.tracer.clone();
+        self.edit("Bake mesh maps", |session| session.store_bake_maps(texture_set, output.resolution, output.height, output.maps))?;
+        self.log.push(format!("Baked texture set {texture_set} ({tracer})"));
+        Ok(())
+    }
+
     fn store_bake(&mut self, texture_set: usize, output: BakeOutput) -> Result<()> {
+        let maps = output.maps.into_iter().map(|(map, pixels)| (map, Arc::new(pixels))).collect();
+        self.store_bake_maps(texture_set, output.resolution, output.height, maps)
+    }
+
+    fn store_bake_maps(&mut self, texture_set: usize, resolution: u32, height: u32, maps: std::collections::BTreeMap<BakedMap, Arc<Vec<f32>>>) -> Result<()> {
         let entry = self.doc.baked.entry(texture_set).or_default();
-        if entry.resolution != output.resolution || entry.maps.keys().any(|map| entry.height(*map) != output.height) {
+        if entry.resolution != resolution || entry.maps.keys().any(|map| entry.height(*map) != height) {
             entry.maps.clear();
         }
-        entry.resolution = output.resolution;
-        for (map, pixels) in output.maps {
-            entry.maps.insert(map, Arc::new(pixels));
-        }
+
+        entry.resolution = resolution;
+        entry.maps.extend(maps);
         self.doc.project.texture_set_mut(texture_set)?.baked = entry.maps.keys().copied().collect();
         Ok(())
     }

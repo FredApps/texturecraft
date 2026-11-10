@@ -10,17 +10,18 @@ fn plane_session() -> Session {
     Session::new_project("t", mesh, "builtin:plane", None, 256).unwrap()
 }
 
-/// `mesh` as OBJ text, lifted by `dy`, keeping only vertices with x ≤ `max_x` (triangles that
-/// lose a vertex are dropped), every vertex colored `rgb`.
-fn obj(mesh: &Mesh, dy: f32, max_x: f32, rgb: [f32; 3]) -> String {
-    let mut s = String::from("o Part_high\n");
-    for p in &mesh.positions {
-        s += &format!("v {} {} {} {} {} {}\n", p.x.min(max_x), p.y + dy, p.z, rgb[0], rgb[1], rgb[2]);
+/// `mesh` as OBJ text, shifted by `offset_y`, with x clamped to `max_x` and every vertex colored `rgb`.
+fn obj(mesh: &Mesh, offset_y: f32, max_x: f32, rgb: [f32; 3]) -> String {
+    let mut text = String::from("o Part_high\n");
+    for position in &mesh.positions {
+        text += &format!("v {} {} {} {} {} {}\n", position.x.min(max_x), position.y + offset_y, position.z, rgb[0], rgb[1], rgb[2]);
     }
-    for t in mesh.indices.chunks_exact(3) {
-        s += &format!("f {} {} {}\n", t[0] + 1, t[1] + 1, t[2] + 1);
+
+    for triangle in mesh.indices.as_chunks::<3>().0 {
+        text += &format!("f {} {} {}\n", triangle[0] + 1, triangle[1] + 1, triangle[2] + 1);
     }
-    s
+
+    text
 }
 
 fn temp_file(name: &str, text: &str) -> String {

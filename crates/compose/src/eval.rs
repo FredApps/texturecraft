@@ -2,6 +2,8 @@
 //! tile by tile in parallel. This is the reference implementation (the oracle) for the viewport
 //! and for export.
 
+pub(crate) mod thumbnail;
+
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -2203,60 +2205,67 @@ pub type FlatTile = (Channel, (u32, u32), Vec<u16>);
 /// Flatten one paint or fill layer: its content (with content effects) times its mask, as
 /// premultiplied (value, coverage) tiles per enabled channel, ready to become a plain paint
 /// layer. Groups are not supported (None).
-pub fn flatten_layer(inp: &Inputs, id: LayerId, tiles: &[(u32, u32)]) -> Option<Vec<FlatTile>> {
-    let set = inp.project.texture_set(inp.ts).ok()?;
-    if inp.project.content_layer(id)?.is_group() {
+pub fn flatten_layer(inputs: &Inputs, id: LayerId, tiles: &[(u32, u32)]) -> Option<Vec<FlatTile>> {
+    let set = inputs.project.texture_set(inputs.ts).ok()?;
+    if inputs.project.content_layer(id)?.is_group() {
         return None;
     }
+
     let channels: Vec<Channel> = set.channel_list();
-    // Plan the layer forced visible so hidden layers flatten too.
-    let mut solo = inp.project.clone();
+
+    // Plan the layer forced visible so hidden layers flatten too
+    let mut solo = inputs.project.clone();
     if let Some(l) = solo.layers.get_mut(&id) {
         l.visible = true;
     }
-    let solo_inp = Inputs { project: &solo, preview: None, block_scales: inp.block_scales.clone(), ..*inp };
-    let fields = neighbourhood_fields(&solo_inp, &channels, tiles);
+    let visible_inputs = Inputs { project: &solo, preview: None, block_scales: inputs.block_scales.clone(), ..*inputs };
+    let fields = neighbourhood_fields(&visible_inputs, &channels, tiles);
+
     let out: Vec<Vec<FlatTile>> = tiles
         .par_iter()
         .map(|&(tx, ty)| {
-            let nodes = plan(&solo_inp, &[id], &channels, tx, ty, 0, Some(&fields));
+            let nodes = plan(&visible_inputs, &[id], &channels, tx, ty, 0, Some(&fields));
             let Some(n) = nodes.first() else { return Vec::new() };
-            let full = anchor_plan(&solo_inp, id, &channels, tx, ty, Some(&fields));
-            let mut bufs: Vec<(Channel, Vec<u16>, bool)> =
+            let full = anchor_plan(&visible_inputs, id, &channels, tx, ty, Some(&fields));
+            let mut buffers: Vec<(Channel, Vec<u16>, bool)> =
                 n.chans.iter().filter_map(|c| Channel::ALL.get(c.ch).map(|ch| (*ch, vec![0u16; TILE_AREA * (c.comps + 1)], false))).collect();
-            for (ch, buf, _) in &mut bufs {
+            for (ch, buffer, _) in &mut buffers {
                 if ch.kind() == ChannelKind::Signed {
-                    for px in buf.chunks_exact_mut(2) {
-                        px[0] = to_u16_signed(0.0);
+                    for pixel in buffer.as_chunks_mut::<2>().0 {
+                        pixel[0] = to_u16_signed(0.0);
                     }
                 }
             }
-            for (x, y, o) in tile_texels(inp.gbuf, tx, ty) {
-                let mut tex = Texel::new(&solo_inp, x, y, o, 0.0);
+
+            for (x, y, o) in tile_texels(inputs.gbuf, tx, ty) {
+                let mut tex = Texel::new(&visible_inputs, x, y, o, 0.0);
                 if !full.is_empty() {
                     tex.anchors_below(&full, id);
                 }
                 let m = tex.node_mask(n);
-                for (c, (ch, buf, any)) in n.chans.iter().zip(bufs.iter_mut()) {
+                for (c, (ch, buffer, any)) in n.chans.iter().zip(buffers.iter_mut()) {
                     let Some((v, cov)) = tex.content(&n.content, c) else { continue };
                     let a = (cov * m).clamp(0.0, 1.0);
                     if a <= 0.0 {
                         continue;
                     }
+
                     *any = true;
                     let comps = c.comps;
-                    let Some(px) = buf.get_mut(o * (comps + 1)..(o + 1) * (comps + 1)) else { continue };
-                    for (slot, pv) in px.iter_mut().zip(v.iter().take(comps)) {
+                    let Some(pixel) = buffer.get_mut(o * (comps + 1)..(o + 1) * (comps + 1)) else { continue };
+                    for (slot, pv) in pixel.iter_mut().zip(v.iter().take(comps)) {
                         *slot = if ch.kind() == ChannelKind::Signed { to_u16_signed(pv * a) } else { to_u16(pv * a) };
                     }
-                    if let Some(slot) = px.get_mut(comps) {
+                    if let Some(slot) = pixel.get_mut(comps) {
                         *slot = to_u16(a);
                     }
                 }
             }
-            bufs.into_iter().filter(|(_, _, any)| *any).map(|(ch, buf, _)| (ch, (tx, ty), buf)).collect()
+
+            buffers.into_iter().filter(|(_, _, any)| *any).map(|(ch, buffer, _)| (ch, (tx, ty), buffer)).collect()
         })
         .collect();
+
     Some(out.into_iter().flatten().collect())
 }
 

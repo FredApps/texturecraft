@@ -77,20 +77,21 @@ impl HighPolyReach {
 /// Each vertex's mesh-name key, from the first triangle that uses it
 fn vertex_keys(mesh: &Mesh, triangle_keys: &[u32]) -> Vec<u32> {
     let mut keys = vec![ANY; mesh.positions.len()];
-    for (corners, &triangle_key) in mesh.indices.chunks_exact(3).zip(triangle_keys) {
+    for (corners, &triangle_key) in mesh.indices.as_chunks::<3>().0.iter().zip(triangle_keys) {
         for &corner in corners {
             if let Some(key) = keys.get_mut(corner as usize).filter(|key| **key == ANY) {
                 *key = triangle_key;
             }
         }
     }
+
     keys
 }
 
 /// Each vertex's sum of its triangles' winding normals, weighted by area: the side the bake's backface test sees as the front
 fn winding_normals(mesh: &Mesh) -> Vec<Vec3> {
     let mut normals = vec![Vec3::ZERO; mesh.positions.len()];
-    for corners in mesh.indices.chunks_exact(3) {
+    for corners in mesh.indices.as_chunks::<3>().0 {
         let position = |corner: u32| mesh.positions.get(corner as usize).copied().unwrap_or(Vec3::ZERO);
         let winding_normal = (position(corners[1]) - position(corners[0])).cross(position(corners[2]) - position(corners[0]));
         for &corner in corners {
@@ -99,5 +100,6 @@ fn winding_normals(mesh: &Mesh) -> Vec<Vec3> {
             }
         }
     }
+
     normals
 }

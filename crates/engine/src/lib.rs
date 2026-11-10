@@ -9,6 +9,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod bake;
+pub mod bake_preview;
 pub mod brush_preset_cmds;
 pub mod camera_cmds;
 pub mod color_selection_cmds;
@@ -52,13 +53,15 @@ pub mod set_cmds;
 pub mod smart_masks;
 pub mod template_cmds;
 pub mod text_cmds;
+pub mod thumbs;
 pub mod tool_cmds;
 mod triangle_partition;
 mod uv_stroke_state;
 pub mod uv_tile_cmds;
 pub mod view_cmds;
 
-pub use bake::{BakeMesh, BakeMeshes, BakeTask};
+pub use bake::{BakeMesh, BakeMeshes, BakeTask, StreamedBake, StreamedMap};
+pub use bake_preview::{BakePreview, PreviewShow};
 pub use commands::{CommandSpec, command_specs, execute, find};
 pub use fill_hit_test::FillHitTest;
 pub use fill_mode::FillMode;

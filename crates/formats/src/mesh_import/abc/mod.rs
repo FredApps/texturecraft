@@ -204,37 +204,37 @@ impl<'a> Ogawa<'a> {
     }
 
     /// The first sample of a scalar or array property as numbers (`extent` per item).
-    fn values(&mut self, p: &Prop) -> Result<Vec<f64>> {
-        let samples = self.group(p.group)?;
+    fn values(&mut self, property: &Prop) -> Result<Vec<f64>> {
+        let samples = self.group(property.group)?;
         let Some(&first) = samples.first() else { return Ok(Vec::new()) };
+
         let raw = self.data(first)?;
         let raw = if raw.is_empty() {
             raw
         } else {
-            raw.get(KEY_BYTES..).ok_or_else(|| malformed(KIND, format!("sample of \"{}\" is shorter than its key", p.name)))?
+            raw.get(KEY_BYTES..).ok_or_else(|| malformed(KIND, format!("sample of \"{}\" is shorter than its key", property.name)))?
         };
-        let size = match p.pod {
+
+        let value_bytes = match property.pod {
             0..=2 => 1,
             3 | 4 => 2,
             5 | 6 | 10 => 4,
             7 | 8 | 11 => 8,
-            other => return Err(FormatError::Unsupported(format!("Alembic property \"{}\" of data type {other}", p.name))),
+            other => return Err(FormatError::Unsupported(format!("Alembic property \"{}\" of data type {other}", property.name))),
         };
-        self.charge((raw.len() / size).saturating_mul(8))?;
-        fn le<const N: usize>(c: &[u8]) -> [u8; N] {
-            <[u8; N]>::try_from(c).unwrap_or([0; N])
-        }
-        Ok(match p.pod {
+        self.charge((raw.len() / value_bytes).saturating_mul(8))?;
+
+        Ok(match property.pod {
             0 | 1 => raw.iter().map(|v| *v as f64).collect(),
             2 => raw.iter().map(|v| *v as i8 as f64).collect(),
-            3 => raw.chunks_exact(2).map(|c| u16::from_le_bytes(le(c)) as f64).collect(),
-            4 => raw.chunks_exact(2).map(|c| i16::from_le_bytes(le(c)) as f64).collect(),
-            5 => raw.chunks_exact(4).map(|c| u32::from_le_bytes(le(c)) as f64).collect(),
-            6 => raw.chunks_exact(4).map(|c| i32::from_le_bytes(le(c)) as f64).collect(),
-            7 => raw.chunks_exact(8).map(|c| u64::from_le_bytes(le(c)) as f64).collect(),
-            8 => raw.chunks_exact(8).map(|c| i64::from_le_bytes(le(c)) as f64).collect(),
-            10 => raw.chunks_exact(4).map(|c| f32::from_le_bytes(le(c)) as f64).collect(),
-            _ => raw.chunks_exact(8).map(|c| f64::from_le_bytes(le(c))).collect(),
+            3 => raw.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c) as f64).collect(),
+            4 => raw.as_chunks::<2>().0.iter().map(|c| i16::from_le_bytes(*c) as f64).collect(),
+            5 => raw.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c) as f64).collect(),
+            6 => raw.as_chunks::<4>().0.iter().map(|c| i32::from_le_bytes(*c) as f64).collect(),
+            7 => raw.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c) as f64).collect(),
+            8 => raw.as_chunks::<8>().0.iter().map(|c| i64::from_le_bytes(*c) as f64).collect(),
+            10 => raw.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c) as f64).collect(),
+            _ => raw.as_chunks::<8>().0.iter().map(|c| f64::from_le_bytes(*c)).collect(),
         })
     }
 
@@ -491,21 +491,23 @@ impl Walk<'_, '_> {
     }
 
     fn mesh(&mut self, r: u64, world: Mat4, sets: &[(String, Vec<f64>)]) -> Result<()> {
-        let props = self.o.compound(r)?;
+        let properties = self.o.compound(r)?;
         let get = |o: &mut Ogawa, name: &str| -> Result<Vec<f64>> {
-            match find(&props, name) {
+            match find(&properties, name) {
                 Some(p) => o.values(p),
                 None => Err(malformed(KIND, format!("PolyMesh has no {name}"))),
             }
         };
+
         let p = get(&mut self.o, "P")?;
         let indices = get(&mut self.o, ".faceIndices")?;
         let counts = get(&mut self.o, ".faceCounts")?;
         check_vertices(p.len() / 3)?;
-        let points: Vec<Vec3> = p.chunks_exact(3).map(|c| world.transform_point3(Vec3::new(c[0] as f32, c[1] as f32, c[2] as f32))).collect();
+        let points: Vec<Vec3> = p.as_chunks::<3>().0.iter().map(|c| world.transform_point3(Vec3::new(c[0] as f32, c[1] as f32, c[2] as f32))).collect();
         let n = [points.len(), counts.len(), indices.len()];
-        let normals = self.param(&props, "N", n)?;
-        let uvs = self.param(&props, "uv", n)?;
+        let normals = self.param(&properties, "N", n)?;
+        let uvs = self.param(&properties, "uv", n)?;
+
         let mut material = vec![None::<usize>; counts.len()];
         for (s, (_, faces)) in sets.iter().enumerate() {
             for f in faces {
@@ -514,19 +516,26 @@ impl Walk<'_, '_> {
                 }
             }
         }
-        let nm = Mat3::from_mat4(world).inverse().transpose();
-        // Alembic winds polygons clockwise; a mirroring transform flips them once more.
+        let normal_transform = Mat3::from_mat4(world).inverse().transpose();
+
+        // Alembic winds polygons clockwise; a mirroring transform flips them once more
         let keep_order = world.determinant() < 0.0;
         let (mut k, mut corners, mut bad_uvs) = (0usize, Vec::new(), 0usize);
         for (f, &count) in counts.iter().enumerate() {
             let end = (count >= 0.0).then(|| k.checked_add(count as usize)).flatten().filter(|e| *e <= indices.len());
             let end = end.ok_or_else(|| malformed(KIND, format!("face {f} has {count} corners past the index list")))?;
             corners.clear();
-            for (kk, &pi) in indices.iter().enumerate().take(end).skip(k) {
-                let p = points.get(pi as usize).filter(|_| pi >= 0.0).ok_or_else(|| malformed(KIND, format!("point index {pi} out of range")))?;
-                let pi = pi as usize;
-                let n = normals.as_ref().and_then(|l| l.get::<3>(kk, pi, f)).map(|[x, y, z]| nm * Vec3::new(x as f32, y as f32, z as f32));
-                let uv = uvs.as_ref().map(|l| match l.get::<2>(kk, pi, f) {
+            for (corner_index, &point_index) in indices.iter().enumerate().take(end).skip(k) {
+                let p = points
+                    .get(point_index as usize)
+                    .filter(|_| point_index >= 0.0)
+                    .ok_or_else(|| malformed(KIND, format!("point index {point_index} out of range")))?;
+                let point_index = point_index as usize;
+                let n = normals
+                    .as_ref()
+                    .and_then(|l| l.get::<3>(corner_index, point_index, f))
+                    .map(|[x, y, z]| normal_transform * Vec3::new(x as f32, y as f32, z as f32));
+                let uv = uvs.as_ref().map(|l| match l.get::<2>(corner_index, point_index, f) {
                     Some([u, v]) => Vec2::new(u as f32, 1.0 - v as f32),
                     None => {
                         bad_uvs += 1;
@@ -542,9 +551,11 @@ impl Walk<'_, '_> {
             let name = material.get(f).copied().flatten().and_then(|s| sets.get(s)).map_or(DEFAULT_MATERIAL, |(n, _)| n.as_str());
             self.sink.polygon(name, &corners)?;
         }
+
         if bad_uvs > 0 {
             self.sink.warn(format!("{bad_uvs} polygon corners have no UV in the Alembic uv parameter (set to 0, 0)"));
         }
+
         Ok(())
     }
 }

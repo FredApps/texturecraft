@@ -1,6 +1,17 @@
 //! Korean UI text: (English key, translation). Keys are the English strings passed to `tr`.
 
 pub const TABLE: &[(&str, &str)] = &[
+    ("Baking {map} ({n}/{total})", "{map} 베이크 중 ({n}/{total})"),
+    ("Baking {map} ({n}/{total}), texture set {set} of {sets}", "{map} 베이크 중 ({n}/{total}), 텍스처 세트 {set}/{sets}"),
+    ("Follow Newest Map", "최신 맵 따라가기"),
+    (
+        "Painting is paused while a bake is shown. Cancel the bake or wait for it to finish.",
+        "베이크를 표시하는 동안에는 페인팅이 일시 중지됩니다. 베이크를 취소하거나 끝날 때까지 기다리세요.",
+    ),
+    (
+        "What the 3D view shows while the bake runs: the newest finished map, one finished map, or the material. Maps not baked yet show a neutral value.",
+        "베이크하는 동안 3D 뷰가 보여 주는 것: 가장 최근에 완료된 맵, 완료된 맵 중 선택한 하나, 또는 머티리얼. 아직 베이크되지 않은 맵은 중립 값으로 표시됩니다.",
+    ),
     (
         "\"{layer}\" has no paint yet: the filter changes what you paint on it.",
         "\"{layer}\"에 아직 페인트가 없습니다: 필터는 이 레이어에 칠하는 내용을 바꿉니다.",
@@ -63,7 +74,6 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Always", "항상"),
     ("Ambient Occlusion", "앰비언트 오클루전"),
     ("Ambient occlusion", "앰비언트 오클루전"),
-    ("Ambient occlusion intensity", "앰비언트 오클루전 강도"),
     ("Amount", "양"),
     ("Anchor point", "앵커 포인트"),
     ("Anchor: {name}", "앵커: {name}"),
@@ -426,6 +436,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Invert", "반전"),
     ("Invert mask", "마스크 반전"),
     ("Invert mask background", "마스크 배경 반전"),
+    ("Invert mask value", "마스크 값 반전"),
     ("Invert quick mask", "퀵 마스크 반전"),
     ("Jitters", "지터"),
     ("Join the ArtCraft community on Discord", "Discord에서 ArtCraft 커뮤니티에 참여하세요"),
@@ -1048,6 +1059,14 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Value Bounds Max", "값 상한"),
     ("Value Bounds Min", "값 하한"),
     ("Vertex Color", "정점 색상"),
+    ("Select the layer content", "레이어 내용 선택"),
+    ("Paint layer", "페인트 레이어"),
+    ("Fill layer", "채우기 레이어"),
+    ("1 effect", "이펙트 1개"),
+    ("{count} effects", "이펙트 {count}개"),
+    ("Mask effects", "마스크 이펙트"),
+    ("Content effects", "콘텐츠 이펙트"),
+    ("Fold or unfold these effects", "이 이펙트 접기/펼치기"),
     ("Remove resolution override", "해상도 재정의 제거"),
     ("Texture set resolution", "텍스처 세트 해상도"),
     ("UV tile {tile} resolution", "UV 타일 {tile} 해상도"),

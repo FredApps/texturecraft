@@ -650,7 +650,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
                         }
                         app.last_paint_point = Some(local(pointer));
                     }
-                    Err(error) => app.toast(error.to_string(), true),
+                    Err(error) => app.toast(tr(&error.to_string()).to_string(), true),
                 }
             }
             if response.clicked_by(PointerButton::Primary)
@@ -741,7 +741,12 @@ const QUICK_MASK_NOTICE_COLOR: Color32 = Color32::from_rgb(0xe8, 0x6a, 0x6a);
 
 /// What bake mode's 3D view draws besides the low poly (nothing in the other modes)
 fn bake_visualization(app: &TextureCraftApp) -> Option<texturecraft_render::BakeVisualization> {
-    (app.ui.mode == crate::state::Mode::Baking).then(|| app.ui.bake_visualization.visualization(app.session.ts())).flatten()
+    // Setup meshes can cover the low-poly map preview; keep the switches for when setup resumes
+    if app.ui.mode != crate::state::Mode::Baking || app.session.bake_preview_active() {
+        return None;
+    }
+
+    app.ui.bake_visualization.visualization(app.session.ts())
 }
 
 /// What a drag on the selected decal's frame does.
@@ -1578,6 +1583,28 @@ fn bake_paint_overlay(app: &TextureCraftApp, ui: &Ui, painter: &egui::Painter, t
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_bake_preview_hides_setup_overlays_and_restores_their_preferences() {
+        let session = texturecraft_engine::sample_session(256, 64).unwrap();
+        let mut harness = egui_kittest::Harness::builder().build_eframe(|context| TextureCraftApp::new(context, session));
+        let app = harness.state_mut();
+        app.ui.mode = crate::state::Mode::Baking;
+        let before = bake_visualization(app).unwrap();
+        assert!(before.high_poly && before.cage);
+
+        app.start_bake(vec![0]);
+
+        assert!(bake_visualization(app).is_none(), "setup overlays must not obscure the finished map");
+        for show in [texturecraft_engine::PreviewShow::Pin(BakedMap::Normal), texturecraft_engine::PreviewShow::Material] {
+            app.session.bake_preview_show(show).unwrap();
+            assert!(bake_visualization(app).is_none());
+        }
+
+        app.cancel_bake();
+
+        assert_eq!(bake_visualization(app), Some(before));
+    }
 
     const VIEW: Rect = Rect::from_min_max(pos2(0.0, 0.0), pos2(100.0, 100.0));
     const DASH_PERIOD: f32 = RUBBER_BAND_DASH + RUBBER_BAND_GAP;

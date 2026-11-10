@@ -72,34 +72,37 @@ fn collect(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
 
 /// The faces of the font file at `path` (each face of a collection).
 pub fn faces_of(path: &Path) -> std::io::Result<Vec<FontFace>> {
-    let mut f = std::fs::File::open(path)?;
-    let mut at = |offset: u64, len: usize| -> std::io::Result<Vec<u8>> {
-        f.seek(SeekFrom::Start(offset))?;
-        let mut buf = vec![0; len];
-        f.read_exact(&mut buf)?;
+    let mut file = std::fs::File::open(path)?;
+    let mut read_at = |offset: u64, length: usize| -> std::io::Result<Vec<u8>> {
+        file.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0; length];
+        file.read_exact(&mut buf)?;
         Ok(buf)
     };
-    let head = at(0, 12)?;
-    let offsets: Vec<u64> = if head.get(..4) == Some(b"ttcf") {
-        let n = u32_at(&head, 8).unwrap_or(0).min(MAX_FACES_PER_FILE);
-        let table = at(12, 4 * n as usize)?;
-        (0..n as usize).filter_map(|i| u32_at(&table, 4 * i)).map(u64::from).collect()
+
+    let header = read_at(0, 12)?;
+    let offsets: Vec<u64> = if header.get(..4) == Some(b"ttcf") {
+        let face_count = u32_at(&header, 8).unwrap_or(0).min(MAX_FACES_PER_FILE);
+        let table = read_at(12, 4 * face_count as usize)?;
+        (0..face_count as usize).filter_map(|i| u32_at(&table, 4 * i)).map(u64::from).collect()
     } else {
         vec![0]
     };
+
     let mut faces = Vec::new();
     for (index, offset) in offsets.into_iter().enumerate() {
-        let dir = at(offset, 12)?;
-        let tables = at(offset + 12, 16 * usize::from(u16_at(&dir, 4).unwrap_or(0)))?;
-        let Some(rec) = tables.chunks_exact(16).find(|r| r.get(..4) == Some(b"name")) else { continue };
-        let (Some(off), Some(len)) = (u32_at(rec, 8), u32_at(rec, 12)) else { continue };
-        let names = at(u64::from(off), len.min(MAX_NAME_TABLE) as usize)?;
+        let directory = read_at(offset, 12)?;
+        let tables = read_at(offset + 12, 16 * usize::from(u16_at(&directory, 4).unwrap_or(0)))?;
+        let Some(record) = tables.as_chunks::<16>().0.iter().find(|r| r.get(..4) == Some(b"name")) else { continue };
+        let (Some(offset), Some(length)) = (u32_at(record, 8), u32_at(record, 12)) else { continue };
+        let names = read_at(u64::from(offset), length.min(MAX_NAME_TABLE) as usize)?;
         let name = |ids: [u16; 2]| ids.iter().find_map(|id| name_string(&names, *id));
         if let Some(family) = name([16, 1]) {
             let style = name([17, 2]).unwrap_or_else(|| "Regular".into());
             faces.push(FontFace { family, style, path: path.to_path_buf(), index: index as u32 });
         }
     }
+
     Ok(faces)
 }
 
@@ -113,30 +116,32 @@ fn u32_at(b: &[u8], o: usize) -> Option<u32> {
 
 /// Name `id` of a `name` table, in English when it has several languages: Windows and Unicode
 /// records are UTF-16BE, Macintosh ones single-byte (read as Latin-1).
-fn name_string(t: &[u8], id: u16) -> Option<String> {
-    let (count, base) = (usize::from(u16_at(t, 2)?), usize::from(u16_at(t, 4)?));
+fn name_string(table: &[u8], id: u16) -> Option<String> {
+    let (count, base) = (usize::from(u16_at(table, 2)?), usize::from(u16_at(table, 4)?));
     let mut best: Option<(u8, String)> = None;
-    for r in (0..count).filter_map(|i| t.get(6 + 12 * i..18 + 12 * i)) {
-        let (platform, language, name_id) = (u16_at(r, 0)?, u16_at(r, 4)?, u16_at(r, 6)?);
-        let (len, off) = (usize::from(u16_at(r, 8)?), usize::from(u16_at(r, 10)?));
-        let Some(bytes) = t.get(base + off..base + off + len) else { continue };
+    for record in (0..count).filter_map(|i| table.get(6 + 12 * i..18 + 12 * i)) {
+        let (platform, language, name_id) = (u16_at(record, 0)?, u16_at(record, 4)?, u16_at(record, 6)?);
+        let (length, offset) = (usize::from(u16_at(record, 8)?), usize::from(u16_at(record, 10)?));
+        let Some(bytes) = table.get(base + offset..base + offset + length) else { continue };
         if name_id != id {
             continue;
         }
-        let (rank, s) = match platform {
+
+        let (rank, name) = match platform {
             3 | 0 => {
-                let s = String::from_utf16_lossy(&bytes.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect::<Vec<_>>());
-                (if language == 0x409 { 0 } else { 1 }, s)
+                let name = String::from_utf16_lossy(&bytes.as_chunks::<2>().0.iter().map(|c| u16::from_be_bytes(*c)).collect::<Vec<_>>());
+                (if language == 0x409 { 0 } else { 1 }, name)
             }
             1 => (if language == 0 { 2 } else { 3 }, bytes.iter().map(|b| char::from(*b)).collect()),
             _ => continue,
         };
-        let s = s.trim().to_string();
-        if !s.is_empty() && best.as_ref().is_none_or(|(r, _)| rank < *r) {
-            best = Some((rank, s));
+        let name = name.trim().to_string();
+        if !name.is_empty() && best.as_ref().is_none_or(|(best_rank, _)| rank < *best_rank) {
+            best = Some((rank, name));
         }
     }
-    best.map(|(_, s)| s)
+
+    best.map(|(_, name)| name)
 }
 
 #[cfg(test)]

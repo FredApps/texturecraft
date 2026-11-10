@@ -199,18 +199,19 @@ impl Mesh {
 
     /// Area-weighted smooth normals over the index buffer.
     pub fn compute_normals(&mut self) {
-        let mut n = vec![Vec3::ZERO; self.positions.len()];
-        for t in self.indices.chunks_exact(3) {
-            let (a, b, c) = (t[0] as usize, t[1] as usize, t[2] as usize);
+        let mut normals = vec![Vec3::ZERO; self.positions.len()];
+        for &[a, b, c] in self.indices.as_chunks::<3>().0 {
+            let (a, b, c) = (a as usize, b as usize, c as usize);
             let (Some(pa), Some(pb), Some(pc)) = (self.positions.get(a), self.positions.get(b), self.positions.get(c)) else { continue };
             let face = (*pb - *pa).cross(*pc - *pa);
             for v in [a, b, c] {
-                if let Some(x) = n.get_mut(v) {
+                if let Some(x) = normals.get_mut(v) {
                     *x += face;
                 }
             }
         }
-        self.normals = n.into_iter().map(|v| v.try_normalize().unwrap_or(Vec3::Y)).collect();
+
+        self.normals = normals.into_iter().map(|v| v.try_normalize().unwrap_or(Vec3::Y)).collect();
     }
 
     /// MikkTSpace tangents (falls back to per-triangle tangents if generation fails).
@@ -237,25 +238,27 @@ impl Mesh {
     }
 
     fn simple_tangents(&mut self) {
-        let mut acc = vec![Vec3::ZERO; self.positions.len()];
-        for t in self.indices.chunks_exact(3) {
-            let (a, b, c) = (t[0] as usize, t[1] as usize, t[2] as usize);
+        let mut tangents = vec![Vec3::ZERO; self.positions.len()];
+        for &[a, b, c] in self.indices.as_chunks::<3>().0 {
+            let (a, b, c) = (a as usize, b as usize, c as usize);
             let (Some(pa), Some(pb), Some(pc)) = (self.positions.get(a), self.positions.get(b), self.positions.get(c)) else { continue };
             let (Some(ua), Some(ub), Some(uc)) = (self.uvs.get(a), self.uvs.get(b), self.uvs.get(c)) else { continue };
             let (e1, e2) = (*pb - *pa, *pc - *pa);
             let (d1, d2) = (*ub - *ua, *uc - *ua);
-            let r = d1.x * d2.y - d2.x * d1.y;
-            if r.abs() < 1e-12 {
+            let determinant = d1.x * d2.y - d2.x * d1.y;
+            if determinant.abs() < 1e-12 {
                 continue;
             }
-            let tan = (e1 * d2.y - e2 * d1.y) / r;
+
+            let tangent = (e1 * d2.y - e2 * d1.y) / determinant;
             for v in [a, b, c] {
-                if let Some(x) = acc.get_mut(v) {
-                    *x += tan;
+                if let Some(x) = tangents.get_mut(v) {
+                    *x += tangent;
                 }
             }
         }
-        self.tangents = acc.into_iter().map(|t| t.try_normalize().unwrap_or(Vec3::X).extend(1.0)).collect();
+
+        self.tangents = tangents.into_iter().map(|t| t.try_normalize().unwrap_or(Vec3::X).extend(1.0)).collect();
     }
 
     /// The UV tiles material `m` covers: integer parts of its triangles' UV centroids (v down),
@@ -280,39 +283,44 @@ impl Mesh {
     /// material's triangles using the vertex: piecewise maps (UV tiles of different sizes) then
     /// place a vertex on a tile border with its own triangle's tile.
     pub fn map_material_uvs_with(&mut self, m: usize, f: impl Fn(Vec2, Vec2) -> Vec2) {
-        let mine: Vec<usize> = self.triangles_of(m).collect();
-        let mut is_mine = vec![false; self.triangle_count()];
-        for t in &mine {
-            if let Some(x) = is_mine.get_mut(*t) {
+        let material_triangles: Vec<usize> = self.triangles_of(m).collect();
+        let mut in_material = vec![false; self.triangle_count()];
+        for t in &material_triangles {
+            if let Some(x) = in_material.get_mut(*t) {
                 *x = true;
             }
         }
+
         let mut shared = vec![false; self.positions.len()];
-        for (_, tri) in self.indices.chunks_exact(3).enumerate().filter(|(t, _)| !is_mine.get(*t).copied().unwrap_or(false)) {
+        for (_, tri) in self.indices.as_chunks::<3>().0.iter().enumerate().filter(|(t, _)| !in_material.get(*t).copied().unwrap_or(false)) {
             for v in tri {
                 if let Some(s) = shared.get_mut(*v as usize) {
                     *s = true;
                 }
             }
         }
-        let mut copies = std::collections::HashMap::new();
-        for k in mine.iter().flat_map(|t| t * 3..t * 3 + 3) {
+
+        let mut duplicates = std::collections::HashMap::new();
+        for k in material_triangles.iter().flat_map(|t| t * 3..t * 3 + 3) {
             let Some(&v) = self.indices.get(k) else { continue };
-            let v = if shared.get(v as usize).copied().unwrap_or(false) { *copies.entry(v).or_insert_with(|| self.duplicate_vertex(v as usize)) } else { v };
+            let v =
+                if shared.get(v as usize).copied().unwrap_or(false) { *duplicates.entry(v).or_insert_with(|| self.duplicate_vertex(v as usize)) } else { v };
             if let Some(i) = self.indices.get_mut(k) {
                 *i = v;
             }
         }
-        // (vertex, centroid of its first triangle), each vertex once.
-        let mut verts = Vec::with_capacity(mine.len() * 3);
-        for t in &mine {
+
+        // (vertex, centroid of its first triangle), each vertex once
+        let mut vertices = Vec::with_capacity(material_triangles.len() * 3);
+        for t in &material_triangles {
             let Some(tri) = self.tri(*t) else { continue };
             let centroid = tri.iter().map(|v| self.uvs.get(*v).copied().unwrap_or_default()).sum::<Vec2>() / 3.0;
-            verts.extend(tri.map(|v| (v, centroid)));
+            vertices.extend(tri.map(|v| (v, centroid)));
         }
-        verts.sort_by_key(|(v, _)| *v);
-        verts.dedup_by_key(|(v, _)| *v);
-        for (v, centroid) in verts {
+
+        vertices.sort_by_key(|(v, _)| *v);
+        vertices.dedup_by_key(|(v, _)| *v);
+        for (v, centroid) in vertices {
             if let Some(uv) = self.uvs.get_mut(v) {
                 *uv = f(centroid, *uv);
             }

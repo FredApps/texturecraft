@@ -321,42 +321,52 @@ fn expect_end(r: &mut impl Read, what: &str) -> Result<()> {
     }
 }
 
-fn read_tiles(r: &mut impl Read, size: (u32, u32), comps: usize, what: &str) -> Result<TileImage> {
-    let (w, h, c, count) = read_header(r, what)?;
-    if (w, h) != size || c != comps {
-        return Err(malformed(KIND, format!("{what}: {w}×{h}×{c} does not match the texture set ({}×{}×{comps})", size.0, size.1)));
+fn read_tiles(reader: &mut impl Read, size: (u32, u32), components: usize, what: &str) -> Result<TileImage> {
+    let (width, height, stored_components, count) = read_header(reader, what)?;
+    if (width, height) != size || stored_components != components {
+        return Err(malformed(
+            KIND,
+            format!("{what}: {width}×{height}×{stored_components} does not match the texture set ({}×{}×{components})", size.0, size.1),
+        ));
     }
-    let mut img = TileImage::new(w, h, comps);
-    if count > (img.tiles_x() as usize) * (img.tiles_y() as usize) {
+
+    let mut image = TileImage::new(width, height, components);
+    if count > (image.tiles_x() as usize) * (image.tiles_y() as usize) {
         return Err(malformed(KIND, format!("{what}: {count} tiles is more than the image holds")));
     }
-    let mut buf = vec![0u8; TILE_AREA * comps * 2];
-    let mut pos = [0u8; 8];
+
+    let mut bytes = vec![0u8; TILE_AREA * components * 2];
+    let mut position_bytes = [0u8; 8];
     for _ in 0..count {
-        read_exact(r, &mut pos, what)?;
-        let (tx, ty) = (u32_at(&pos, 0), u32_at(&pos, 1));
-        if tx >= img.tiles_x() || ty >= img.tiles_y() || img.is_allocated(tx, ty) {
+        read_exact(reader, &mut position_bytes, what)?;
+        let (tx, ty) = (u32_at(&position_bytes, 0), u32_at(&position_bytes, 1));
+        if tx >= image.tiles_x() || ty >= image.tiles_y() || image.is_allocated(tx, ty) {
             return Err(malformed(KIND, format!("{what}: bad or repeated tile ({tx}, {ty})")));
         }
-        read_exact(r, &mut buf, what)?;
-        let data: Vec<u16> = buf.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect();
-        img.set_tile(tx, ty, Some(Arc::new(data)));
+
+        read_exact(reader, &mut bytes, what)?;
+        let data: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b)).collect();
+        image.set_tile(tx, ty, Some(Arc::new(data)));
     }
-    expect_end(r, what)?;
-    Ok(img)
+
+    expect_end(reader, what)?;
+
+    Ok(image)
 }
 
 /// A baked map: (width, height, data).
-fn read_baked(r: &mut impl Read, comps: usize, what: &str) -> Result<(u32, u32, Vec<f32>)> {
-    let (w, h, c, _) = read_header(r, what)?;
-    if w == 0 || h == 0 || u64::from(w) * u64::from(h) > MAX_TEXELS || c != comps {
-        return Err(malformed(KIND, format!("{what}: bad size {w}×{h}×{c}")));
+fn read_baked(reader: &mut impl Read, components: usize, what: &str) -> Result<(u32, u32, Vec<f32>)> {
+    let (width, height, stored_components, _) = read_header(reader, what)?;
+    if width == 0 || height == 0 || u64::from(width) * u64::from(height) > MAX_TEXELS || stored_components != components {
+        return Err(malformed(KIND, format!("{what}: bad size {width}×{height}×{stored_components}")));
     }
-    let len = (w as usize) * (h as usize) * comps;
-    let mut bytes = vec![0u8; len * 4];
-    read_exact(r, &mut bytes, what)?;
-    expect_end(r, what)?;
-    Ok((w, h, bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()))
+
+    let value_count = (width as usize) * (height as usize) * components;
+    let mut bytes = vec![0u8; value_count * 4];
+    read_exact(reader, &mut bytes, what)?;
+    expect_end(reader, what)?;
+
+    Ok((width, height, bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()))
 }
 
 /// Texture set holding a paint layer, a content effect or a mask effect id.

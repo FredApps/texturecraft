@@ -1,6 +1,17 @@
 //! German UI text: (English key, translation). Keys are the English strings passed to `tr`.
 
 pub const TABLE: &[(&str, &str)] = &[
+    ("Baking {map} ({n}/{total})", "{map} wird gebacken ({n}/{total})"),
+    ("Baking {map} ({n}/{total}), texture set {set} of {sets}", "{map} wird gebacken ({n}/{total}), Texturset {set} von {sets}"),
+    ("Follow Newest Map", "Neueste Map verfolgen"),
+    (
+        "Painting is paused while a bake is shown. Cancel the bake or wait for it to finish.",
+        "Das Malen ist pausiert, solange ein Bake angezeigt wird. Brich den Bake ab oder warte, bis er fertig ist.",
+    ),
+    (
+        "What the 3D view shows while the bake runs: the newest finished map, one finished map, or the material. Maps not baked yet show a neutral value.",
+        "Was die 3D-Ansicht während des Backens zeigt: die zuletzt fertige Map, eine fertige Map deiner Wahl oder das Material. Noch nicht gebackene Maps zeigen einen neutralen Wert.",
+    ),
     ("\"{layer}\" has no paint yet: the filter changes what you paint on it.", "\"{layer}\" ist noch nicht bemalt: Der Filter verändert, was du darauf malst."),
     ("0 turns autosave off. Copies go to {folder}", "0 deaktiviert die automatische Speicherung. Kopien werden in {folder} abgelegt"),
     ("2D view only", "Nur 2D-Ansicht"),
@@ -63,7 +74,6 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Always", "Immer"),
     ("Ambient Occlusion", "Ambient Occlusion"),
     ("Ambient occlusion", "Ambient occlusion"),
-    ("Ambient occlusion intensity", "Ambient-Occlusion-Intensität"),
     ("Amount", "Stärke"),
     ("Anchor point", "Ankerpunkt"),
     ("Anchor: {name}", "Anker: {name}"),
@@ -447,6 +457,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Invert", "Invertieren"),
     ("Invert mask", "Maske invertieren"),
     ("Invert mask background", "Maskenhintergrund invertieren"),
+    ("Invert mask value", "Maskenwert invertieren"),
     ("Invert quick mask", "Schnellmaske invertieren"),
     ("Jitters", "Streuung"),
     ("Join the ArtCraft community on Discord", "Der ArtCraft-Community auf Discord beitreten"),
@@ -1081,6 +1092,14 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Value Bounds Max", "Maximaler Grenzwert"),
     ("Value Bounds Min", "Minimaler Grenzwert"),
     ("Vertex Color", "Scheitelpunktfarbe"),
+    ("Select the layer content", "Ebeneninhalt auswählen"),
+    ("Paint layer", "Malebene"),
+    ("Fill layer", "Füllebene"),
+    ("1 effect", "1 Effekt"),
+    ("{count} effects", "{count} Effekte"),
+    ("Mask effects", "Maskeneffekte"),
+    ("Content effects", "Inhaltseffekte"),
+    ("Fold or unfold these effects", "Diese Effekte ein- oder ausklappen"),
     ("Remove resolution override", "Auflösungsüberschreibung entfernen"),
     ("Texture set resolution", "Auflösung des Textursets"),
     ("UV tile {tile} resolution", "Auflösung der UV-Kachel {tile}"),

@@ -1,6 +1,17 @@
 //! French UI text: (English key, translation). Keys are the English strings passed to `tr`.
 
 pub const TABLE: &[(&str, &str)] = &[
+    ("Baking {map} ({n}/{total})", "Cuisson de {map} ({n}/{total})"),
+    ("Baking {map} ({n}/{total}), texture set {set} of {sets}", "Cuisson de {map} ({n}/{total}), jeu de textures {set} sur {sets}"),
+    ("Follow Newest Map", "Suivre la dernière carte"),
+    (
+        "Painting is paused while a bake is shown. Cancel the bake or wait for it to finish.",
+        "La peinture est suspendue tant qu'une cuisson est affichée. Annulez la cuisson ou attendez qu'elle se termine.",
+    ),
+    (
+        "What the 3D view shows while the bake runs: the newest finished map, one finished map, or the material. Maps not baked yet show a neutral value.",
+        "Ce que la vue 3D affiche pendant la cuisson : la dernière carte terminée, une carte terminée au choix ou le matériau. Les cartes pas encore cuites affichent une valeur neutre.",
+    ),
     (
         "\"{layer}\" has no paint yet: the filter changes what you paint on it.",
         "\"{layer}\" n'a pas encore de peinture : le filtre modifie ce que vous y peignez.",
@@ -66,7 +77,6 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Always", "Toujours"),
     ("Ambient Occlusion", "Occlusion ambiante"),
     ("Ambient occlusion", "Occlusion ambiante"),
-    ("Ambient occlusion intensity", "Intensité de l'occlusion ambiante"),
     ("Amount", "Quantité"),
     ("Anchor point", "Point d'ancrage"),
     ("Anchor: {name}", "Ancrage : {name}"),
@@ -450,6 +460,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Invert", "Inverser"),
     ("Invert mask", "Inverser le masque"),
     ("Invert mask background", "Inverser le fond du masque"),
+    ("Invert mask value", "Inverser la valeur du masque"),
     ("Invert quick mask", "Inverser le masque rapide"),
     ("Jitters", "Variations"),
     ("Join the ArtCraft community on Discord", "Rejoindre la communauté ArtCraft sur Discord"),
@@ -1090,6 +1101,14 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Value Bounds Max", "Borne maximale"),
     ("Value Bounds Min", "Borne minimale"),
     ("Vertex Color", "Couleur des sommets"),
+    ("Select the layer content", "Sélectionner le contenu du calque"),
+    ("Paint layer", "Calque de peinture"),
+    ("Fill layer", "Calque de remplissage"),
+    ("1 effect", "1 effet"),
+    ("{count} effects", "{count} effets"),
+    ("Mask effects", "Effets du masque"),
+    ("Content effects", "Effets du contenu"),
+    ("Fold or unfold these effects", "Replier ou déplier ces effets"),
     ("Remove resolution override", "Supprimer la résolution personnalisée"),
     ("Texture set resolution", "Résolution de l'ensemble de textures"),
     ("UV tile {tile} resolution", "Résolution de la tuile UV {tile}"),

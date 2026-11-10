@@ -23,7 +23,7 @@ fn bumpy_high_poly() -> (Mesh, Vec<bool>) {
 
     let mut flipped = vec![false; mesh.positions.len()];
     let mut unflipped = vec![false; mesh.positions.len()];
-    for corners in mesh.indices.chunks_exact_mut(3) {
+    for corners in mesh.indices.as_chunks_mut::<3>().0 {
         let center_x = corners.iter().map(|&corner| mesh.positions[corner as usize].x).sum::<f32>() / 3.0;
         if center_x > FLIPPED_FROM_X {
             corners.swap(1, 2);
@@ -32,6 +32,7 @@ fn bumpy_high_poly() -> (Mesh, Vec<bool>) {
             if center_x > FLIPPED_FROM_X { flipped[corner as usize] = true } else { unflipped[corner as usize] = true }
         }
     }
+
     // Vertices on the border face both ways: neither answer is right for them
     let mixed = flipped.iter().zip(&unflipped).map(|(flipped, unflipped)| *flipped && *unflipped).collect();
     (mesh, mixed)

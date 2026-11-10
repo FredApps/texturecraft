@@ -16,7 +16,7 @@ use crate::i18n::{tr, trf};
 use crate::new_project_advanced::COMBO_WIDTH;
 use crate::state::Mode;
 use crate::theme::{Accent, Brightness, Tokens, caption};
-use crate::widgets::{color_swatch, combo, icon_button, primary_button, slider, slider_edit};
+use crate::widgets::{color_swatch, combo, icon_button, primary_button, section, slider};
 
 pub fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     start(app, ctx);
@@ -196,10 +196,14 @@ pub(crate) fn display(app: &mut TextureCraftApp, ui: &mut Ui) {
     if ui.checkbox(&mut ortho, tr("Orthographic")).changed() {
         app.run("camera.set", json!({"ortho": ortho}));
     }
-    ui.horizontal(|ui| {
-        ui.label(tr("Tone mapping"));
-        ui.selectable_value(&mut d.tone_mapping, ToneMapping::Linear, tr("Linear"));
-        ui.selectable_value(&mut d.tone_mapping, ToneMapping::AcesFilmic, tr("ACES filmic"));
+    let tone_mapping_name = |tone_mapping: ToneMapping| match tone_mapping {
+        ToneMapping::Linear => tr("Linear"),
+        ToneMapping::AcesFilmic => tr("ACES filmic"),
+    };
+    combo(ui, tr("Tone mapping"), tone_mapping_name(d.tone_mapping), |ui| {
+        for tone_mapping in [ToneMapping::Linear, ToneMapping::AcesFilmic] {
+            ui.selectable_value(&mut d.tone_mapping, tone_mapping, tone_mapping_name(tone_mapping));
+        }
     });
     cameras(app, ui);
     ui.add_space(6.0);
@@ -217,7 +221,6 @@ pub(crate) fn display(app: &mut TextureCraftApp, ui: &mut Ui) {
     });
     ui.add_space(6.0);
     ui.label(caption(tr("Viewer settings")));
-    slider(ui, tr("Ambient occlusion intensity"), &mut d.ao_intensity, 0.0..=1.0, 2);
     ui.checkbox(&mut app.ui.wireframe_3d, tr("Show wireframe in the 3D view"));
     ui.checkbox(&mut app.ui.uv_wireframe, tr("Show UV wireframe in the 2D view"));
     ui.checkbox(&mut d.taa, tr("Temporal anti-aliasing (refines the 3D view while it is still)"));
@@ -265,18 +268,23 @@ fn cameras(app: &mut TextureCraftApp, ui: &mut Ui) {
     }
 }
 
-/// The Shader Settings panel body (a dock tab).
+/// Wide enough for the longer shader model name
+const SHADER_MODEL_COMBO_WIDTH: f32 = 260.0;
+
+/// Width of the scatter color swatch
+const SCATTER_SWATCH_WIDTH: f32 = 44.0;
+
+/// Index of refraction slider range: air to well past diamond (2.42)
+const INDEX_OF_REFRACTION_RANGE: std::ops::RangeInclusive<f32> = 1.0..=3.0;
+
+/// The Shader Settings panel body (a dock tab)
 pub(crate) fn shader(app: &mut TextureCraftApp, ui: &mut Ui) {
-    let tk = Tokens::get(ui.ctx());
-    let mut d = app.session.doc.project.display.clone();
-    let before = d.clone();
-    let model = |sg: bool| if sg { tr("TextureCraft PBR - Specular Glossiness") } else { tr("TextureCraft PBR - Metallic Roughness") };
-    egui::ComboBox::from_id_salt("shader_model").width(260.0).selected_text(model(d.spec_gloss)).show_ui(ui, |ui| {
-        for sg in [false, true] {
-            ui.selectable_value(&mut d.spec_gloss, sg, model(sg));
-        }
-    });
-    let channels = if d.spec_gloss {
+    let tokens = Tokens::get(ui.ctx());
+    let mut display = app.session.doc.project.display.clone();
+    let before = display.clone();
+
+    let model_name = |spec_gloss: bool| if spec_gloss { tr("TextureCraft PBR - Specular Glossiness") } else { tr("TextureCraft PBR - Metallic Roughness") };
+    let channels = if display.spec_gloss {
         tr("Base color is the diffuse color, Specular the F0 color and Glossiness 1 - roughness (add these channels in the texture set settings).")
     } else {
         tr("Base color, Metallic, Roughness and Specular level.")
@@ -287,75 +295,90 @@ pub(crate) fn shader(app: &mut TextureCraftApp, ui: &mut Ui) {
     let optional = tr(
         "Optional channels add a clear coat (Coat weight, Coat roughness, Coat normal), sheen (Sheen weight, color, roughness), anisotropy (Anisotropy level, angle), subsurface scattering (Scattering weight) and transmission (Transmission).",
     );
-    ui.label(RichText::new(format!("{model_text} {channels} {optional}")).color(tk.text_dim));
+
+    egui::ComboBox::from_id_salt("shader_model")
+        .width(SHADER_MODEL_COMBO_WIDTH)
+        .selected_text(model_name(display.spec_gloss))
+        .show_ui(ui, |ui| {
+            for spec_gloss in [false, true] {
+                ui.selectable_value(&mut display.spec_gloss, spec_gloss, model_name(spec_gloss));
+            }
+        })
+        .response
+        .on_hover_text(format!("{model_text} {channels} {optional}"));
     ui.add_space(6.0);
-    ui.checkbox(&mut d.parallax, tr("Parallax occlusion (height channel)"))
+
+    ui.checkbox(&mut display.parallax, tr("Parallax occlusion (height channel)"))
         .on_hover_text(tr("Offsets the textures by the height channel, at the height to normal strength"));
-    ui.checkbox(&mut d.displacement, tr("Displacement (height channel)")).on_hover_text(tr(
+    ui.checkbox(&mut display.displacement, tr("Displacement (height channel)")).on_hover_text(tr(
         "Moves the surface by the height channel on a finer copy of the mesh, at the height to normal strength (viewport only: painting follows the base surface)",
     ));
+    slider(ui, tr("AO intensity"), &mut display.ao_intensity, 0.0..=1.0, 2);
     ui.add_space(6.0);
-    ui.label(caption(tr("Subsurface scattering")));
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(tr("Scatter color")).color(tk.text));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| color_swatch(ui, "shader_scatter_color", &mut d.scatter_color, 44.0))
-    })
-    .response
-    .on_hover_text(tr("Color of the light that travels under the surface (each channel goes as far as its value)"));
-    slider(ui, tr("Scatter radius"), &mut d.scatter_radius, 0.0..=1.0, 3)
-        .on_hover_text(tr("How far light travels under the surface, as a fraction of the mesh size (where the Scattering weight channel is painted)"));
-    ui.add_space(6.0);
-    ui.label(caption(tr("Transmission")));
-    slider(ui, tr("Index of refraction"), &mut d.ior, 1.0..=3.0, 2)
-        .on_hover_text(tr("How strongly transmissive surfaces bend light (where the Transmission channel is painted): water 1.33, glass 1.5, diamond 2.42"));
-    if d != before {
-        app.session.doc.project.display = d;
-    }
-    let ts = app.session.ts();
-    if let Some(set) = app.session.doc.project.texture_sets.get(ts) {
-        let mut hs = set.height_strength;
-        if let Some(merge) = slider_edit(ui, tr("Height to normal strength"), &mut hs, 0.0..=10.0, 2) {
-            app.run("textureSet.settings", json!({"ts": ts, "heightStrength": hs, "merge": merge}));
-        }
-    }
-    let mut ao = app.session.doc.project.display.ao_intensity;
-    if slider(ui, tr("AO intensity"), &mut ao, 0.0..=1.0, 2).changed() {
-        app.session.doc.project.display.ao_intensity = ao;
+
+    section(ui, "shader_subsurface", tr("Subsurface scattering"), true, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(tr("Scatter color")).color(tokens.text));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                color_swatch(ui, "shader_scatter_color", &mut display.scatter_color, SCATTER_SWATCH_WIDTH)
+            })
+        })
+        .response
+        .on_hover_text(tr("Color of the light that travels under the surface (each channel goes as far as its value)"));
+        slider(ui, tr("Scatter radius"), &mut display.scatter_radius, 0.0..=1.0, 3)
+            .on_hover_text(tr("How far light travels under the surface, as a fraction of the mesh size (where the Scattering weight channel is painted)"));
+    });
+    section(ui, "shader_transmission", tr("Transmission"), true, |ui| {
+        slider(ui, tr("Index of refraction"), &mut display.ior, INDEX_OF_REFRACTION_RANGE, 2).on_hover_text(tr(
+            "How strongly transmissive surfaces bend light (where the Transmission channel is painted): water 1.33, glass 1.5, diamond 2.42",
+        ));
+    });
+
+    if display != before {
+        app.session.doc.project.display = display;
     }
 }
 
-/// The History panel body (a dock tab).
+/// The History panel body (a dock tab)
 pub(crate) fn history(app: &mut TextureCraftApp, ui: &mut Ui) {
-    let tk = Tokens::get(ui.ctx());
+    let tokens = Tokens::get(ui.ctx());
     let (done, undone) = (app.session.history_labels(), app.session.redo_labels());
-    // A click on a step goes back (or forward) to it: steps to undo, or to redo when negative.
+    // A click on a step goes back (or forward) to it: steps to undo, or to redo when negative
     let mut jump = 0i64;
-    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
-        let n = done.len() as i64;
-        let rows = std::iter::once(RichText::new(tr("Project opened")).color(tk.text_dim))
-            .chain(done.iter().map(RichText::new))
-            .chain(undone.iter().map(|l| RichText::new(trf("{action} (undone)", &[("action", l)])).color(tk.text_dim)));
-        for (i, text) in rows.enumerate() {
-            // Row i is the state after i steps.
-            let steps = n - i as i64;
-            if ui.selectable_label(steps == 0, text).on_hover_text(tr("Return to this step")).clicked() {
-                jump = steps;
+
+    // Bottom up: the Undo and Redo row keeps its place under a list that fills the rest of the panel
+    ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+        ui.horizontal(|ui| {
+            if ui.add_enabled(app.session.can_undo(), egui::Button::new(format!("{} {}", ic::ARROW_COUNTER_CLOCKWISE, tr("Undo")))).clicked() {
+                app.run("edit.undo", json!({}));
             }
-        }
+            if ui.add_enabled(app.session.can_redo(), egui::Button::new(format!("{} {}", ic::ARROW_CLOCKWISE, tr("Redo")))).clicked() {
+                app.run("edit.redo", json!({}));
+            }
+        });
+
+        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                let done_count = done.len() as i64;
+                let rows = std::iter::once(RichText::new(tr("Project opened")).color(tokens.text_dim))
+                    .chain(done.iter().map(RichText::new))
+                    .chain(undone.iter().map(|label| RichText::new(trf("{action} (undone)", &[("action", label)])).color(tokens.text_dim)));
+                for (row, text) in rows.enumerate() {
+                    // Each row is the state after that many steps
+                    let steps = done_count - row as i64;
+                    if ui.selectable_label(steps == 0, text).on_hover_text(tr("Return to this step")).clicked() {
+                        jump = steps;
+                    }
+                }
+            });
+        });
     });
+
     if jump > 0 {
         app.run("edit.undo", json!({ "steps": jump }));
     } else if jump < 0 {
         app.run("edit.redo", json!({ "steps": -jump }));
     }
-    ui.horizontal(|ui| {
-        if ui.add_enabled(app.session.can_undo(), egui::Button::new(format!("{} {}", ic::ARROW_COUNTER_CLOCKWISE, tr("Undo")))).clicked() {
-            app.run("edit.undo", json!({}));
-        }
-        if ui.add_enabled(app.session.can_redo(), egui::Button::new(format!("{} {}", ic::ARROW_CLOCKWISE, tr("Redo")))).clicked() {
-            app.run("edit.redo", json!({}));
-        }
-    });
 }
 
 /// What the start window was asked for.
@@ -736,11 +759,11 @@ fn about(app: &mut TextureCraftApp, ctx: &egui::Context) {
     app.ui.windows.about = open;
 }
 
-/// The Log panel body (a dock tab).
+/// The Log panel body (a dock tab)
 pub(crate) fn log(app: &mut TextureCraftApp, ui: &mut Ui) {
-    egui::ScrollArea::vertical().max_height(300.0).stick_to_bottom(true).show(ui, |ui| {
-        for l in &app.session.log {
-            ui.label(RichText::new(l).monospace());
+    egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(true).show(ui, |ui| {
+        for line in &app.session.log {
+            ui.label(RichText::new(line).monospace());
         }
     });
 }

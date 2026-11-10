@@ -28,6 +28,7 @@ Use these preferences when reviewing and improving a PR. Follow repository requi
 
 - Prefer the smallest complete solution that is efficient and easy to understand
 - Look for repeated calculations, expensive iterations, unnecessary allocations, and redundant data access
+- For loops, batches, and streaming operations, trace allocations and buffer lifetimes across multiple iterations, including outputs retained from earlier iterations. Identify work that belongs once per operation rather than once per item, using the full selection when making retention decisions
 - Consider caching, batching, and parallelism when measurements justify their complexity and memory cost
 - Measure relevant runtime, construction cost, and memory tradeoffs using representative workloads
 - Compare before and after with the same inputs, build settings, and environment; account for measurement variation and cold or warm state where relevant
@@ -77,6 +78,7 @@ Use these preferences when reviewing and improving a PR. Follow repository requi
 - For naming, spacing, or organization findings, identify the location and the specific standard being missed
 - Order findings by severity and distinguish confirmed problems, hypotheses needing verification, and optional improvements
 - Give measured optimization results with workload, build, and environment details; do not describe an unmeasured change as faster
+- For memory-related changes, verify allocation/resampling counts or peak live memory in representative multi-item cases. Final pixel equality and shared output buffers do not prove that temporary allocations are avoided
 - State remaining limitations and coverage gaps; if no actionable problems were found, say so without implying complete correctness
 - Before handing back edits, review the final diff for unintended behavior changes, unrelated edits, and claims unsupported by validation
 
