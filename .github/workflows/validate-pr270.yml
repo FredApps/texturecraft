@@ -26,8 +26,7 @@ jobs:
       command: |
         cargo fmt --all
         git diff -- crates/engine/src/bake/bake_task.rs crates/engine/src/bake/preserve_tiles.rs crates/ui-egui/tests/live_bake_validation.rs
-        cargo test -p texturecraft-engine --release
-        cargo test -p texturecraft-ui-egui --release --test bake_preview
+        cargo test -p texturecraft-engine -p texturecraft-render -p texturecraft-ui-egui --release
         cargo test -p texturecraft-ui-egui --release --test live_bake_validation -- --ignored --nocapture
         python - <<'PY'
         import base64
