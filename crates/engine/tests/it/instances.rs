@@ -220,12 +220,10 @@ fn budgeted_updates_spread_work_and_end_identical() {
     s.caches[0].invalidate_all();
     // A clock that is always over budget: one chunk per call.
     let mut calls = 0;
-    // Progress: a tile is two steps from done while dirty (coarse look, then exact), one when refining.
-    let steps = |s: &texturecraft_engine::Session| 2 * s.caches[0].dirty.len() + s.caches[0].refine.len() + s.caches[0].settle.len();
     while s.pending_tiles() > 0 {
-        let before = steps(&s);
+        let before = s.pending_tiles();
         s.update_for(0.0, || 1.0);
-        assert!(steps(&s) < before);
+        assert!(s.pending_tiles() < before);
         calls += 1;
     }
     assert!(calls > 1, "the work was spread over calls");

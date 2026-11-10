@@ -350,11 +350,6 @@ pub fn blend3(mode: BlendMode, a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 
 /// Mix `blended` over `a` by weight `w` (coverage × opacity × mask).
 pub fn mix3(a: [f32; 3], blended: [f32; 3], w: f32) -> [f32; 3] {
-    // A full-weight blend is exactly the blended value (`a + (b - a)` can be an ulp off it): what
-    // lies under it does not leak in, so skipping the layers it hides changes nothing at all.
-    if w >= 1.0 {
-        return blended;
-    }
     [a[0] + (blended[0] - a[0]) * w, a[1] + (blended[1] - a[1]) * w, a[2] + (blended[2] - a[2]) * w]
 }
 

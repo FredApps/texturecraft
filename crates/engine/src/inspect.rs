@@ -193,10 +193,5 @@ pub fn session(s: &Session) -> Value {
         "history": { "undo": s.undo_label(), "redo": s.redo_label(), "depth": s.history_labels().len() },
         "memoryBytes": s.memory().total(),
         "pendingTiles": s.pending_tiles(),
-        // Tiles with no look of the current composite yet, tiles shown from a coarse pass only
-        // (their exact composite pending), and the coarsest stride shown (0: none).
-        "dirtyTiles": s.caches.iter().map(|c| c.dirty.len()).sum::<usize>(),
-        "coarseTiles": s.caches.iter().map(|c| c.refine.len()).sum::<usize>(),
-        "coarsestStride": s.caches.iter().flat_map(|c| c.refine.values().copied()).max().unwrap_or(0),
     })
 }

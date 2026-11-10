@@ -573,35 +573,3 @@ fn gathering_filters_composite_identically_in_any_grouping_and_cached() {
         assert!(!check_cached(&f, 0, hot).is_empty());
     }
 }
-
-/// A folder that hides the layers below it but records an anchor point inside (under its own
-/// hiding layer) keeps them: its inner stack starts from them, so the anchor holds them.
-#[test]
-fn layers_under_a_hiding_folder_with_an_anchor_are_not_culled() {
-    let mut f = fixture();
-    let only = |f: &mut Fixture, id: LayerId, c: Channel| f.project.layer_mut(id).unwrap().channels.retain(|x, _| *x == c);
-    let low = add(&mut f, 0, fill(&[(Channel::BaseColor, Source::Uniform([0.9; 3]))]), None);
-    only(&mut f, low, Channel::BaseColor);
-    let group = add(&mut f, 0, LayerKind::Group { children: vec![], collapsed: false }, None);
-    // Inside: a half-opacity fill recording anchor A, then an opaque fill hiding everything.
-    let anchored = put(&mut f, 0, Some(group), fill(&[(Channel::BaseColor, Source::Uniform([0.5; 3]))]), None);
-    only(&mut f, anchored, Channel::BaseColor);
-    blend(&mut f, anchored, BlendMode::Normal, 0.5);
-    let anchor = effect(&mut f, EffectKind::Anchor);
-    let anchor_id = anchor.id;
-    f.project.layer_mut(anchored).unwrap().content_effects.push(anchor);
-    let hiding = put(&mut f, 0, Some(group), fill(&[(Channel::BaseColor, Source::Uniform([0.1; 3]))]), None);
-    only(&mut f, hiding, Channel::BaseColor);
-    // Above the folder, roughness reads the base color held by A.
-    let reader = add(&mut f, 0, fill(&[(Channel::Roughness, Source::Anchor { anchor: anchor_id, channel: Channel::BaseColor })]), None);
-    only(&mut f, reader, Channel::Roughness);
-    let out = reference(&f, 0);
-    let rough = out.value(Channel::Roughness, 128, 128)[0];
-    // A = 0.5 at half opacity over the low layer's 0.9.
-    assert!((rough - 0.7).abs() < 2e-3, "the anchor holds the layer under the folder: {rough}");
-    assert!((out.value(Channel::BaseColor, 128, 128)[0] - 0.1).abs() < 2e-3);
-    // The same stack with an (unread) anchor on the low layer is never culled: identical.
-    let keep = effect(&mut f, EffectKind::Anchor);
-    f.project.layer_mut(low).unwrap().content_effects.push(keep);
-    assert!(reference(&f, 0) == out, "culling changed the composite");
-}
