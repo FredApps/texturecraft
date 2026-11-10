@@ -1,8 +1,8 @@
 //! Native preview rendering uses a separate thread pool
 //! Web requests render synchronously on the UI thread
 
-#[cfg(target_arch = "wasm32")]
-use crate::mask_shape::MaskShape;
+#[cfg(any(target_arch = "wasm32", test))]
+use crate::orb_shape::OrbShape;
 use crate::preview_request::PreviewRequest;
 
 /// Request key and rendered image; None on failure
@@ -17,8 +17,8 @@ pub enum PreviewWorker {
     #[cfg(not(target_arch = "wasm32"))]
     Running { requests: std::sync::mpsc::Sender<PreviewRequest>, results: std::sync::mpsc::Receiver<PreviewResult> },
     /// The web: requests render as they are made
-    #[cfg(target_arch = "wasm32")]
-    Inline { shape: MaskShape, results: Vec<PreviewResult> },
+    #[cfg(any(target_arch = "wasm32", test))]
+    Inline { shape: OrbShape, results: Vec<PreviewResult> },
     /// The worker could not start or stopped; requests are refused
     // The web has no thread to stop
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
@@ -27,10 +27,10 @@ pub enum PreviewWorker {
 
 impl PreviewWorker {
     /// Submit work, starting the worker on first use; false if it has stopped
-    /// Native results request a repaint
-    pub fn request(&mut self, ctx: &egui::Context, request: PreviewRequest) -> bool {
+    /// Completed results request a repaint so the UI polls them on the next pass
+    pub fn request(&mut self, context: &egui::Context, request: PreviewRequest) -> bool {
         if matches!(self, PreviewWorker::NotStarted) {
-            *self = PreviewWorker::start(ctx);
+            *self = PreviewWorker::start(context);
         }
 
         match self {
@@ -39,12 +39,14 @@ impl PreviewWorker {
                 if requests.send(request).is_ok() {
                     return true;
                 }
+
                 *self = PreviewWorker::Stopped;
                 false
             }
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(any(target_arch = "wasm32", test))]
             PreviewWorker::Inline { shape, results } => {
                 results.push((request.key.clone(), request.render(shape)));
+                context.request_repaint();
                 true
             }
             PreviewWorker::NotStarted | PreviewWorker::Stopped => false,
@@ -72,7 +74,7 @@ impl PreviewWorker {
                 }
                 ready
             }
-            #[cfg(target_arch = "wasm32")]
+            #[cfg(any(target_arch = "wasm32", test))]
             PreviewWorker::Inline { results, .. } => std::mem::take(results),
             PreviewWorker::NotStarted | PreviewWorker::Stopped => Vec::new(),
         }
@@ -89,7 +91,7 @@ impl PreviewWorker {
         use std::collections::VecDeque;
         use std::sync::mpsc::channel;
 
-        use crate::mask_shape::MaskShape;
+        use crate::orb_shape::OrbShape;
 
         let (requests, request_rx) = channel::<PreviewRequest>();
         let (result_tx, results) = channel();
@@ -101,7 +103,7 @@ impl PreviewWorker {
             if let Err(e) = &pool {
                 log::warn!("shelf previews share the global thread pool: {e}");
             }
-            let mut shape = MaskShape::default();
+            let mut shape = OrbShape::default();
             let mut queue = VecDeque::new();
             loop {
                 if queue.is_empty() {
@@ -136,7 +138,7 @@ impl PreviewWorker {
     /// Render inline (no threads on the web)
     #[cfg(target_arch = "wasm32")]
     fn start(_ctx: &egui::Context) -> PreviewWorker {
-        PreviewWorker::Inline { shape: MaskShape::default(), results: Vec::new() }
+        PreviewWorker::Inline { shape: OrbShape::default(), results: Vec::new() }
     }
 }
 
@@ -161,6 +163,30 @@ mod tests {
     use crate::shelf_preview::ShelfPreview;
 
     #[test]
+    fn inline_results_schedule_a_frame_to_display_them() {
+        for id in ["steel", "nope"] {
+            let context = egui::Context::default();
+            for _ in 0..3 {
+                let mut output = context.run_pass(Default::default(), |_| {});
+
+                // No renderer consumes the texture updates in this scheduling test
+                output.textures_delta.clear();
+            }
+            assert!(!context.has_requested_repaint(), "the UI is idle before the request");
+
+            let mut worker = PreviewWorker::Inline { shape: OrbShape::default(), results: Vec::new() };
+            assert!(worker.poll().is_empty(), "the UI polls before submitting work");
+            let request = PreviewRequest { key: id.into(), preview: ShelfPreview::Material(id), size_px: 8, hover: false };
+            assert!(worker.request(&context, request));
+
+            let results = worker.poll();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].1.is_some(), id == "steel");
+            assert!(context.has_requested_repaint(), "the result needs another frame even when this is the only request");
+        }
+    }
+
+    #[test]
     fn requests_are_answered_and_unknown_assets_get_none() {
         let ctx = egui::Context::default();
         let mut worker = PreviewWorker::default();
@@ -170,23 +196,26 @@ mod tests {
             ("unknown material", ShelfPreview::Material("nope")),
             ("mask", ShelfPreview::SmartMask(SMART_MASKS[0].id)),
             ("unknown mask", ShelfPreview::SmartMask("nope")),
+            ("smart material", ShelfPreview::SmartMaterial("steel_painted_worn")),
+            ("unknown smart material", ShelfPreview::SmartMaterial("nope")),
         ];
+        let requests_sent = requests.len();
         for (key, preview) in requests {
             assert!(worker.request(&ctx, PreviewRequest { key: key.into(), preview, size_px, hover: false }), "{key}");
         }
 
         let mut answers = HashMap::new();
         let start = Instant::now();
-        while answers.len() < 4 && start.elapsed() < Duration::from_secs(120) {
+        while answers.len() < requests_sent && start.elapsed() < Duration::from_secs(120) {
             answers.extend(worker.poll());
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        for key in ["material", "mask"] {
+        for key in ["material", "mask", "smart material"] {
             let image = answers.get(key).and_then(Option::as_ref).unwrap_or_else(|| panic!("{key}: {answers:?}"));
             assert_eq!(image.size, [size_px, size_px], "{key}");
         }
-        for key in ["unknown material", "unknown mask"] {
+        for key in ["unknown material", "unknown mask", "unknown smart material"] {
             assert!(matches!(answers.get(key), Some(None)), "{key}: {answers:?}");
         }
         assert!(!worker.is_stopped());

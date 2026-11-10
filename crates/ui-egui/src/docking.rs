@@ -388,6 +388,17 @@ fn style(ui: &Ui, t: &Tokens) -> DockStyle {
     s
 }
 
+/// Whether a modal layer or update dialog holds the input, so the panels, floating ones included,
+/// do not take it.
+pub(crate) fn input_blocked(app: &TextureCraftApp, context: &egui::Context) -> bool {
+    let modal = context.memory(|memory| memory.top_modal_layer()).is_some();
+    #[cfg(not(target_arch = "wasm32"))]
+    let modal = modal || crate::updates_ui::blocks_input(app);
+    #[cfg(target_arch = "wasm32")]
+    let _ = app;
+    modal
+}
+
 /// Draw the dock (viewport and panels) into `ui`.
 pub fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
     for panel in Panel::ALL {
@@ -400,7 +411,7 @@ pub fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
     let tokens = Tokens::get(&context);
     let style = style(ui, &tokens);
     let layout = app.ui.dock.workspace.layout.clone();
-    let mut area = DockArea::new(area_id()).input_blocked(context.memory(|memory| memory.top_modal_layer()).is_some());
+    let mut area = DockArea::new(area_id()).input_blocked(input_blocked(app, &context));
     if let Some(panel) = app.ui.dock.raise.take() {
         area = area.raise_panel(panel);
     }

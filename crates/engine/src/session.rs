@@ -11,6 +11,7 @@ use texturecraft_geom::{Bvh, Mesh, OrbitCamera, UvGBuffer};
 use texturecraft_paint::{BrushSettings, EyeDepth, Stroke, StrokeCanvas};
 use texturecraft_texel::DilationMap;
 
+use crate::fill_mode::FillMode;
 use crate::{EngineError, Result};
 
 /// Padding (texels) applied to composites for display.
@@ -160,15 +161,6 @@ impl ViewMode {
     }
 }
 
-/// Polygon fill granularity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum FillMode {
-    #[default]
-    Triangle,
-    UvIsland,
-    Mesh,
-}
-
 /// A screen-pinned image for the Projection tool (a stencil).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StencilState {
@@ -210,6 +202,12 @@ pub struct ToolState {
     /// Gray painted into masks.
     pub mask_value: f32,
     pub fill_mode: FillMode,
+    /// How a polygon fill box decides which polygons it selects
+    #[serde(default)]
+    pub fill_hit_test: crate::fill_hit_test::FillHitTest,
+    /// Polygon fill boxes in the 3D view select only the polygons the camera sees
+    #[serde(default = "default_fill_visible_only")]
+    pub fill_visible_only: bool,
     /// Stencil used by the Projection tool.
     #[serde(default)]
     pub stencil: Option<StencilState>,
@@ -229,6 +227,10 @@ pub struct ToolState {
 
 fn default_smudge_strength() -> f32 {
     0.5
+}
+
+fn default_fill_visible_only() -> bool {
+    true
 }
 
 /// What the Clone tool copies (the clone source modes).
@@ -260,6 +262,8 @@ impl Default for ToolState {
             enabled: [Channel::BaseColor, Channel::Metallic, Channel::Roughness, Channel::Height, Channel::Normal].into_iter().collect(),
             mask_value: 1.0,
             fill_mode: FillMode::Triangle,
+            fill_hit_test: Default::default(),
+            fill_visible_only: default_fill_visible_only(),
             stencil: None,
             smudge_strength: default_smudge_strength(),
             clone_source: None,
@@ -291,8 +295,8 @@ pub(crate) struct ActiveStroke {
     pub canvas: StrokeCanvas,
     /// Camera visibility for 3D strokes (None for strokes in the 2D view).
     pub depth: Option<Arc<EyeDepth>>,
-    /// 2D view strokes: last UV point and the distance carried to the next stamp.
-    pub uv: Option<(Option<Vec2>, f32)>,
+    /// 2D view strokes: where the stroke is between samples.
+    pub uv: Option<crate::uv_stroke_state::UvStrokeState>,
     pub camera: OrbitCamera,
     pub viewport: Vec2,
     pub values: BTreeMap<Channel, [f32; 3]>,
@@ -314,6 +318,9 @@ pub struct Session {
     pub mesh: Arc<Mesh>,
     /// Unique per loaded mesh and UV layout (GPU caches compare it).
     pub mesh_id: u64,
+    /// Unique per open project: a mesh reimport or UV layout change keeps it, and opening, closing
+    /// or creating a project replaces it.
+    pub project_id: u64,
     /// The mesh with its own UVs (`mesh` maps UV-tiled sets into their atlas).
     pub(crate) source: Arc<Mesh>,
     pub bvh: Arc<Bvh>,
@@ -334,6 +341,8 @@ pub struct Session {
     pub target: StackTarget,
     pub camera: OrbitCamera,
     pub view: ViewMode,
+    /// The live bake preview while the app bakes (see [`crate::bake_preview`]).
+    pub bake_preview: Option<crate::bake_preview::BakePreview>,
     /// Viewport size (pixels) used by scripted strokes.
     pub viewport: Vec2,
     pub(crate) stroke: Option<ActiveStroke>,
@@ -356,6 +365,8 @@ pub struct Session {
     /// The last stroke's camera visibility buffer: reused while the camera, view size and mesh
     /// are unchanged, so back-to-back dabs start instantly.
     pub(crate) depth_cache: Option<DepthCache>,
+    /// The polygon fill box being dragged
+    pub(crate) polygon_fill_drag: Option<crate::polygon_fill_drag::PolygonFillDrag>,
     /// The user's export presets (kept when another project opens).
     pub export_presets: crate::preset_cmds::UserPresets,
     /// The user's project templates (kept when another project opens).
@@ -378,6 +389,7 @@ impl Session {
         Ok(Session {
             doc,
             mesh_id: next_mesh_id(),
+            project_id: next_mesh_id(),
             source,
             mesh,
             bvh: Arc::new(bvh),
@@ -393,6 +405,7 @@ impl Session {
             target: StackTarget::Content,
             camera,
             view: ViewMode::Material,
+            bake_preview: None,
             viewport: Vec2::new(1280.0, 800.0),
             stroke: None,
             clipboard: None,
@@ -405,6 +418,7 @@ impl Session {
             revision: 1,
             log: Vec::new(),
             depth_cache: None,
+            polygon_fill_drag: None,
             export_presets: Default::default(),
             templates: Default::default(),
         })
@@ -489,22 +503,24 @@ impl Session {
         self.edit_merging(label, self.merge_edits, f)
     }
 
-    /// [`Session::edit`] that, with `merge`, continues the previous undo step when it has the
-    /// same label (a drag in the viewport is one step however many updates it makes).
-    pub fn edit_merging<T>(&mut self, label: &str, merge: bool, f: impl FnOnce(&mut Session) -> Result<T>) -> Result<T> {
+    /// [`Session::edit`] that, with `merge`, continues the previous undo step when it has the same label (a viewport drag is one step however many updates it makes).
+    pub fn edit_merging<T>(&mut self, label: &str, merge: bool, change: impl FnOnce(&mut Session) -> Result<T>) -> Result<T> {
+        // A box fill under way becomes its own step first, so this edit isn't written over or folded into it
+        self.end_polygon_fill_box();
+
         let before = self.doc.clone();
-        let result = f(self).and_then(|v| match self.doc.project.instance_cycle() {
+        let result = change(self).and_then(|value| match self.doc.project.instance_cycle() {
             Some(id) => Err(EngineError::Other(format!("instance layer {} would draw itself", id.0))),
-            None => Ok(v),
+            None => Ok(value),
         });
         match result {
-            Ok(v) => {
+            Ok(value) => {
                 self.record(label, before, merge);
-                Ok(v)
+                Ok(value)
             }
-            Err(e) => {
+            Err(error) => {
                 self.doc = before;
-                Err(e)
+                Err(error)
             }
         }
     }
@@ -530,7 +546,7 @@ impl Session {
 
     /// Mark dirty every texture set whose composite differs between `other` and the current
     /// document (after an edit, undo or redo).
-    fn invalidate_changed(&mut self, other: &Document) {
+    pub(crate) fn invalidate_changed(&mut self, other: &Document) {
         self.follow_uv_layouts(&other.project);
         self.sync_caches();
         let resources = |d: &Document| d.resources.iter().map(|(n, b)| (n.clone(), Arc::as_ptr(b))).collect::<Vec<_>>();
@@ -625,25 +641,29 @@ impl Session {
     }
 
     pub fn undo(&mut self) -> Result<String> {
+        // A stroke, a box fill or an edited path under way would otherwise write over the restored document
         self.cancel_stroke();
-        // An edited path would otherwise repaint over the restored document.
+        self.end_polygon_fill_box();
         self.stop_path_edit();
-        let (label, doc) = self.undo.pop().ok_or_else(|| EngineError::Other("nothing to undo".into()))?;
-        let now = std::mem::replace(&mut self.doc, doc);
-        self.after_history(&now);
-        self.redo.push((label.clone(), now));
+
+        let (label, restored) = self.undo.pop().ok_or_else(|| EngineError::Other("nothing to undo".into()))?;
+        let current = std::mem::replace(&mut self.doc, restored);
+        self.after_history(&current);
+        self.redo.push((label.clone(), current));
         self.sync_images();
         Ok(label)
     }
 
     pub fn redo(&mut self) -> Result<String> {
+        // A stroke, a box fill or an edited path under way would otherwise write over the restored document
         self.cancel_stroke();
-        // An edited path would otherwise repaint over the restored document.
+        self.end_polygon_fill_box();
         self.stop_path_edit();
-        let (label, doc) = self.redo.pop().ok_or_else(|| EngineError::Other("nothing to redo".into()))?;
-        let now = std::mem::replace(&mut self.doc, doc);
-        self.after_history(&now);
-        self.undo.push((label.clone(), now));
+
+        let (label, restored) = self.redo.pop().ok_or_else(|| EngineError::Other("nothing to redo".into()))?;
+        let current = std::mem::replace(&mut self.doc, restored);
+        self.after_history(&current);
+        self.undo.push((label.clone(), current));
         self.sync_images();
         Ok(label)
     }

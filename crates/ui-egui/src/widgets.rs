@@ -307,7 +307,9 @@ fn collapsible_section(ui: &mut Ui, id: &str, title: &str, default_open: bool, r
         // At the defaults the icon is inert, so Tab skips it
         let sense = if at_default { Sense::CLICK } else { Sense::click() };
         let response = ui.interact(rect, id.with("reset"), sense).on_hover_text(tr("Reset to defaults"));
-        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, !at_default, tr("Reset to defaults")));
+
+        // A focused reset must identify its section without relying on nearby visual text
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, !at_default, format_args!("{title}: {}", tr("Reset to defaults"))));
 
         let focused = response.has_focus();
         let color = if at_default {

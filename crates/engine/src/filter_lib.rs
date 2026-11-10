@@ -19,6 +19,20 @@ pub struct FilterDef {
     pub mask: bool,
 }
 
+impl FilterDef {
+    /// Whether it builds a filter effect (levels and material finishes are effect types of their own)
+    pub fn is_filter_effect(&self) -> bool {
+        matches!(build(self.id, &Value::Null), Ok(EffectKind::Filter(_)))
+    }
+}
+
+/// The library entries that build filter effects, in shelf order, worked out once
+pub fn filter_effects() -> &'static [&'static FilterDef] {
+    static FILTER_EFFECTS: std::sync::LazyLock<Vec<&'static FilterDef>> =
+        std::sync::LazyLock::new(|| FILTERS.iter().filter(|def| def.is_filter_effect()).collect());
+    &FILTER_EFFECTS
+}
+
 const fn def(id: &'static str, label: &'static str, group: &'static str, mask: bool) -> FilterDef {
     FilterDef { id, label, group, mask }
 }

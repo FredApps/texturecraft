@@ -78,18 +78,16 @@ mod tests {
 
     #[test]
     fn particles_slide_down_a_wall_deterministically() {
-        // A vertical wall: the plane rotated to face +Z.
-        let mut m = primitives::plane(2.0, 8);
-        for p in &mut m.positions {
-            *p = Vec3::new(p.x, -p.z, 0.0);
+        // A vertical wall: the plane rotated to face +Z
+        let mut mesh = primitives::plane(2.0, 8);
+        for position in &mut mesh.positions {
+            *position = Vec3::new(position.x, -position.z, 0.0);
         }
-        for n in &mut m.normals {
-            *n = Vec3::Z;
-        }
-        let bvh = Bvh::new(&m);
-        let cam = OrbitCamera::default();
-        let ctx = PickCtx { mesh: &m, bvh: &bvh, camera: &cam, viewport: Vec2::new(100.0, 100.0) };
-        let s = Stamp {
+        mesh.normals.fill(Vec3::Z);
+        let bvh = Bvh::new(&mesh);
+        let camera = OrbitCamera::default();
+        let context = PickCtx { mesh: &mesh, bvh: &bvh, camera: &camera, viewport: Vec2::new(100.0, 100.0) };
+        let stamp = Stamp {
             center: Vec3::ZERO,
             normal: Vec3::Z,
             tangent: Vec3::X,
@@ -101,12 +99,14 @@ mod tests {
             seed: 3,
             copy: false,
         };
-        let p = Particles { enabled: true, count: 4, lifetime: 20, gravity: 1.0 };
-        let a = emit(&ctx, &p, &s);
-        assert_eq!(a, emit(&ctx, &p, &s));
-        assert_eq!(a.len(), 80);
-        let lowest = a.iter().map(|d| d.center.y).fold(f32::MAX, f32::min);
+        let particles = Particles { enabled: true, count: 4, lifetime: 20, gravity: 1.0 };
+
+        let dabs = emit(&context, &particles, &stamp);
+
+        assert_eq!(dabs, emit(&context, &particles, &stamp));
+        assert_eq!(dabs.len(), 80);
+        let lowest = dabs.iter().map(|d| d.center.y).fold(f32::MAX, f32::min);
         assert!(lowest < -0.4, "{lowest}");
-        assert!(a.iter().all(|d| d.center.z.abs() < 1e-3));
+        assert!(dabs.iter().all(|d| d.center.z.abs() < 1e-3));
     }
 }
