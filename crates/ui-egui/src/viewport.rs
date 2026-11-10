@@ -317,11 +317,7 @@ fn add_callback(app: &mut TextureCraftApp, ui: &Ui, rect: Rect, mut frame: Frame
     let scene = match (sync.0.take(), app.gpu.as_mut()) {
         (Some(aux), Some(gpu_link)) => {
             let sync_start_ms = crate::now_ms();
-            // Pointer, key and scroll input all count: the compositor then keeps frames short.
-            let user_active =
-                ui.ctx().input(|i| i.pointer.is_moving() || i.pointer.any_down() || !i.events.is_empty() || i.smooth_scroll_delta != egui::Vec2::ZERO);
-            let scene =
-                gpu_link.sync(&mut app.session, aux, bake, u32::from(app.ui.prefs.viewport_texture.min(2)), f64::from(app.profiler.logic_ms), user_active);
+            let scene = gpu_link.sync(&mut app.session, aux, bake, u32::from(app.ui.prefs.viewport_texture.min(2)), f64::from(app.profiler.logic_ms));
             let reports = gpu_link.take_reports();
             app.profiler.sync_ms += (crate::now_ms() - sync_start_ms) as f32;
             gpu_report_toasts(app, reports);
