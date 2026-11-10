@@ -46,11 +46,15 @@ impl BakeTask {
         let total = maps.len();
         let mut combined: Option<StreamedBake> = None;
 
-        for (index, map) in maps.into_iter().enumerate() {
+        for (index, map) in maps.iter().copied().enumerate() {
             let mut settings = self.settings.clone();
             settings.maps.select([map]);
             let mut output = self.run_with(&settings, progress)?;
             let Some(data) = output.maps.remove(&map) else { continue };
+            if combined.is_none() {
+                // Retain unchecked maps once, using the full selection rather than this one-map pass.
+                super::preserve_tiles::restore_unchecked(&mut output, &self.previous_maps, &self.excluded_tiles, &maps)?;
+            }
 
             let data = Arc::new(data);
             on_map(StreamedMap { map, index, total, resolution: output.resolution, height: output.height, data: data.clone() });
@@ -82,7 +86,9 @@ impl BakeTask {
     }
 
     pub fn run(&self, progress: &Progress) -> Result<BakeOutput> {
-        self.run_with(&self.settings, progress)
+        let mut output = self.run_with(&self.settings, progress)?;
+        super::preserve_tiles::restore_unchecked(&mut output, &self.previous_maps, &self.excluded_tiles, &[])?;
+        Ok(output)
     }
 
     fn run_with(&self, settings: &BakeSettings, progress: &Progress) -> Result<BakeOutput> {

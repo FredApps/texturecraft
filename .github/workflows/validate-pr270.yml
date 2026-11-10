@@ -1,0 +1,37 @@
+name: Validate PR 270
+
+on:
+  push:
+    branches: [validate/pr270-memory]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    uses: storytold/craft-common-actions/.github/workflows/gate.yml@main
+    with:
+      os: '["ubuntu-24.04"]'
+      craft-fonts-ref: aced4137c022f1f587624d48e81ec77e1914a9cc
+      toolchain: "1.96.0"
+      tools: ""
+      packages: >-
+        libxkbcommon-dev libwayland-dev libx11-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+        libgtk-3-dev mesa-vulkan-drivers
+      env: |
+        XDG_RUNTIME_DIR=/tmp
+        WGPU_BACKEND=vulkan
+        TC_UI_SNAPSHOTS=/tmp/pr270-snapshots
+      command: |
+        cargo fmt --all
+        git diff -- crates/engine/src/bake/bake_task.rs crates/engine/src/bake/preserve_tiles.rs crates/ui-egui/tests/live_bake_validation.rs
+        cargo test -p texturecraft-engine --release
+        cargo test -p texturecraft-ui-egui --release --test bake_preview
+        cargo test -p texturecraft-ui-egui --release --test live_bake_validation -- --ignored --nocapture
+        python - <<'PY'
+        import base64
+        from pathlib import Path
+        for path in sorted(Path('/tmp/pr270-snapshots').glob('*.png')):
+            print('PR270_SNAPSHOT ' + path.name + ' ' + base64.b64encode(path.read_bytes()).decode())
+        PY
