@@ -816,20 +816,25 @@ impl DecalFrame {
         use texturecraft_engine::StackTarget;
         use texturecraft_engine::compose::pattern::{decal_axes, decal_corners};
         use texturecraft_engine::core::{EffectKind, Fill, LayerKind, Projection};
+
         if app.ui.mode != crate::state::Mode::Painting {
             return None;
         }
 
         let layers = &app.session.doc.project;
+        let selected = app.session.selected_layer()?;
         let (layer, effect, decal) = match app.session.target {
             StackTarget::Content => {
-                let layer = app.session.selected_layer().and_then(|id| layers.content_layer(id))?;
+                let layer = layers.content_layer(selected)?;
                 let LayerKind::Fill(Fill { projection: Projection::Decal(decal), .. }) = &layer.kind else { return None };
 
                 (layer.id, None, decal)
             }
             StackTarget::Effect(effect) => {
-                let (owner, mask_effect) = layers.effect(effect)?;
+                // Only the selected layer's effective mask may supply a decal frame, including an instance's inherited mask
+                let owner = layers.mask_owner(selected);
+                let mask = layers.layer(owner).ok()?.mask.as_ref()?;
+                let mask_effect = mask.effects.iter().find(|candidate| candidate.id == effect)?;
                 let EffectKind::Fill { projection: Projection::Decal(decal), .. } = &mask_effect.kind else { return None };
 
                 (owner, Some(effect), decal)
@@ -1617,6 +1622,139 @@ fn bake_paint_overlay(app: &TextureCraftApp, ui: &Ui, painter: &egui::Painter, t
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A selected mask decal on the ball, with another texture set available for selection tests
+    fn decal_frame_app(render: bool) -> egui_kittest::Harness<'static, TextureCraftApp> {
+        let session =
+            Session::new_project("Decal selection", texturecraft_engine::geom::primitives::material_ball(), "builtin:material_ball", None, 256).unwrap();
+        let builder = egui_kittest::Harness::builder().with_size(vec2(1600.0, 960.0));
+        let builder = if render { builder.wgpu() } else { builder };
+        let mut harness = builder.build_eframe(|context| TextureCraftApp::new(context, session));
+        harness.run_steps(4);
+        let mut png = Vec::new();
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 255])).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let image = harness.state_mut().session.import_resource_bytes("decal.png", png).unwrap();
+        harness.state_mut().run("layer.add.decal", json!({"image": image, "channel": "mask", "size": 0.5})).unwrap();
+        harness.run_steps(2);
+        assert_eq!(harness.state().session.ts(), 0);
+        assert!(DecalFrame::of(harness.state(), harness.state().viewport_rect).is_some());
+        harness
+    }
+
+    /// Move a primary-button drag through enough frames to reach the viewport's decal handles
+    fn drag_decal_handle(harness: &mut egui_kittest::Harness<'_, TextureCraftApp>, from: Pos2, to: Pos2) {
+        let modifiers = egui::Modifiers::NONE;
+        harness.hover_at(from);
+        harness.event(egui::Event::PointerButton { pos: from, button: PointerButton::Primary, pressed: true, modifiers });
+        harness.run_steps(2);
+        for step in 1..=4 {
+            harness.hover_at(from.lerp(to, step as f32 / 4.0));
+            harness.run_steps(1);
+        }
+        harness.event(egui::Event::PointerButton { pos: to, button: PointerButton::Primary, pressed: false, modifiers });
+        harness.run_steps(2);
+    }
+
+    #[test]
+    fn decal_frame_rejects_a_stale_effect_after_failed_layer_selection() {
+        use texturecraft_engine::{StackTarget, execute};
+
+        for texture_set in [0, 1] {
+            let mut harness = decal_frame_app(false);
+            let original = DecalFrame::of(harness.state(), harness.state().viewport_rect).unwrap();
+            let effect = original.effect.unwrap();
+            let session = &mut harness.state_mut().session;
+            execute(session, "textureSet.select", &json!({"ts": texture_set})).unwrap();
+            let other = execute(session, "layer.add.paint", &json!({"name": "Other layer"})).unwrap()["layer"].clone();
+            execute(session, "layer.select", &json!({"layer": original.layer.0, "target": effect.0})).unwrap();
+
+            let selected = execute(session, "layer.select", &json!({"layer": other, "target": effect.0}));
+
+            assert!(selected.is_err());
+            assert_eq!(session.ts(), texture_set);
+            assert_eq!(session.selected_layer().unwrap().0, other.as_u64().unwrap());
+            assert_eq!(session.target, StackTarget::Effect(effect), "the failed selection leaves the previous effect target");
+            assert!(DecalFrame::of(harness.state(), harness.state().viewport_rect).is_none(), "a stale effect must not show a decal frame");
+
+            drag_decal_handle(&mut harness, original.corners[1], original.center + (original.corners[1] - original.center) * 1.5);
+            drag_decal_handle(&mut harness, original.knob, original.knob + vec2(40.0, 0.0));
+
+            let effect = &harness.state().session.doc.project.effect(effect).unwrap().1.kind;
+            assert!(
+                matches!(effect, texturecraft_engine::core::EffectKind::Fill { projection: texturecraft_engine::core::Projection::Decal(decal), .. } if *decal == original.decal)
+            );
+        }
+    }
+
+    #[test]
+    fn decal_frame_keeps_an_instances_inherited_mask_effect_editable() {
+        use texturecraft_engine::execute;
+
+        let mut harness = decal_frame_app(false);
+        let original = DecalFrame::of(harness.state(), harness.state().viewport_rect).unwrap();
+        let effect = original.effect.unwrap();
+        let session = &mut harness.state_mut().session;
+        let instance = execute(session, "layer.instance", &json!({"layer": original.layer.0, "ts": 1})).unwrap()["layer"].clone();
+
+        // The source effect remains a valid inherited target when selection changes to its instance
+        assert!(execute(session, "layer.select", &json!({"layer": instance, "target": effect.0})).is_err());
+
+        assert_eq!(session.ts(), 1);
+        assert_eq!(session.selected_layer().unwrap().0, instance.as_u64().unwrap());
+        let inherited = DecalFrame::of(harness.state(), harness.state().viewport_rect).unwrap();
+        assert_eq!((inherited.layer, inherited.effect, inherited.decal), (original.layer, original.effect, original.decal));
+
+        drag_decal_handle(&mut harness, inherited.corners[1], inherited.center + (inherited.corners[1] - inherited.center) * 1.5);
+
+        let edited = DecalFrame::of(harness.state(), harness.state().viewport_rect).unwrap();
+        assert!(edited.decal.size[0] > original.decal.size[0], "scaling an inherited decal edits its source");
+    }
+
+    #[test]
+    fn decal_frame_rejects_a_source_mask_overridden_by_the_selected_instance() {
+        use texturecraft_engine::execute;
+
+        let mut harness = decal_frame_app(false);
+        let original = DecalFrame::of(harness.state(), harness.state().viewport_rect).unwrap();
+        let effect = original.effect.unwrap();
+        let session = &mut harness.state_mut().session;
+        let instance = execute(session, "layer.instance", &json!({"layer": original.layer.0, "ts": 1})).unwrap()["layer"].clone();
+        execute(session, "mask.add.black", &json!({"layer": instance})).unwrap();
+        execute(session, "layer.select", &json!({"layer": original.layer.0, "target": effect.0})).unwrap();
+
+        assert!(execute(session, "layer.select", &json!({"layer": instance, "target": effect.0})).is_err());
+
+        assert!(DecalFrame::of(harness.state(), harness.state().viewport_rect).is_none(), "an override hides the source's mask decal");
+    }
+
+    #[test]
+    #[ignore = "requires an offscreen GPU adapter and TC_UI_SNAPSHOTS"]
+    fn decal_frame_selection_snapshots() {
+        use texturecraft_engine::execute;
+
+        let Some(directory) = std::env::var_os("TC_UI_SNAPSHOTS").map(std::path::PathBuf::from) else { return };
+
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut harness = decal_frame_app(true);
+        let original = DecalFrame::of(harness.state(), harness.state().viewport_rect).unwrap();
+        let effect = original.effect.unwrap();
+        let session = &mut harness.state_mut().session;
+        let instance = execute(session, "layer.instance", &json!({"layer": original.layer.0, "ts": 1})).unwrap()["layer"].clone();
+        assert!(execute(session, "layer.select", &json!({"layer": instance, "target": effect.0})).is_err());
+        harness.run_steps(6);
+
+        assert!(DecalFrame::of(harness.state(), harness.state().viewport_rect).is_some());
+        harness.render().unwrap().save(directory.join("decal-frame-inherited.png")).unwrap();
+
+        let session = &mut harness.state_mut().session;
+        let other = execute(session, "layer.add.paint", &json!({"name": "Other layer"})).unwrap()["layer"].clone();
+        execute(session, "layer.select", &json!({"layer": original.layer.0, "target": effect.0})).unwrap();
+        assert!(execute(session, "layer.select", &json!({"layer": other, "target": effect.0})).is_err());
+        harness.run_steps(6);
+
+        assert!(DecalFrame::of(harness.state(), harness.state().viewport_rect).is_none());
+        harness.render().unwrap().save(directory.join("decal-frame-stale.png")).unwrap();
+    }
 
     #[test]
     fn live_bake_preview_hides_setup_overlays_and_restores_their_preferences() {
