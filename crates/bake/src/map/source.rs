@@ -1,4 +1,5 @@
 use super::sampling::{generated_hue, interpolate, splitmix64};
+use crate::BakeRequest;
 use crate::tracing::{ANY, TraceMesh};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,6 +22,18 @@ pub(super) struct Source<'a> {
 }
 
 impl<'a> Source<'a> {
+    /// `request`'s low and high poly, their mesh names keyed from one shared table so the bake can match a low-poly part to its high-poly part
+    pub(super) fn of_request(request: &BakeRequest<'a>) -> (Source<'a>, Option<Source<'a>>) {
+        let settings = &request.settings.high_poly;
+        let mut name_keys = HashMap::new();
+        let low = Source::new(request.mesh, request.bvh, request.low_base_color, &[], &settings.low_suffix, settings, &mut name_keys);
+        let high = request.high.map(|high_mesh| {
+            Source::new(high_mesh.mesh, high_mesh.bvh, high_mesh.base_color, high_mesh.file_ids, &settings.high_suffix, settings, &mut name_keys)
+        });
+
+        (low, high)
+    }
+
     pub(super) fn new(
         mesh: &'a Mesh,
         bvh: &'a Bvh,

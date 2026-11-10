@@ -9,10 +9,13 @@
 
 mod baked_maps;
 pub mod below;
+mod curvature_size_level;
+pub mod curvature_sizes;
 pub mod display;
 pub mod eval;
 pub mod pattern;
 pub mod store;
+pub mod thumb;
 
 pub use below::{BelowCache, StackKey};
 pub use display::{DisplayKind, tile_bytes};
@@ -21,3 +24,4 @@ pub use eval::{
     mask_at, mask_image, pad_tiles,
 };
 pub use store::{BakedMaps, ImageRes, ImageStore, PixelStore};
+pub use thumb::{THUMB_TEXELS, ThumbImage, ThumbTarget};

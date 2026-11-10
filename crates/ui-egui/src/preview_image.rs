@@ -3,6 +3,7 @@
 use egui::{Color32, ColorImage};
 use texturecraft_engine::compose::ImageRes;
 use texturecraft_engine::core::ProceduralKind;
+use texturecraft_engine::geom::glam::Vec3;
 use texturecraft_engine::paint::alphas::{self, LibraryAlpha};
 use texturecraft_engine::paint::{BrushSettings, Shape};
 use texturecraft_engine::preview::{self, Sample};
@@ -12,6 +13,14 @@ use texturecraft_engine::texel::linear_to_srgb;
 const PROCEDURAL_SCALE: f32 = 3.0;
 /// Samples per pixel along each axis of the alpha swatches
 const ALPHA_SUPERSAMPLE: usize = 2;
+/// Normal tilt per height step, relative to the shape's radius in pixels
+const BUMP_PER_RADIUS: f32 = 0.75;
+/// Exposure of the shaded previews before tone mapping
+const EXPOSURE: f32 = 1.4;
+/// Gap between a preview's shape and the image edge in pixels
+const SHAPE_MARGIN_PX: f32 = 1.0;
+/// Guards the normal division against a zero vector
+const MIN_NORMAL_LENGTH: f32 = 1e-6;
 
 /// Linear shading for view-space normal `n`, viewed along +Z
 pub fn shade(n: [f32; 3], base: [f32; 3], metal: f32, rough: f32) -> [f32; 3] {
@@ -52,28 +61,52 @@ pub fn aces(x: f32) -> f32 {
 
 /// Shade row-major `size²` samples with height bumps and a transparent background
 pub fn sphere_image(size: usize, samples: &[Option<Sample>]) -> ColorImage {
-    let mut img = ColorImage::filled([size, size], Color32::TRANSPARENT);
-    let r = (size as f32 * 0.5 - 1.0).max(0.5);
-    let h = |x: Option<usize>, y: Option<usize>| {
-        let (x, y) = (x.filter(|x| *x < size)?, y?);
-        samples.get(y.checked_mul(size)?.checked_add(x)?).copied().flatten().map(|s| s.height)
-    };
-    for (i, n) in preview::sphere_normals(size).enumerate() {
-        let (Some(n), Some(Some(s))) = (n, samples.get(i)) else { continue };
+    let mut image = ColorImage::filled([size, size], Color32::TRANSPARENT);
+    let radius = preview_radius(size);
+    let height = |index: usize| samples.get(index).copied().flatten().map(|sample| sample.height);
 
-        let (x, y) = (i % size, i / size);
-        let c = s.height;
-        // Image Y points down; the shading normal uses Y up
-        let dx = h(Some(x + 1), Some(y)).unwrap_or(c) - h(x.checked_sub(1), Some(y)).unwrap_or(c);
-        let dy = h(Some(x), y.checked_sub(1)).unwrap_or(c) - h(Some(x), Some(y + 1)).unwrap_or(c);
-        let k = r * 0.5 * 1.5;
-        let b = [n.x - dx * k, n.y - dy * k, n.z];
-        let len = (b[0] * b[0] + b[1] * b[1] + b[2] * b[2]).sqrt().max(1e-6);
-        let col = shade(b.map(|v| v / len), s.base, s.metallic, s.roughness).map(|v| (linear_to_srgb(aces(v * 1.4)) * 255.0 + 0.5) as u8);
-        let edge = ((1.0 - (n.x * n.x + n.y * n.y).sqrt()) * r).clamp(0.0, 1.0);
-        img.pixels[i] = Color32::from_rgba_unmultiplied(col[0], col[1], col[2], (edge * 255.0) as u8);
+    for (index, normal) in preview::sphere_normals(size).enumerate() {
+        let (Some(normal), Some(Some(sample))) = (normal, samples.get(index)) else { continue };
+
+        // Anti-aliased outline: opaque from one pixel inside the rim
+        let coverage = ((1.0 - (normal.x * normal.x + normal.y * normal.y).sqrt()) * radius).clamp(0.0, 1.0);
+        image.pixels[index] = lit_pixel(normal, height_slope(size, index, sample.height, height), radius, sample, coverage);
     }
-    img
+    image
+}
+
+/// Radius in pixels of the shape filling a `size²` preview
+pub(crate) fn preview_radius(size: usize) -> f32 {
+    (size as f32 * 0.5 - SHAPE_MARGIN_PX).max(0.5)
+}
+
+/// Height change per pixel rightwards and upwards at `pixel`; None heights count as `center`
+pub(crate) fn height_slope(size: usize, pixel: usize, center: f32, height: impl Fn(usize) -> Option<f32>) -> [f32; 2] {
+    let (x, y) = (pixel % size, pixel / size);
+    let at = |x: Option<usize>, y: Option<usize>| {
+        let (x, y) = (x.filter(|x| *x < size)?, y?);
+        height(y.checked_mul(size)?.checked_add(x)?)
+    };
+
+    // Image Y points down; the shading normal uses Y up
+    let right = at(Some(x + 1), Some(y)).unwrap_or(center) - at(x.checked_sub(1), Some(y)).unwrap_or(center);
+    let up = at(Some(x), y.checked_sub(1)).unwrap_or(center) - at(Some(x), Some(y + 1)).unwrap_or(center);
+    [right, up]
+}
+
+/// Tilt a view-space normal by the height `slope` on a shape of `radius` pixels
+pub(crate) fn bumped_normal(normal: Vec3, slope: [f32; 2], radius: f32) -> Vec3 {
+    let bump = radius * BUMP_PER_RADIUS;
+    let bumped = [normal.x - slope[0] * bump, normal.y - slope[1] * bump, normal.z];
+    let length = (bumped[0] * bumped[0] + bumped[1] * bumped[1] + bumped[2] * bumped[2]).sqrt().max(MIN_NORMAL_LENGTH);
+    Vec3::from(bumped.map(|component| component / length))
+}
+
+/// One sphere pixel of `sample`, bumped by `slope` and `coverage` opaque
+fn lit_pixel(normal: Vec3, slope: [f32; 2], radius: f32, sample: &Sample, coverage: f32) -> Color32 {
+    let linear = shade(bumped_normal(normal, slope, radius).to_array(), sample.base, sample.metallic, sample.roughness);
+    let color = linear.map(|component| (linear_to_srgb(aces(component * EXPOSURE)) * 255.0 + 0.5) as u8);
+    Color32::from_rgba_unmultiplied(color[0], color[1], color[2], (coverage * 255.0) as u8)
 }
 
 /// Grayscale `size²` swatch of procedural `kind`

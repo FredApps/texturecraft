@@ -20,6 +20,7 @@ const AUTO_MIN_SHARE: f64 = 0.001;
 /// The properties of levels effect `effect_id` of `layer`; every edit goes through `effect.set`
 pub(crate) fn levels_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, effect_id: LayerId, levels: &Levels) {
     ui.label(caption(tr("Levels")));
+
     let is_content = layer.content_effects.iter().any(|effect| effect.id == effect_id);
     let channels: Vec<Channel> =
         if is_content { layer.channels.keys().copied().filter(|channel| channel.kind() != ChannelKind::NormalMap).collect() } else { Vec::new() };
@@ -87,6 +88,16 @@ pub(crate) fn levels_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &
 /// The histogram levels effect `effect_id` remaps, recomputed after a change once no pointer button is held
 fn histogram_counts(app: &TextureCraftApp, ui: &Ui, effect_id: LayerId, channel: Channel) -> Option<Arc<Vec<u32>>> {
     let key = egui::Id::unique(("levels_histogram", effect_id.0, channel));
+    let owner = ui.make_persistent_id("levels_histogram_owner");
+
+    // Selection changes the revision, so old effects' histograms cannot be reused
+    ui.data_mut(|data| {
+        let previous = std::mem::replace(data.get_temp_mut_or(owner, key), key);
+        if previous != key {
+            data.remove::<(u64, Arc<Vec<u32>>)>(previous);
+        }
+    });
+
     let revision = app.session.revision;
     match ui.data(|data| data.get_temp::<(u64, Arc<Vec<u32>>)>(key)) {
         Some((cached, counts)) if cached == revision || ui.input(|input| input.pointer.any_down()) => Some(counts),
@@ -104,8 +115,8 @@ fn auto_input_range(counts: &[u32]) -> Option<(f32, f32)> {
     let holds_enough = |count: &u32| f64::from(*count) > total as f64 * AUTO_MIN_SHARE;
     let first = counts.iter().position(holds_enough)?;
     let last = counts.iter().rposition(holds_enough)?;
-    let buckets = counts.len() as f32;
-    Some((first as f32 / buckets, (last + 1) as f32 / buckets))
+    let bucket_count = counts.len() as f32;
+    Some((first as f32 / bucket_count, (last + 1) as f32 / bucket_count))
 }
 
 #[cfg(test)]
@@ -119,6 +130,7 @@ mod tests {
         counts[10] = 5_000;
         counts[40] = 5_000;
         counts[60] = 1;
+
         assert_eq!(auto_input_range(&counts), Some((10.0 / HISTOGRAM_BUCKETS as f32, 41.0 / HISTOGRAM_BUCKETS as f32)));
     }
 

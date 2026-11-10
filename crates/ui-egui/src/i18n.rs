@@ -134,12 +134,14 @@ pub fn os_language() -> &'static str {
     locale.map_or("en", |l| language_for_locale(&l))
 }
 
+/// Tests that switch the global UI language, or draw the UI under it, run one at a time.
+#[cfg(test)]
+pub(crate) static TEST_LANGUAGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
+    use super::TEST_LANGUAGE as LANGUAGE;
     use super::*;
-
-    /// Tests that switch the global UI language run one at a time.
-    static LANGUAGE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Every key the UI looks up: `tr("…")` / `trf("…"` literals in the sources, plus the
     /// static catalogs whose labels are translated where they are shown.

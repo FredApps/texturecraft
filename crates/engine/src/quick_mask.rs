@@ -105,34 +105,37 @@ impl Session {
     /// Includes the stroke in progress.
     pub fn quick_mask_rgba(&self, ts: usize, size: u32) -> Option<Vec<u8>> {
         let cache = self.caches.get(ts)?;
-        let (w, h) = cache.size;
-        let size = size.clamp(1, w.max(h));
+        let (width, height) = cache.size;
+        let size = size.clamp(1, width.max(height));
         let mask = self.quick_mask_image(ts, cache.size);
         let live = self.stroke.as_ref().filter(|s| s.ts == ts && s.target.is_none()).map(|s| (&s.canvas.alpha, s.stroke.settings.opacity, s.erase));
         let base = cache.composite.channels.get(&Channel::BaseColor);
-        let lut = srgb_lut();
+        let srgb = srgb_lut();
         let inverted = self.quick_mask.inverted;
         let mut out = vec![255u8; size as usize * size as usize * 4];
+
         out.par_chunks_mut(size as usize * 4).enumerate().for_each(|(y, row)| {
-            let ty = (y as u64 * u64::from(h) / u64::from(size)) as u32;
-            for (x, px) in row.chunks_exact_mut(4).enumerate() {
-                let tx = (x as u64 * u64::from(w) / u64::from(size)) as u32;
-                let mut m = from_u16(mask.get(tx, ty)[0]);
+            let ty = (y as u64 * u64::from(height) / u64::from(size)) as u32;
+            for (x, pixel) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                let tx = (x as u64 * u64::from(width) / u64::from(size)) as u32;
+                let mut coverage = from_u16(mask.get(tx, ty)[0]);
                 if let Some((alpha, opacity, erase)) = live {
-                    let a = from_u16(alpha.get(tx, ty)[0]) * opacity;
-                    m = if erase { m * (1.0 - a) } else { a + m * (1.0 - a) };
+                    let stroke_coverage = from_u16(alpha.get(tx, ty)[0]) * opacity;
+                    coverage = if erase { coverage * (1.0 - stroke_coverage) } else { stroke_coverage + coverage * (1.0 - stroke_coverage) };
                 }
-                let blocked = if inverted { m } else { 1.0 - m };
+
+                let blocked = if inverted { coverage } else { 1.0 - coverage };
                 let raw = base.map(|b| b.get(tx, ty)).unwrap_or([32768; 4]);
-                let t = 0.55 * blocked;
+                let tint_amount = 0.55 * blocked;
                 for (k, tint) in [0.9, 0.1, 0.15].into_iter().enumerate() {
-                    let c = f32::from(lut.get(usize::from(raw[k] >> 4)).copied().unwrap_or(0)) / 255.0;
-                    if let Some(slot) = px.get_mut(k) {
-                        *slot = ((c + (tint - c) * t).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                    let color = f32::from(srgb.get(usize::from(raw[k] >> 4)).copied().unwrap_or(0)) / 255.0;
+                    if let Some(slot) = pixel.get_mut(k) {
+                        *slot = ((color + (tint - color) * tint_amount).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                     }
                 }
             }
         });
+
         Some(out)
     }
 }

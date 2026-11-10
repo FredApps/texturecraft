@@ -7,12 +7,22 @@ use texturecraft_compose::PaintTarget;
 use texturecraft_core::{Channel, Effect, EffectKind, LayerId, LayerKind, Mask, MaskBackground};
 use texturecraft_geom::glam::Vec2;
 use texturecraft_paint::{
-    CommitSource, EyeDepth, PickCtx, Pickup, PickupMode, RasterCtx, Shape, Staging, Stroke, StrokeCanvas, SurfaceHit, commit_layer, commit_mask,
-    fill_triangles, pick, rasterize,
+    CommitSource, EyeDepth, PickCtx, Pickup, PickupMode, RasterCtx, Shape, Staging, Stroke, StrokeCanvas, SurfaceHit, commit_layer, commit_mask, pick,
+    rasterize,
 };
 
-use crate::session::{ActiveStroke, CloneFrom, FillMode, Session, StackTarget, Tool};
+use crate::session::{ActiveStroke, CloneFrom, Session, StackTarget, Tool};
+use crate::uv_stroke_state::UvStrokeState;
 use crate::{EngineError, Result};
+
+/// Shortest distance between 2D view stamps, so a stamp with no radius (a pen at zero pressure) can't stall a stroke.
+const MIN_UV_STAMP_STEP: f32 = 1e-5;
+
+/// 2D view stamps rasterized together, bounding the memory of one batch.
+const UV_STAMP_BATCH: usize = 4096;
+
+/// Covers a UV diagonal at the minimum step (about 142k stamps), including light pen pressure, while bounding hostile coordinates
+const MAX_UV_STAMPS_PER_SAMPLE: usize = 150_000;
 
 impl Session {
     /// Camera visibility for a stroke at `viewport` (cached until the camera, size or mesh change).
@@ -145,6 +155,7 @@ impl Session {
     /// Common setup of 3D and 2D strokes. `first_uv` is where the stroke starts on the mesh
     /// (the Clone tool's destination anchor).
     fn start_stroke(&mut self, viewport: Vec2, uv_mode: bool, first_uv: Option<Vec2>) -> Result<()> {
+        self.refuse_while_baking()?;
         let tool = self.tool.tool;
         let erase = tool == Tool::Eraser;
         let quick_mask = self.quick_mask.editing;
@@ -234,7 +245,7 @@ impl Session {
             stroke,
             canvas,
             depth,
-            uv: uv_mode.then_some((None, 0.0)),
+            uv: uv_mode.then(UvStrokeState::default),
             camera: self.camera,
             viewport,
             values,
@@ -286,9 +297,18 @@ impl Session {
         Some(texturecraft_compose::Stencil { image, view_proj: self.camera.view_proj(aspect), center, half, rotation, tile: st.tile })
     }
 
+    /// Painting is paused while a bake preview shows the baked maps instead of the material.
+    pub(crate) fn refuse_while_baking(&self) -> Result<()> {
+        match self.painting_blocked() {
+            Some(why) => Err(EngineError::Other(why.into())),
+            None => Ok(()),
+        }
+    }
+
     /// Start a stroke at `screen` (viewport pixels). Returns false when the cursor misses the
     /// mesh (the stroke starts anyway and resumes when the cursor enters the mesh).
     pub fn begin_stroke(&mut self, screen: Vec2, viewport: Vec2, pressure: f32) -> Result<bool> {
+        self.refuse_while_baking()?;
         self.cancel_stroke();
         match self.tool.tool {
             Tool::PolygonFill => return self.polygon_fill(screen, viewport).map(|_| true),
@@ -301,12 +321,16 @@ impl Session {
         Ok(self.continue_stroke(screen, pressure))
     }
 
-    /// Start a stroke in the 2D view at texture coordinate `uv`.
+    /// Start a stroke in the 2D view at texture coordinate `uv` (polygon fill fills there).
     pub fn begin_stroke_uv(&mut self, uv: Vec2, pressure: f32) -> Result<()> {
+        self.refuse_while_baking()?;
         self.cancel_stroke();
-        if matches!(self.tool.tool, Tool::PolygonFill | Tool::ColorPicker | Tool::GeometryMask) {
-            return Err(EngineError::Other("use this tool in the 3D view".into()));
+        match self.tool.tool {
+            Tool::PolygonFill => return self.polygon_fill_uv(uv).map(|_| ()),
+            Tool::ColorPicker | Tool::GeometryMask => return Err(EngineError::Other("use this tool in the 3D view".into())),
+            _ => {}
         }
+
         self.start_stroke(self.viewport, true, Some(uv))?;
         self.continue_stroke_uv(uv, pressure);
         Ok(())
@@ -314,40 +338,49 @@ impl Session {
 
     /// Add a 2D view sample (texture coordinates). Brush size is relative to the UV square.
     pub fn continue_stroke_uv(&mut self, uv: Vec2, pressure: f32) {
-        let Some(st) = self.stroke.as_mut() else { return };
-        let Some((last, carry)) = st.uv.as_mut() else { return };
-        let Some(cache) = self.caches.get_mut(st.ts) else { return };
-        let b = &st.stroke.settings;
-        let p = pressure.clamp(0.0, 1.0);
-        let radius = b.size * 2.0 * if p < 1.0 { b.min_size + (1.0 - b.min_size) * p } else { 1.0 };
-        let step = (b.spacing * 2.0 * radius).max(1e-5);
-        let mut points = Vec::new();
-        match *last {
-            None => points.push(uv),
-            Some(prev) => {
-                let seg = uv - prev;
-                let len = seg.length();
-                let mut t = step - *carry;
-                while t <= len && points.len() < 4096 {
-                    points.push(prev + seg * (t / len.max(1e-9)));
-                    t += step;
-                }
-                *carry = len - (t - step);
-            }
-        }
-        // Follow path: turn the stamp with the stroke direction (y up on screen, v grows down).
-        let angle = match *last {
-            Some(prev) if b.follow_path && uv != prev => b.angle + (prev.y - uv.y).atan2(uv.x - prev.x).to_degrees() - 90.0,
-            _ => b.angle,
+        let Some(active) = self.stroke.as_mut() else { return };
+        let Some(progress) = active.uv.as_mut() else { return };
+        let Some(cache) = self.caches.get_mut(active.ts) else { return };
+
+        let settings = &active.stroke.settings;
+        let pressure = pressure.clamp(0.0, 1.0);
+        let size_scale = if pressure < 1.0 { settings.min_size + (1.0 - settings.min_size) * pressure } else { 1.0 };
+        let radius = settings.size * 2.0 * size_scale;
+        let step = (settings.spacing * 2.0 * radius).max(MIN_UV_STAMP_STEP);
+
+        // Follow path: turn the stamp with the stroke direction (y up on screen, v grows down)
+        let angle = match progress.last {
+            Some(previous) if settings.follow_path && uv != previous => settings.angle + (previous.y - uv.y).atan2(uv.x - previous.x).to_degrees() - 90.0,
+            _ => settings.angle,
         };
-        *last = Some(uv);
-        let n0 = st.stroke.stamps.len() as u32;
-        let stamps: Vec<texturecraft_paint::UvStamp> = points
-            .iter()
-            .enumerate()
-            .map(|(i, c)| texturecraft_paint::UvStamp { center: *c, radius, angle, flow: b.flow, hardness: b.hardness, seed: n0 + i as u32 })
-            .collect();
-        texturecraft_paint::rasterize_uv(&mut st.canvas, &cache.gbuf, Self::shape(&self.images, b), &stamps);
+
+        // The first sample is one stamp; a later one stamps every `step` along the segment from the previous
+        let (start, segment, mut distance) = match progress.last.replace(uv) {
+            None => (uv, Vec2::ZERO, 0.0),
+            // Pressure can shrink the step below the carry from the preceding sample
+            Some(previous) => (previous, uv - previous, (step - progress.carry).max(0.0)),
+        };
+        let length = segment.length();
+        let shape = Self::shape(&self.images, settings);
+        let mut batch = Vec::new();
+        let mut stamped = 0;
+        while distance <= length && stamped < MAX_UV_STAMPS_PER_SAMPLE {
+            let batch_size = UV_STAMP_BATCH.min(MAX_UV_STAMPS_PER_SAMPLE - stamped);
+            batch.clear();
+            while distance <= length && batch.len() < batch_size {
+                let center = start + segment * (distance / length.max(f32::MIN_POSITIVE));
+                let seed = progress.stamps.wrapping_add((stamped + batch.len()) as u32);
+                batch.push(texturecraft_paint::UvStamp { center, radius, angle, flow: settings.flow, hardness: settings.hardness, seed });
+                distance += step;
+            }
+
+            stamped += batch.len();
+            texturecraft_paint::rasterize_uv(&mut active.canvas, &cache.gbuf, shape, &batch);
+        }
+
+        // At most one step, so a segment cut off at the stamp limit can't push the next one's stamps backwards
+        progress.carry = (length - (distance - step)).min(step);
+        progress.stamps = progress.stamps.wrapping_add(stamped as u32);
         self.stroke_painted();
     }
 
@@ -482,21 +515,6 @@ impl Session {
         Ok(tiles)
     }
 
-    /// Polygon fill: fill the triangle / UV island / whole mesh under `screen`.
-    pub fn polygon_fill(&mut self, screen: Vec2, viewport: Vec2) -> Result<usize> {
-        let hit = self.pick(screen, viewport).ok_or_else(|| EngineError::Other("nothing under the cursor".into()))?;
-        let ts = self.ts();
-        let material = self.doc.project.texture_set(ts)?.material;
-        if hit.material != material {
-            return Err(EngineError::Other("that surface belongs to another texture set".into()));
-        }
-        let tris = self.fill_set(hit.tri, material);
-        let (gbuf, mut canvas) = self.fill_canvas(ts)?;
-        fill_triangles(&mut canvas, &gbuf, &tris);
-        self.commit_fill("Polygon fill", ts, &canvas)?;
-        Ok(tris.len())
-    }
-
     /// The G-buffer of texture set `ts` and an empty canvas for a one-shot fill, limited by the
     /// quick mask unless the fill edits it.
     pub(crate) fn fill_canvas(&self, ts: usize) -> Result<(std::sync::Arc<texturecraft_geom::UvGBuffer>, StrokeCanvas)> {
@@ -510,61 +528,31 @@ impl Session {
 
     /// Commit a one-shot fill with the tool's material (one undo step), or into the quick mask.
     pub(crate) fn commit_fill(&mut self, label: &str, ts: usize, canvas: &StrokeCanvas) -> Result<()> {
-        let size = (canvas.alpha.width(), canvas.alpha.height());
-        let src = |opacity| CommitSource { alpha: &canvas.alpha, tiles: &canvas.dirty, opacity, erase: false, per_texel: None, carried: None };
         if self.quick_mask.editing {
-            self.commit_quick_mask(ts, size, src(self.tool.brush.opacity));
-            return Ok(());
+            return self.paint_fill(ts, canvas);
         }
-        self.edit(label, |s| {
-            let target = s.paint_target()?;
-            let values = s.stroke_values(target);
-            match target {
-                PaintTarget::Layer(id) => commit_layer(&mut s.doc.pixels, id, size, &values, src(s.tool.brush.opacity), &mut Staging::default()),
-                PaintTarget::Mask(eid) => commit_mask(&mut s.doc.pixels, eid, size, s.tool.mask_value, src(s.tool.brush.opacity), &mut Staging::default()),
-            }
-            Ok(())
-        })
+
+        // Each fill is its own step, never merged into a box drag's step of the same label
+        self.edit_merging(label, false, |session| session.paint_fill(ts, canvas))
     }
 
-    /// Triangles filled by the current fill mode starting from `tri`.
-    fn fill_set(&self, tri: u32, material: usize) -> BTreeSet<u32> {
-        let m = &self.mesh;
-        match self.tool.fill_mode {
-            FillMode::Triangle => [tri].into_iter().collect(),
-            FillMode::Mesh => m.triangles_of(material).map(|t| t as u32).collect(),
-            FillMode::UvIsland => {
-                // Triangles sharing an edge in UV space form a UV island: imported meshes often
-                // split vertices along hard edges (or per face) where the UVs run on, so shared
-                // vertex indices alone break an island into its polygons.
-                let corner = |i: usize| m.uvs.get(i).map(|uv| [(uv.x * 1e5).round() as i64, (uv.y * 1e5).round() as i64]);
-                let edges = |t: usize| match m.tri(t).map(|v| v.map(corner)) {
-                    Some([Some(a), Some(b), Some(c)]) => [(a, b), (b, c), (c, a)].map(|(p, q)| (p.min(q), p.max(q))).to_vec(),
-                    _ => Vec::new(),
-                };
-                let mut by_edge: BTreeMap<_, Vec<u32>> = BTreeMap::new();
-                for t in m.triangles_of(material) {
-                    for e in edges(t) {
-                        by_edge.entry(e).or_default().push(t as u32);
-                    }
-                }
-                let mut seen = BTreeSet::new();
-                let mut stack = vec![tri];
-                while let Some(t) = stack.pop() {
-                    if !seen.insert(t) {
-                        continue;
-                    }
-                    for e in edges(t as usize) {
-                        for n in by_edge.get(&e).map(Vec::as_slice).unwrap_or(&[]) {
-                            if !seen.contains(n) {
-                                stack.push(*n);
-                            }
-                        }
-                    }
-                }
-                seen
-            }
+    /// Paint a one-shot fill with the tool's material into the paint target, or into the quick mask while it is edited (no undo step)
+    pub(crate) fn paint_fill(&mut self, ts: usize, canvas: &StrokeCanvas) -> Result<()> {
+        let size = (canvas.alpha.width(), canvas.alpha.height());
+        let opacity = self.tool.brush.opacity;
+        let source = CommitSource { alpha: &canvas.alpha, tiles: &canvas.dirty, opacity, erase: false, per_texel: None, carried: None };
+        if self.quick_mask.editing {
+            self.commit_quick_mask(ts, size, source);
+            return Ok(());
         }
+
+        let target = self.paint_target()?;
+        let values = self.stroke_values(target);
+        match target {
+            PaintTarget::Layer(id) => commit_layer(&mut self.doc.pixels, id, size, &values, source, &mut Staging::default()),
+            PaintTarget::Mask(effect) => commit_mask(&mut self.doc.pixels, effect, size, self.tool.mask_value, source, &mut Staging::default()),
+        }
+        Ok(())
     }
 
     /// Color picker: copy the material under the cursor into the tool's paint values.
@@ -626,35 +614,4 @@ fn with_commit_source<R>(
     let per_texel: Option<texturecraft_paint::TexelFn> = if st.stencil.is_some() { Some(&stencil_fn) } else { None };
     let carried = st.canvas.pickup.as_ref().map(|p| &p.values);
     f(CommitSource { alpha: &st.canvas.alpha, tiles, opacity: st.stroke.settings.opacity, erase: st.erase, per_texel, carried })
-}
-
-#[cfg(test)]
-mod tests {
-    use texturecraft_geom::glam::{Vec2, Vec3};
-    use texturecraft_geom::mesh::Mesh;
-    use texturecraft_geom::primitives;
-
-    use crate::session::{FillMode, Session};
-
-    #[test]
-    fn uv_island_fill_follows_uvs_across_split_vertices() {
-        // Two copies of a plane, each triangle with its own three vertices (as hard edges or
-        // per-face imports leave a mesh), the second copy apart in UV space.
-        let plane = primitives::plane(2.0, 4);
-        let (mut positions, mut uvs) = (Vec::<Vec3>::new(), Vec::<Vec2>::new());
-        for shift in [0.0, 0.5] {
-            for i in plane.indices.iter().map(|i| *i as usize) {
-                positions.push(plane.positions[i] + Vec3::Y * shift);
-                uvs.push(plane.uvs[i] * 0.5 + shift);
-            }
-        }
-        let indices = (0..positions.len() as u32).collect();
-        let mesh = Mesh::from_parts(positions, None, uvs, indices, "m").unwrap();
-        let n = plane.triangle_count();
-        assert_eq!(mesh.vertex_count(), 6 * n, "no vertex is shared");
-        let mut s = Session::new_project("t", mesh, "test", None, 128).unwrap();
-        s.tool.fill_mode = FillMode::UvIsland;
-        assert_eq!(s.fill_set(0, 0).len(), n, "the whole first island");
-        assert_eq!(s.fill_set(n as u32, 0).len(), n, "only the second island");
-    }
 }

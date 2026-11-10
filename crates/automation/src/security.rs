@@ -178,8 +178,11 @@ pub struct ConnectionLimiter(Arc<AtomicUsize>);
 pub struct Permit(Arc<AtomicUsize>);
 
 impl ConnectionLimiter {
-    pub fn try_acquire(&self, max: usize) -> Option<Permit> {
-        self.0.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < max).then_some(n + 1)).ok().map(|_| Permit(self.0.clone()))
+    pub fn try_acquire(&self, max_connections: usize) -> Option<Permit> {
+        self.0
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |connections| (connections < max_connections).then_some(connections + 1))
+            .ok()
+            .map(|_| Permit(self.0.clone()))
     }
 }
 
@@ -328,10 +331,12 @@ mod tests {
 
     #[test]
     fn limiter_releases() {
-        let l = ConnectionLimiter::default();
-        let p = l.try_acquire(1).unwrap();
-        assert!(l.try_acquire(1).is_none());
-        drop(p);
-        assert!(l.try_acquire(1).is_some());
+        let limiter = ConnectionLimiter::default();
+
+        let permit = limiter.try_acquire(1).unwrap();
+        assert!(limiter.try_acquire(1).is_none());
+
+        drop(permit);
+        assert!(limiter.try_acquire(1).is_some());
     }
 }

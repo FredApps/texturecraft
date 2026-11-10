@@ -1,8 +1,9 @@
-//! The levels editor: draggable handles over a histogram and an output gradient, double-click to type a value
+//! Levels handles over a histogram and output gradient, with labelled fields for exact values
 
 use egui::{Color32, CornerRadius, CursorIcon, Id, Pos2, Rect, Response, Sense, Stroke, Ui, WidgetInfo, pos2, vec2};
 use texturecraft_engine::core::Levels;
 
+use crate::i18n::tr;
 use crate::levels_handle::LevelsHandle;
 use crate::theme::Tokens;
 
@@ -13,16 +14,16 @@ const HANDLE_HALF_WIDTH: f32 = 5.0;
 /// Height of a handle's straight sides; the rest is its tip pointing at the track
 const HANDLE_SIDE_HEIGHT: f32 = 6.0;
 
-/// Extra width on each side of a handle that still grabs it
-const HANDLE_GRAB_MARGIN: f32 = 2.0;
+/// A larger target than the painted pointer makes handles easier to grab
+const HANDLE_TARGET_SIZE: f32 = 24.0;
+
+/// Fraction of the track moved by one arrow key press
+const KEYBOARD_STEP: f32 = 0.01;
 
 const GRADIENT_HEIGHT: f32 = 8.0;
 const GAP_BELOW_HISTOGRAM: f32 = 3.0;
 const VALUE_ROW_HEIGHT: f32 = 16.0;
-const VALUE_FONT_SIZE: f32 = 10.5;
-
-/// Width of the box a value is typed into
-const TYPED_VALUE_WIDTH: f32 = 52.0;
+const VALUE_FONT_SIZE: f32 = 11.5;
 
 /// Padding of the histogram well around its bars
 const WELL_PADDING: f32 = 3.0;
@@ -33,14 +34,11 @@ const GAMMA_HANDLE_GRAY: u8 = 128;
 /// Grid lines across the histogram, at these fractions of its width
 const GRID_FRACTIONS: [f32; 3] = [0.25, 0.5, 0.75];
 
-/// Decimals of a value typed in or printed beside a handle (printed without trailing zeros)
+/// Decimals printed beside a handle; exact entry keeps the stored precision
 const VALUE_DECIMALS: usize = 3;
 
 /// Space kept around a printed value; a value closer to one already printed is left out
 const VALUE_SPACING: f32 = 2.0;
-
-/// Text margin inside the box a value is typed into
-const TYPED_VALUE_MARGIN: egui::Vec2 = vec2(2.0, 1.0);
 
 /// Opacity of the shade over the histogram outside the input range
 const OUTSIDE_RANGE_SHADE: f32 = 0.7;
@@ -59,14 +57,19 @@ pub fn levels_editor(ui: &mut Ui, id_salt: impl std::hash::Hash + std::fmt::Debu
 
     // Gamma goes last so it stays grabbable between input handles that close in on it
     let handles = [LevelsHandle::InputLow, LevelsHandle::InputHigh, LevelsHandle::Gamma, LevelsHandle::OutputLow, LevelsHandle::OutputHigh];
+    forget_previous_editor(ui, id, &handles);
+
     let mut edit = None;
     let mut responses = Vec::with_capacity(handles.len());
+    let mut focus_value = None;
     for handle in handles {
         let x = track_x(&track, handle.position(levels));
         let top = handle_top(rect, handle);
-        let grab_half_width = HANDLE_HALF_WIDTH + HANDLE_GRAB_MARGIN;
-        let hit = Rect::from_x_y_ranges(x - grab_half_width..=x + grab_half_width, top..=top + HANDLE_HEIGHT);
-        let response = ui.interact(hit, id.with(handle), Sense::click_and_drag()).on_hover_cursor(CursorIcon::PointingHand);
+        let hit = Rect::from_center_size(pos2(x, top + HANDLE_HEIGHT / 2.0), vec2(HANDLE_TARGET_SIZE, HANDLE_TARGET_SIZE));
+        let response = ui
+            .interact(hit, id.with(handle), Sense::click_and_drag())
+            .on_hover_cursor(CursorIcon::ResizeHorizontal)
+            .on_hover_text(tr("Double-click or press Enter to edit"));
         if response.drag_started() {
             ui.data_mut(|data| data.remove_temp::<bool>(response.id));
         }
@@ -82,25 +85,82 @@ pub fn levels_editor(ui: &mut Ui, id_salt: impl std::hash::Hash + std::fmt::Debu
             }
         }
 
+        edit = edit.or(handle_keys(ui, &response, handle, levels));
+        if response.double_clicked() || (response.has_focus() && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter))) {
+            focus_value = Some(handle);
+        }
+
         let value = handle.value(levels);
         response.widget_info(|| WidgetInfo::slider(true, f64::from(value), handle.label()));
+        let range = handle.value_range(levels);
+        ui.ctx().accesskit_node_builder(response.id, |node| {
+            use egui::accesskit::Action;
+
+            node.set_min_numeric_value(f64::from(*range.start()));
+            node.set_max_numeric_value(f64::from(*range.end()));
+            node.add_action(Action::SetValue);
+            if value < *range.end() {
+                node.add_action(Action::Increment);
+            }
+            if value > *range.start() {
+                node.add_action(Action::Decrement);
+            }
+        });
         responses.push((handle, response));
     }
-
-    let typing_id = id.with("typing");
-    let double_clicked = responses.iter().find(|(_, response)| response.double_clicked()).map(|(handle, _)| *handle);
-    if let Some(handle) = double_clicked {
-        start_typing(ui, typing_id, handle, levels);
-    }
-
-    let typing = ui.data(|data| data.get_temp::<(LevelsHandle, String)>(typing_id));
 
     let well = Rect::from_x_y_ranges(rect.x_range().shrink(HANDLE_HALF_WIDTH), histogram_top..=histogram_top + HISTOGRAM_HEIGHT);
     paint_histogram(ui, well, counts.unwrap_or_default(), levels);
     paint_output_gradient(ui, Rect::from_x_y_ranges(track, gradient_top..=gradient_top + GRADIENT_HEIGHT));
-    paint_handles_and_values(ui, rect, &responses, levels, typing.as_ref().map(|(handle, _)| *handle));
-    let typed = typing.and_then(|(handle, text)| typed_value(ui, rect, typing_id, (handle, text), double_clicked.is_some(), levels));
-    edit.or(typed)
+    paint_handles_and_values(ui, rect, &responses, levels);
+
+    let cancel_typing = responses.iter().any(|(_, response)| response.is_pointer_button_down_on());
+    let fields = [LevelsHandle::InputLow, LevelsHandle::Gamma, LevelsHandle::InputHigh, LevelsHandle::OutputLow, LevelsHandle::OutputHigh];
+    let mut labels = Vec::with_capacity(fields.len());
+
+    // A shared label row keeps the fields aligned when translated names wrap
+    ui.columns(fields.len(), |columns| {
+        for (ui, handle) in columns.iter_mut().zip(fields) {
+            let label =
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| ui.label(egui::RichText::new(handle.label()).size(VALUE_FONT_SIZE))).inner;
+            labels.push(label.id);
+        }
+    });
+
+    let mut invalid = false;
+    ui.columns(fields.len(), |columns| {
+        for ((ui, handle), label) in columns.iter_mut().zip(fields).zip(labels) {
+            let (typed, field_invalid) = number_field(ui, id.with((handle, "value")), label, handle, levels, focus_value == Some(handle), cancel_typing);
+            edit = edit.or(typed);
+            invalid |= field_invalid;
+        }
+    });
+    if invalid {
+        ui.colored_label(Tokens::get(ui.ctx()).warning, tr("Enter a finite number"));
+    }
+
+    edit
+}
+
+/// Properties shows one effect at a time; its old cursor, draft and drag state must not accumulate
+fn forget_previous_editor(ui: &Ui, id: Id, handles: &[LevelsHandle]) {
+    let owner = ui.make_persistent_id("levels_editor_owner");
+    ui.data_mut(|data| {
+        let previous = data.get_temp::<Id>(owner);
+        if previous == Some(id) {
+            return;
+        }
+
+        if let Some(previous) = previous {
+            for handle in handles {
+                let field = previous.with((handle, "value"));
+                data.remove::<egui::text_edit::TextEditState>(field);
+                data.remove::<(String, bool)>(field);
+                data.remove::<bool>(previous.with(handle));
+            }
+        }
+        data.insert_temp(owner, id);
+    });
 }
 
 fn handle_top(rect: Rect, handle: LevelsHandle) -> f32 {
@@ -195,15 +255,15 @@ fn paint_output_gradient(ui: &Ui, strip: Rect) {
 }
 
 /// Each handle filled with its gray, the active one on top, and its value beside it, overlapping values left out
-fn paint_handles_and_values(ui: &Ui, rect: Rect, responses: &[(LevelsHandle, Response)], levels: &Levels, typing: Option<LevelsHandle>) {
+fn paint_handles_and_values(ui: &Ui, rect: Rect, responses: &[(LevelsHandle, Response)], levels: &Levels) {
     let track = track(rect);
     let tokens = Tokens::get(ui.ctx());
     let painter = ui.painter();
-    let is_active = |response: &Response| response.dragged() || response.hovered();
+    let priority = |response: &Response| (response.dragged(), response.hovered(), response.has_focus());
 
     // Active handles last, so the one on top is the one the pointer grabs
     let mut by_paint_order: Vec<&(LevelsHandle, Response)> = responses.iter().collect();
-    by_paint_order.sort_by_key(|(_, response)| is_active(response));
+    by_paint_order.sort_by_key(|(_, response)| priority(response));
     for &(handle, ref response) in by_paint_order {
         let x = track_x(&track, handle.position(levels));
         let fill = match handle {
@@ -212,7 +272,7 @@ fn paint_handles_and_values(ui: &Ui, rect: Rect, responses: &[(LevelsHandle, Res
             LevelsHandle::InputHigh => Color32::WHITE,
             LevelsHandle::OutputLow | LevelsHandle::OutputHigh => Color32::from_gray((handle.value(levels).clamp(0.0, 1.0) * 255.0).round() as u8),
         };
-        let outline = if response.dragged() {
+        let outline = if response.dragged() || response.has_focus() {
             tokens.accent
         } else if response.hovered() {
             tokens.text_strong
@@ -220,20 +280,16 @@ fn paint_handles_and_values(ui: &Ui, rect: Rect, responses: &[(LevelsHandle, Res
             tokens.text
         };
         let points_down = LevelsHandle::INPUT.contains(&handle);
-        painter.add(egui::Shape::convex_polygon(handle_outline(x, handle_top(rect, handle), points_down), fill, Stroke::new(1.0, outline)));
+        painter.add(egui::Shape::convex_polygon(handle_outline(x, handle_top(rect, handle), points_down), fill, Stroke::new(1.5, outline)));
     }
 
     // Active values first, so a neighbour's overlapping value gives way to them
     let font = egui::FontId::proportional(VALUE_FONT_SIZE);
     let mut printed: Vec<Rect> = Vec::new();
     let mut by_priority: Vec<&(LevelsHandle, Response)> = responses.iter().collect();
-    by_priority.sort_by_key(|(_, response)| !is_active(response));
+    by_priority.sort_by_key(|(_, response)| std::cmp::Reverse(priority(response)));
     for &(handle, ref response) in by_priority {
-        if typing == Some(handle) {
-            continue;
-        }
-
-        let color = if is_active(response) { tokens.text_strong } else { tokens.text_dim };
+        let color = if response.hovered() || response.has_focus() || response.dragged() { tokens.text_strong } else { tokens.text };
         let galley = painter.layout_no_wrap(shown_value(handle.value(levels)), font.clone(), color);
         let text_rect = value_rect(rect, handle, levels, galley.size());
         if printed.iter().any(|other| other.expand(VALUE_SPACING).intersects(text_rect)) {
@@ -258,63 +314,117 @@ fn handle_outline(x: f32, top: f32, points_down: bool) -> Vec<Pos2> {
     ]
 }
 
-/// Opens the box that types `handle`'s value, holding its current value
-fn start_typing(ui: &Ui, typing_id: Id, handle: LevelsHandle, levels: &Levels) {
-    let text = format!("{:.VALUE_DECIMALS$}", handle.value(levels));
-    ui.data_mut(|data| data.insert_temp(typing_id, (handle, text)));
-}
-
-/// The floating box a value is typed into: Enter or a click elsewhere applies it as one undo step, Escape drops it
-fn typed_value(ui: &Ui, rect: Rect, typing_id: Id, (handle, mut text): (LevelsHandle, String), opened: bool, levels: &mut Levels) -> Option<bool> {
-    let field_id = typing_id.with("field");
-    let field = value_rect(rect, handle, levels, vec2(TYPED_VALUE_WIDTH, VALUE_ROW_HEIGHT));
-    // Floating over the editor, so opening it never moves the rest of the panel
-    let response = egui::Area::new(typing_id.with("area"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(field.min)
-        .show(ui.ctx(), |ui| {
-            let text_edit = egui::TextEdit::singleline(&mut text)
-                .id(field_id)
-                .font(egui::FontId::proportional(VALUE_FONT_SIZE))
-                .align(egui::Align2::CENTER_CENTER)
-                .margin(TYPED_VALUE_MARGIN);
-            ui.add_sized(field.size(), text_edit)
-        })
-        .inner;
-
-    // The app can consume Escape before the box sees it, so read the raw event
-    let escape = ui.input(|input| input.raw.events.iter().any(|event| matches!(event, egui::Event::Key { key: egui::Key::Escape, pressed: true, .. })));
-
-    if opened {
-        // Typing replaces the value; selected only now, as the unfocused box collapses a selection
-        let mut state = egui::text_edit::TextEditState::load(ui.ctx(), field_id).unwrap_or_default();
-        state.cursor.set_char_range(Some(egui::text::CCursorRange::select_all_str(&text)));
-        state.store(ui.ctx(), field_id);
-        response.request_focus();
-        return None;
-    }
-
-    if response.has_focus() && !escape {
-        ui.data_mut(|data| data.insert_temp(typing_id, (handle, text)));
-        return None;
-    }
-
-    ui.data_mut(|data| data.remove::<(LevelsHandle, String)>(typing_id));
-    ui.memory_mut(|memory| memory.surrender_focus(field_id));
-    // A box left open while the editor was hidden is dropped, not applied later
-    if !response.lost_focus() {
-        return None;
-    }
-
-    let typed = text.trim().parse::<f32>().ok().filter(|value| value.is_finite());
-    let (false, Some(typed)) = (escape, typed) else { return None };
+/// Arrow keys move along the track; accessibility increment/decrement change the numeric value
+fn handle_keys(ui: &Ui, response: &Response, handle: LevelsHandle, levels: &mut Levels) -> Option<bool> {
+    use egui::accesskit::{Action, ActionData};
 
     let mut next = *levels;
-    handle.set_value(&mut next, typed);
+    if response.has_focus() {
+        ui.memory_mut(|memory| memory.set_focus_lock_filter(response.id, egui::EventFilter { horizontal_arrows: true, ..Default::default() }));
+        let steps = ui.input(|input| input.num_presses(egui::Key::ArrowRight) as f32 - input.num_presses(egui::Key::ArrowLeft) as f32);
+        if steps != 0.0 {
+            handle.set_position(&mut next, handle.position(levels) + steps * KEYBOARD_STEP);
+        }
+    }
+
+    ui.input(|input| {
+        let steps = input.num_accesskit_action_requests(response.id, Action::Increment) as f32
+            - input.num_accesskit_action_requests(response.id, Action::Decrement) as f32;
+        if steps != 0.0 {
+            handle.set_value(&mut next, handle.value(levels) + steps * KEYBOARD_STEP);
+        }
+        for request in input.accesskit_action_requests(response.id, Action::SetValue) {
+            if let Some(ActionData::NumericValue(value)) = request.data {
+                handle.set_value(&mut next, value as f32);
+            }
+        }
+    });
     if next == *levels {
         return None;
     }
 
     *levels = next;
     Some(false)
+}
+
+/// Exact entry commits on Enter or focus loss; invalid input stays editable and Escape cancels
+fn number_field(ui: &mut Ui, id: Id, label: Id, handle: LevelsHandle, levels: &mut Levels, focus: bool, cancel: bool) -> (Option<bool>, bool) {
+    let shown = handle.value(levels).to_string();
+    let (mut text, mut invalid) = ui.data(|data| data.get_temp::<(String, bool)>(id)).unwrap_or_else(|| (shown.clone(), false));
+    if focus || cancel {
+        text = shown.clone();
+        invalid = false;
+    }
+
+    let response =
+        ui.add(egui::TextEdit::singleline(&mut text).id(id).desired_width(ui.available_width()).align(egui::Align2::CENTER_CENTER)).labelled_by(label);
+    if response.changed() {
+        invalid = false;
+    }
+    if focus {
+        let mut state = egui::text_edit::TextEditState::load(ui.ctx(), id).unwrap_or_default();
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::select_all_str(&text)));
+        state.store(ui.ctx(), id);
+        response.request_focus();
+        ui.data_mut(|data| data.insert_temp(id, (text, false)));
+        return (None, false);
+    }
+
+    // The app can consume Escape before the field sees it, so read the raw event
+    let escape = ui.input(|input| input.raw.events.iter().any(|event| matches!(event, egui::Event::Key { key: egui::Key::Escape, pressed: true, .. })));
+    if cancel || escape {
+        ui.data_mut(|data| data.remove::<(String, bool)>(id));
+        ui.memory_mut(|memory| memory.surrender_focus(id));
+        return (None, false);
+    }
+
+    if response.has_focus() {
+        ui.data_mut(|data| data.insert_temp(id, (text, invalid)));
+        return (None, invalid);
+    }
+
+    // Discard abandoned input when a hidden editor reappears
+    ui.data_mut(|data| data.remove::<(String, bool)>(id));
+    if !response.lost_focus() || text == shown {
+        return (None, false);
+    }
+
+    let Some(value) = text.trim().parse::<f32>().ok().filter(|value| value.is_finite()) else {
+        response.request_focus();
+        ui.data_mut(|data| data.insert_temp(id, (text, true)));
+        return (None, true);
+    };
+
+    let before = *levels;
+    handle.set_value(levels, value);
+    ((before != *levels).then_some(false), false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn switching_effects_releases_old_field_and_drag_state() {
+        let context = egui::Context::default();
+        let mut levels = Levels::default();
+        for effect in 0..100 {
+            context
+                .run_ui(egui::RawInput::default(), |ui| {
+                    levels_editor(ui, effect, None, &mut levels);
+                    let id = ui.make_persistent_id(("levels_editor", effect));
+                    ui.data_mut(|data| {
+                        data.insert_temp(id.with((LevelsHandle::Gamma, "value")), ("invalid draft".to_string(), true));
+                        data.insert_temp(id.with(LevelsHandle::Gamma), true);
+                    });
+                })
+                .drop_without_applying_deltas();
+        }
+
+        context.data(|data| {
+            assert_eq!(data.count::<egui::text_edit::TextEditState>(), 5, "only the current effect's fields remain");
+            assert_eq!(data.count::<(String, bool)>(), 1, "only the current draft remains");
+            assert_eq!(data.count::<bool>(), 1, "only the current drag state remains");
+        });
+    }
 }
