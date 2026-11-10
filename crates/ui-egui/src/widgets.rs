@@ -288,16 +288,38 @@ fn collapsible_section(ui: &mut Ui, id: &str, title: &str, default_open: bool, r
     let id = ui.make_persistent_id(id);
     let mut collapsing_state = egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, default_open);
 
+    // Register focus from creation so the next frame does not clear the header's focus
+    let mut header_builder = egui::UiBuilder::new().id_salt(id.with("header")).sense(Sense::click());
+    if reset_at_default.is_some() {
+        // Earlier controls can widen the content beyond the UI's original visible bounds
+        let visible_bounds = ui.stack().max_rect.intersect(ui.clip_rect());
+        let mut header_bounds = ui.available_rect_before_wrap();
+        header_bounds.min.x = header_bounds.min.x.max(visible_bounds.min.x);
+        header_bounds.max.x = header_bounds.max.x.min(visible_bounds.max.x).max(header_bounds.min.x);
+        header_builder = header_builder.max_rect(header_bounds);
+    }
+
     let mut reset_rect = None;
-    let header = ui.horizontal(|ui| {
-        ui.add(egui::Label::new(section_chevron(ui, collapsing_state.is_open())).selectable(false));
-        ui.add(egui::Label::new(RichText::new(title).strong().color(tokens.text_strong)).selectable(false));
-        if reset_at_default.is_some() {
-            let icon_size = vec2(SECTION_RESET_ICON_SIZE, SECTION_RESET_ICON_SIZE);
-            reset_rect = Some(ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| ui.allocate_exact_size(icon_size, Sense::hover()).0).inner);
-        }
+    let header = ui.scope_builder(header_builder, |ui| {
+        ui.horizontal(|ui| {
+            ui.add(egui::Label::new(section_chevron(ui, collapsing_state.is_open())).selectable(false));
+            let title = egui::Label::new(RichText::new(title).strong().color(tokens.text_strong)).selectable(false);
+            if reset_at_default.is_some() {
+                let icon_size = vec2(SECTION_RESET_ICON_SIZE, SECTION_RESET_ICON_SIZE);
+                let title_width = (ui.available_width() - icon_size.x - ui.spacing().item_spacing.x).max(0.0);
+
+                // Long titles must not extend into the reset target in narrow panels
+                ui.allocate_ui_with_layout(vec2(title_width, icon_size.y), *ui.layout(), |ui| {
+                    ui.set_width(title_width);
+                    ui.add(title.truncate());
+                });
+                reset_rect = Some(ui.allocate_exact_size(icon_size, Sense::hover()).0);
+            } else {
+                ui.add(title);
+            }
+        });
     });
-    if header.response.interact(Sense::click()).clicked() {
+    if header.response.clicked() {
         collapsing_state.toggle(ui);
     }
 

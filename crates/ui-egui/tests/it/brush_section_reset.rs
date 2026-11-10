@@ -186,3 +186,110 @@ fn reset_icons_identify_their_sections() {
         assert!(harness.query_by_role_and_label(egui::Role::Button, &label).is_some(), "the reset button must name its {title} section");
     }
 }
+
+#[test]
+fn narrow_headers_keep_title_clicks_separate_from_reset() {
+    use texturecraft_ui_egui::widgets::section_with_reset;
+
+    for right_to_left in [false, true] {
+        for width in [120.0, 180.0, 300.0] {
+            let title = "Lazy mouse and symmetry";
+            let mut harness = Harness::builder().with_size(egui::vec2(width, 180.0)).with_context_setup(texturecraft_ui_egui::theme::install).build_ui_state(
+                |ui, resets| {
+                    let alignment = if right_to_left { egui::Align::RIGHT } else { egui::Align::LEFT };
+                    ui.with_layout(egui::Layout::top_down(alignment), |ui| {
+                        ui.style_mut().right_to_left = right_to_left;
+                        if section_with_reset(ui, "narrow_section", title, false, false, |ui| {
+                            ui.label("Section contents");
+                        }) {
+                            *resets += 1;
+                        }
+                    });
+                },
+                0_u32,
+            );
+            harness.run_steps(STARTUP_FRAMES);
+
+            let title_rect = harness.get_by_label(title).rect();
+            let reset_label = format!("{title}: Reset to defaults");
+            let reset_rect = harness.get_by_role_and_label(egui::Role::Button, &reset_label).rect();
+            assert!(!title_rect.intersects(reset_rect), "title and reset overlap at width {width}, right_to_left={right_to_left}");
+            assert!(reset_rect.left() >= 0.0 && reset_rect.right() <= width, "reset must stay inside the panel");
+
+            harness.get_by_label(title).click();
+            harness.run_steps(SETTLE_FRAMES);
+
+            assert_eq!(*harness.state(), 0, "clicking the title must not reset settings");
+            assert!(harness.query_by_label("Section contents").is_some(), "clicking the title unfolds the section");
+
+            harness.get_by_role_and_label(egui::Role::Button, &reset_label).click();
+            harness.run_steps(SETTLE_FRAMES);
+
+            assert_eq!(*harness.state(), 1, "the reset remains clickable in a narrow panel");
+            assert!(harness.query_by_label("Section contents").is_some(), "resetting leaves the section open");
+        }
+    }
+}
+
+#[test]
+fn tab_visits_changed_resets_and_skips_default_resets() {
+    use texturecraft_ui_egui::widgets::section_with_reset;
+
+    for at_default in [false, true] {
+        let mut harness = Harness::builder().with_size(egui::vec2(300.0, 180.0)).with_context_setup(texturecraft_ui_egui::theme::install).build_ui(|ui| {
+            let _ = ui.button("Before section");
+            section_with_reset(ui, "tab_section", "Size", false, at_default, |_| {});
+            let _ = ui.button("After section");
+        });
+        harness.run_steps(STARTUP_FRAMES);
+        harness.get_by_role_and_label(egui::Role::Button, "Before section").focus();
+        harness.run_steps(SETTLE_FRAMES);
+        assert!(harness.get_by_role_and_label(egui::Role::Button, "Before section").is_focused());
+        let mut reset_was_focused = false;
+
+        // Screen-reader mode also puts the header's labels in the focus order
+        for _ in 0..8 {
+            harness.key_press(egui::Key::Tab);
+            harness.run_steps(SETTLE_FRAMES);
+            reset_was_focused |= harness.get_by_role_and_label(egui::Role::Button, "Size: Reset to defaults").is_focused();
+            if harness.get_by_role_and_label(egui::Role::Button, "After section").is_focused() {
+                break;
+            }
+        }
+
+        assert!(harness.get_by_role_and_label(egui::Role::Button, "After section").is_focused(), "Tab reaches the next control");
+        assert_eq!(reset_was_focused, !at_default, "only an enabled reset belongs in the Tab order");
+    }
+}
+
+#[test]
+fn overflowing_contents_do_not_push_resets_outside_the_panel() {
+    use texturecraft_ui_egui::widgets::section_with_reset;
+
+    for right_to_left in [false, true] {
+        let width = 120.0;
+        let mut harness = Harness::builder().with_size(egui::vec2(width, 180.0)).with_context_setup(texturecraft_ui_egui::theme::install).build_ui_state(
+            |ui, resets| {
+                let alignment = if right_to_left { egui::Align::RIGHT } else { egui::Align::LEFT };
+                ui.with_layout(egui::Layout::top_down(alignment), |ui| {
+                    ui.style_mut().right_to_left = right_to_left;
+
+                    // A slider in an earlier section can expand the scroll area's content width
+                    ui.allocate_exact_size(egui::vec2(400.0, 1.0), egui::Sense::hover());
+                    if section_with_reset(ui, "overflow_section", "Size", false, false, |_| {}) {
+                        *resets += 1;
+                    }
+                });
+            },
+            0_u32,
+        );
+        harness.run_steps(STARTUP_FRAMES);
+        let reset_rect = harness.get_by_role_and_label(egui::Role::Button, "Size: Reset to defaults").rect();
+        assert!(reset_rect.left() >= 0.0 && reset_rect.right() <= width, "reset must stay visible when content overflows, right_to_left={right_to_left}");
+
+        harness.get_by_role_and_label(egui::Role::Button, "Size: Reset to defaults").click();
+        harness.run_steps(SETTLE_FRAMES);
+
+        assert_eq!(*harness.state(), 1, "overflowing contents must not block the reset");
+    }
+}

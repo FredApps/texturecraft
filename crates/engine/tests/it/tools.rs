@@ -2,10 +2,10 @@
 //! agents paint.
 
 use serde_json::{Value, json};
-use texturecraft_engine::core::Channel;
+use texturecraft_engine::core::{Channel, LayerId};
 use texturecraft_engine::geom::glam::Vec2;
 use texturecraft_engine::geom::primitives;
-use texturecraft_engine::{Session, execute};
+use texturecraft_engine::{Session, StackTarget, execute};
 
 const RES: f32 = 256.0;
 
@@ -179,4 +179,42 @@ fn quick_mask_limits_painting() {
     execute(&mut s, "tool.material", &json!({"channel": "baseColor", "color": [0.0, 1.0, 0.0]})).unwrap();
     dab(&mut s, 150.0, 200.0);
     assert!(color_at(&s, 150.0, 200.0)[1] > 0.85, "disabled: everything is open");
+}
+
+#[test]
+fn swap_mask_value_inverts_only_while_a_mask_is_the_target() {
+    let mut session = session();
+    execute(&mut session, "layer.add.paint", &Value::Null).unwrap();
+    let swap = |session: &mut Session| execute(session, "tool.swapMaskValue", &Value::Null);
+    let effect_target = |result: Value| StackTarget::Effect(LayerId(result["effect"].as_u64().unwrap()));
+
+    assert!(swap(&mut session).is_err(), "painting the layer content: nothing to invert");
+
+    let content_effect = effect_target(execute(&mut session, "effect.add.paint", &json!({"target": "content"})).unwrap());
+    session.target = content_effect;
+    assert!(swap(&mut session).is_err(), "a content effect is not a mask");
+
+    execute(&mut session, "mask.add.white", &Value::Null).unwrap();
+    session.target = StackTarget::Mask;
+    session.tool.mask_value = 0.2;
+
+    swap(&mut session).unwrap();
+
+    assert_eq!(session.tool.mask_value, 0.8);
+
+    session.tool.mask_value = 1.0;
+
+    swap(&mut session).unwrap();
+
+    assert_eq!(session.tool.mask_value, 0.0);
+
+    swap(&mut session).unwrap();
+
+    assert_eq!(session.tool.mask_value, 1.0, "pressing it again goes back");
+
+    session.target = effect_target(execute(&mut session, "effect.add.paint", &json!({"target": "mask"})).unwrap());
+
+    swap(&mut session).unwrap();
+
+    assert_eq!(session.tool.mask_value, 0.0, "a mask effect paints the mask too");
 }

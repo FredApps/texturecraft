@@ -9,7 +9,7 @@ use texturecraft_paint::{Alignment, BrushAlpha, alphas};
 use crate::commands::{CommandSpec, always, bad, boolp, channel_param, color_param, f32p, strp};
 use crate::fill_hit_test::FillHitTest;
 use crate::fill_mode::FillMode;
-use crate::session::{CloneFrom, CloneSource, Tool};
+use crate::session::{CloneFrom, CloneSource, StackTarget, Tool};
 use crate::{Result, Session, cmd};
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -52,6 +52,15 @@ pub fn specs() -> Vec<CommandSpec> {
             "{channel, color?|value?, enabled?, solo?: true (paint this channel only)} or {maskValue?: 0..1}",
             always,
             material
+        ),
+        cmd!(
+            "tool.swapMaskValue",
+            "Invert mask value",
+            ["Tools"],
+            Some("X"),
+            "{} — mask value becomes 1 − value: switch the brush between adding to and removing from the mask",
+            paints_mask,
+            swap_mask_value
         ),
         cmd!(
             "tool.stencil",
@@ -271,6 +280,30 @@ fn material(s: &mut Session, p: &Value) -> Result<Value> {
         "enabled": s.tool.enabled.iter().map(|c| c.id()).collect::<Vec<_>>(),
         "maskValue": s.tool.mask_value,
     }))
+}
+
+/// Whether strokes paint the selected layer's mask: the mask itself or one of its effects
+fn paints_mask(session: &Session) -> std::result::Result<(), String> {
+    session.selected_layer().ok_or("no layer selected")?;
+
+    let project = &session.doc.project;
+    let targets_mask = match session.target {
+        StackTarget::Content => false,
+        StackTarget::Mask => true,
+        StackTarget::Effect(effect_id) => project
+            .effect(effect_id)
+            .and_then(|(owner, _)| project.layers.get(&owner))
+            .is_some_and(|owner_layer| !owner_layer.content_effects.iter().any(|effect| effect.id == effect_id)),
+    };
+
+    if targets_mask { Ok(()) } else { Err("select a mask to paint on".into()) }
+}
+
+fn swap_mask_value(session: &mut Session, _: &Value) -> Result<Value> {
+    session.tool.mask_value = 1.0 - session.tool.mask_value;
+    session.revision = session.revision.wrapping_add(1);
+
+    Ok(json!({ "maskValue": session.tool.mask_value }))
 }
 
 fn stencil(s: &mut Session, p: &Value) -> Result<Value> {
