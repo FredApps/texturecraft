@@ -93,11 +93,29 @@ pub struct GpuLink {
     pub adapter: String,
     /// Most tiles waiting to be composited since compositing last caught up (progress).
     composite_total: usize,
+    /// Consecutive frames without user input (see [`frame_budgets`]).
+    idle_frames: u32,
     bake_scene: BakeSceneLink,
 }
 
-/// Compositing time per frame: a full recomposite of a large texture set spreads over frames.
+/// The compositing and whole-frame budgets in milliseconds after `idle_frames` frames without
+/// user input: the responsive pair while the user works, the longer pair once they have stopped.
+fn frame_budgets(idle_frames: u32) -> (f64, f64) {
+    if idle_frames >= IDLE_FRAMES_BEFORE_BOOST { (IDLE_COMPOSITE_BUDGET_MS, IDLE_FRAME_BUDGET_MS) } else { (COMPOSITE_BUDGET_MS, FRAME_BUDGET_MS) }
+}
+
+/// Compositing time per frame while the user is working: a full recomposite of a large texture
+/// set spreads over frames.
 const COMPOSITE_BUDGET_MS: f64 = 30.0;
+/// Compositing time per frame once the user has stopped touching the app: the compositor scales
+/// with the machine's cores, so a longer slice finishes sooner on a fast PC (a frame then takes
+/// longer, but nothing is being dragged or painted that would feel it).
+const IDLE_COMPOSITE_BUDGET_MS: f64 = 100.0;
+/// [`FRAME_BUDGET_MS`] while idle: the idle compositing slice plus the usual rest of the frame.
+const IDLE_FRAME_BUDGET_MS: f64 = IDLE_COMPOSITE_BUDGET_MS + (FRAME_BUDGET_MS - COMPOSITE_BUDGET_MS);
+/// Frames without input (about 0.2 s at 60 fps) before the longer idle slices start, so a short
+/// pause between strokes or drags keeps the responsive budget.
+const IDLE_FRAMES_BEFORE_BOOST: u32 = 12;
 /// The most a frame spends on the scene (with the work already done this frame, such as a
 /// stroke's commit): compositing and display conversion leave the rest for the next frames, so
 /// a large (8K) texture set never stalls one frame.
@@ -109,6 +127,10 @@ const UPLOAD_CHUNK: usize = 64;
 /// Estimated GPU upload cost of one display tile (write_texture of one 64×64 tile of one
 /// display kind, measured at ~5.5 µs on a desktop GPU), counted against the frame budget.
 const UPLOAD_MS_PER_TILE: f64 = 0.006;
+/// CPU cost of converting one display tile of one kind for upload ([`tile_bytes`], measured at
+/// ~6 µs: 8192 in 50 ms on a 24-thread desktop): with [`UPLOAD_MS_PER_TILE`], what a tile still
+/// waiting for upload will cost this frame.
+const CONVERT_MS_PER_TILE: f64 = 0.006;
 
 pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
     let reset = Arc::new(AtomicBool::new(false));
@@ -140,6 +162,7 @@ pub fn init(rs: &egui_wgpu::RenderState, ctx: &egui::Context) -> GpuLink {
         aux: BTreeMap::new(),
         adapter: format!("{} ({:?})", info.name, info.backend),
         composite_total: 0,
+        idle_frames: 0,
         bake_scene: BakeSceneLink::default(),
     }
 }
@@ -162,13 +185,28 @@ impl GpuLink {
     }
 
     /// Collect everything the GPU needs this frame, running the compositor first: `bake` is what bake mode's 3D view draws besides the low poly, `spent_ms` the time this frame already took
-    pub fn sync(&mut self, session: &mut Session, aux_map: Option<AuxView>, bake: Option<BakeVisualization>, shift: u32, spent_ms: f64) -> SceneSync {
+    pub fn sync(
+        &mut self,
+        session: &mut Session,
+        aux_map: Option<AuxView>,
+        bake: Option<BakeVisualization>,
+        shift: u32,
+        spent_ms: f64,
+        user_active: bool,
+    ) -> SceneSync {
         let start_ms = crate::now_ms();
         let mut queued = 0usize;
-        let time_left_ms = |queued: usize| FRAME_BUDGET_MS - spent_ms - (crate::now_ms() - start_ms) - queued as f64 * UPLOAD_MS_PER_TILE;
+        self.idle_frames = if user_active { 0 } else { self.idle_frames.saturating_add(1) };
+        let (composite_budget_ms, frame_budget_ms) = frame_budgets(self.idle_frames);
+        let time_left_ms = |queued: usize| frame_budget_ms - spent_ms - (crate::now_ms() - start_ms) - queued as f64 * UPLOAD_MS_PER_TILE;
         let pending = session.pending_tiles();
         self.composite_total = if pending == 0 { 0 } else { self.composite_total.max(pending) };
-        session.update_for(COMPOSITE_BUDGET_MS.min(time_left_ms(0)).max(MIN_SLICE_MS), crate::now_ms);
+        // Tiles composited earlier and still waiting to be uploaded go first: a big change's
+        // coarse look is composited in a frame or two, and showing it whole matters more than
+        // compositing on (otherwise it appears a chunk of tiles per frame).
+        let backlog = session.caches.iter().map(|c| c.upload.len()).sum::<usize>() * DisplayKind::ALL.len();
+        let backlog_ms = backlog as f64 * (UPLOAD_MS_PER_TILE + CONVERT_MS_PER_TILE);
+        session.update_for(composite_budget_ms.min(time_left_ms(0) - backlog_ms).max(MIN_SLICE_MS), crate::now_ms);
 
         let mut out = SceneSync::default();
         if self.lost.swap(false, Ordering::AcqRel) {
@@ -408,5 +446,28 @@ impl CallbackTrait for ViewCallback {
         pass.set_viewport(0.0, 0.0, sw as f32, sh as f32, 0.0, 1.0);
         pass.set_scissor_rect(clip.left_px.max(0) as u32, clip.top_px.max(0) as u32, clip.width_px as u32, clip.height_px as u32);
         gpu.renderer.blit_prepared(pass, self.frame.view_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// While the user is working (or just stopped) a frame keeps the responsive budgets.
+    #[test]
+    fn budgets_stay_short_while_the_user_is_active() {
+        assert_eq!(frame_budgets(0), (COMPOSITE_BUDGET_MS, FRAME_BUDGET_MS));
+        assert_eq!(frame_budgets(IDLE_FRAMES_BEFORE_BOOST - 1), (COMPOSITE_BUDGET_MS, FRAME_BUDGET_MS));
+    }
+
+    /// After a pause the compositor gets the longer slice, and the frame budget grows with it so the
+    /// display uploads keep their usual share.
+    #[test]
+    fn budgets_grow_once_the_user_is_idle() {
+        let (composite, frame) = frame_budgets(IDLE_FRAMES_BEFORE_BOOST);
+        assert_eq!(composite, IDLE_COMPOSITE_BUDGET_MS);
+        assert!(composite > COMPOSITE_BUDGET_MS);
+        assert_eq!(frame - composite, FRAME_BUDGET_MS - COMPOSITE_BUDGET_MS, "the non-compositing share of a frame is unchanged");
+        assert_eq!(frame_budgets(u32::MAX), (composite, frame), "stays boosted");
     }
 }

@@ -803,6 +803,22 @@ fn fields_of(inp: &Inputs, channels: &[Channel], list: &[LayerId], tiles: &[(u32
     out
 }
 
+/// Whether texture set `ts` has a layer with a neighbourhood filter (blur, sharpen, warp…) in
+/// its mask or content: a composite then precomputes [`neighbourhood_fields`] at full
+/// resolution, so even a [`composite_tiles_coarse`] is not much cheaper than the exact one.
+/// The same layers as `neighbourhood_fields` looks at (it may count a hidden one).
+pub fn has_neighbourhood_filters(project: &Project, ts: usize) -> bool {
+    let Ok(set) = project.texture_set(ts) else { return false };
+    let mut order = Vec::new();
+    draw_order(project, &set.stack, 0, &mut order);
+    let res = set.resolution;
+    order.iter().any(|id| {
+        let mask = layer_mask(project, *id).is_some_and(|m| m.enabled && neighbourhood(&m.effects, res).is_some());
+        let content = project.content_layer(*id).is_some_and(|l| !l.is_group() && neighbourhood(&l.content_effects, res).is_some());
+        mask || content
+    })
+}
+
 /// Build the curvature detail sizes every visible generator of `layers` reads, once, before tiles composite in parallel.
 fn prepare_curvature_sizes(inp: &Inputs, layers: &[LayerId]) {
     let visible = layers.iter().filter(|id| inp.project.layers.get(id).is_some_and(|layer| layer.visible));
@@ -899,10 +915,89 @@ fn mask_plan<'a>(inp: &Inputs<'a>, id: LayerId, mask: &'a Mask, tx: u32, ty: u32
 }
 
 fn plan<'a>(inp: &Inputs<'a>, list: &[LayerId], channels: &[Channel], tx: u32, ty: u32, depth: usize, fields: Option<&'a Fields>) -> Vec<Node<'a>> {
+    plan_with(inp, list, channels, tx, ty, depth, fields, false)
+}
+
+/// [`plan`], leaving out what an opaque layer above hides when `cull` (see [`cull_hidden`]).
+/// Only for lists that are evaluated whole and not looked into (no anchor or stop layer reads).
+#[allow(clippy::too_many_arguments)]
+fn plan_with<'a>(
+    inp: &Inputs<'a>,
+    list: &[LayerId],
+    channels: &[Channel],
+    tx: u32,
+    ty: u32,
+    depth: usize,
+    fields: Option<&'a Fields>,
+    cull: bool,
+) -> Vec<Node<'a>> {
     if depth > texturecraft_core::project::MAX_DEPTH {
         return Vec::new();
     }
-    list.iter().filter_map(|id| plan_node(inp, *id, channels, tx, ty, depth, fields, true)).collect()
+    let mut nodes: Vec<Node<'a>> = list.iter().filter_map(|id| plan_node(inp, *id, channels, tx, ty, depth, fields, true, cull)).collect();
+    if cull {
+        cull_hidden(&mut nodes, channels);
+    }
+    nodes
+}
+
+/// Whether node `n` hides everything below it in channel `ch`: it replaces the stack there at
+/// every texel (full opacity, normal blend, no mask or geometry or height mask, a fill that
+/// covers the whole surface with no content effects), or is a folder at full opacity holding
+/// such a layer.
+fn occludes(n: &Node, ch: usize) -> bool {
+    if n.mask.is_some() || n.parts.is_some() || n.height_mask.enabled {
+        return false;
+    }
+    let Some(c) = n.chans.iter().find(|c| c.ch == ch) else { return false };
+    if c.opacity < 1.0 {
+        return false;
+    }
+    match &n.content {
+        Content::Fill(f) => c.blend == BlendMode::Normal && !matches!(f.projection, Projection::Decal(_)) && c.effects.is_empty() && c.start.is_none(),
+        Content::Group(kids) => kids.iter().any(|k| occludes(k, ch)),
+        Content::Paint { .. } => false,
+    }
+}
+
+/// Whether `n` or a layer in it masks with its height.
+fn uses_height_mask(n: &Node) -> bool {
+    n.height_mask.enabled || matches!(&n.content, Content::Group(kids) if kids.iter().any(uses_height_mask))
+}
+
+/// Take channel `ch` out of `n` (and what it holds), dropping what then draws nothing.
+fn strip_channel(n: &mut Node, ch: usize) {
+    n.chans.retain(|c| c.ch != ch);
+    if let Content::Group(kids) = &mut n.content {
+        for k in kids.iter_mut() {
+            strip_channel(k, ch);
+        }
+        kids.retain(|k| !k.chans.is_empty());
+    }
+}
+
+/// Leave out the layers (per channel) that a layer above them hides completely: a stack that
+/// grows by applying material after material would otherwise evaluate every one of them. The
+/// result is identical. Channels with anchor points or height masks below the hiding layer
+/// are left alone (they read other layers' values), and so are those under a hiding folder
+/// that records an anchor point: its inner stack starts from what lies below it, so an anchor
+/// under the hiding layer inside it holds the layers it hides.
+fn cull_hidden(nodes: &mut Vec<Node>, channels: &[Channel]) {
+    for c in channels {
+        let ch = c.index();
+        let Some(k) = nodes.iter().rposition(|n| occludes(n, ch)) else { continue };
+        if nodes.get(k).is_some_and(|n| n.has_anchor) {
+            continue;
+        }
+        let Some(below) = nodes.get_mut(..k) else { continue };
+        if below.iter().any(|n| n.has_anchor || (*c == Channel::Height && uses_height_mask(n))) {
+            continue;
+        }
+        for n in below.iter_mut() {
+            strip_channel(n, ch);
+        }
+    }
+    nodes.retain(|n| !n.chans.is_empty() || n.has_anchor);
 }
 
 /// The plan of layer `id` at `depth` (None where it draws nothing); a folder's children are
@@ -917,6 +1012,7 @@ fn plan_node<'a>(
     depth: usize,
     fields: Option<&'a Fields>,
     kids: bool,
+    cull: bool,
 ) -> Option<Node<'a>> {
     let own: &'a Layer = inp.project.layers.get(&id)?;
     // Instances draw their source's content (a missing source draws nothing).
@@ -943,7 +1039,9 @@ fn plan_node<'a>(
     let content = match &layer.kind {
         LayerKind::Paint => Content::Paint { preview: previews(inp, PaintTarget::Layer(layer.id)) },
         LayerKind::Fill(f) => Content::Fill(f),
-        LayerKind::Group { children, .. } => Content::Group(if kids { plan(inp, children, channels, tx, ty, depth + 1, fields) } else { Vec::new() }),
+        LayerKind::Group { children, .. } => {
+            Content::Group(if kids { plan_with(inp, children, channels, tx, ty, depth + 1, fields, cull) } else { Vec::new() })
+        }
         // `content_layer` already followed instance links.
         LayerKind::Instance { .. } => return None,
     };
@@ -990,8 +1088,8 @@ fn plan_levels<'a>(inp: &Inputs<'a>, levels: &[Level], channels: &[Channel], tx:
         .iter()
         .enumerate()
         .map(|(d, l)| LevelPlan {
-            below: if warm { Vec::new() } else { plan(inp, &l.below, channels, tx, ty, d, Some(fields)) },
-            at: plan_node(inp, l.at, channels, tx, ty, d, Some(fields), d == last),
+            below: if warm { Vec::new() } else { plan_with(inp, &l.below, channels, tx, ty, d, Some(fields), true) },
+            at: plan_node(inp, l.at, channels, tx, ty, d, Some(fields), d == last, false),
             above: plan(inp, &l.above, channels, tx, ty, d, Some(fields)),
         })
         .collect()
@@ -1660,6 +1758,35 @@ pub fn composite_tiles(inp: &Inputs, out: &mut Composite, tiles: &[(u32, u32)]) 
     composite_tiles_cached(inp, out, tiles, None);
 }
 
+/// The strides a coarse composite ([`composite_tiles_coarse`]) takes, coarsest first: texels
+/// per block side, one evaluated per block. Each divides the rows of a band and a tile, so a
+/// block never crosses bands or tiles. A big recomposite shows them in this order before the
+/// exact composite. One level: a coarse pass costs about the same at any stride (writing,
+/// padding and uploading the full-resolution tiles dominate once one texel in 64 is
+/// evaluated; measured 4096², 3217 tiles: 139 ms at 16, 150 at 8, 254 at 4, 2.1 s exact), so
+/// a second level would only add that cost again before the exact composite.
+pub const COARSE_STRIDES: [u32; 1] = [8];
+
+/// A quick look at `tiles`: [`composite_tiles`] evaluating one texel in every `stride` by `stride`
+/// block (its first covered texel) and repeating it over the block's covered texels (a texel only
+/// depends on its own position, so the evaluated ones are exact; the rest are as blocky as a
+/// lower resolution), about `stride`² times fewer evaluations. A `stride` that does not divide a band and a tile composites exactly. A later
+/// [`composite_tiles`] of the same tiles gives the exact result.
+pub fn composite_tiles_coarse(inp: &Inputs, out: &mut Composite, tiles: &[(u32, u32)], stride: u32) {
+    let Ok(set) = inp.project.texture_set(inp.ts) else { return };
+    if (inp.gbuf.width, inp.gbuf.height) != (out.resolution, out.height) {
+        return;
+    }
+    let step = if stride > 0 && BAND.is_multiple_of(stride) && TILE.is_multiple_of(stride) { stride } else { 1 };
+    let mut blocks: BTreeMap<(u32, u32), Vec<(u32, u32)>> = BTreeMap::new();
+    for t in tiles {
+        blocks.entry((t.1 / BLOCK, t.0 / BLOCK)).or_default().push(*t);
+    }
+    for block in blocks.values() {
+        composite_block(inp, &set.stack, out, block, None, 0, step);
+    }
+}
+
 /// Tiles per side of the blocks a composite works through (bounds neighbourhood-filter memory).
 const BLOCK: u32 = 16;
 
@@ -1688,7 +1815,7 @@ pub fn composite_tiles_cached(inp: &Inputs, out: &mut Composite, tiles: &[(u32, 
             None => 0,
         };
         let cached = below.as_deref().zip(split.as_deref());
-        let records = composite_block(inp, &set.stack, out, block, cached, quota);
+        let records = composite_block(inp, &set.stack, out, block, cached, quota, 1);
         if let Some(b) = below.as_deref_mut() {
             for t in block {
                 b.touch(*t);
@@ -1719,6 +1846,7 @@ fn composite_block(
     tiles: &[(u32, u32)],
     below: Option<(&BelowCache, &[Level])>,
     quota: usize,
+    step: u32,
 ) -> Vec<((u32, u32), Vec<Band>)> {
     let channels: Vec<Channel> = inp.project.texture_set(inp.ts).map(|s| s.channel_list()).unwrap_or_default();
     let (w, h) = (out.resolution, out.height);
@@ -1748,7 +1876,7 @@ fn composite_block(
             let warm = cached((tx, ty)).and_then(|b| b.get(band as usize));
             let record = warm.is_none() && recorded.contains(&(tx, ty));
             let levels = split.map(|l| plan_levels(inp, l, &channels, tx, ty, &fields, warm.is_some()));
-            let nodes = if levels.is_none() { plan(inp, stack, &channels, tx, ty, 0, Some(&fields)) } else { Vec::new() };
+            let nodes = if levels.is_none() { plan_with(inp, stack, &channels, tx, ty, 0, Some(&fields), true) } else { Vec::new() };
             let rows = (BAND * TILE) as usize;
             let mut accs = vec![defaults; nlev];
             let mut masks = vec![0.0f32; nlev];
@@ -1772,10 +1900,16 @@ fn composite_block(
             let mut bufs: Vec<Vec<u16>> = channels.iter().map(|c| vec![0u16; rows * c.components()]).collect();
             let mut anchors = Vec::new();
             let mut any = false;
+            // Coarse: per `step`-wide block of the current block row, the value of its first
+            // covered texel (evaluated), repeated over the block's other covered texels.
+            let mut sampled: Vec<Option<Acc>> = vec![None; if step > 1 { (TILE / step) as usize } else { 0 }];
             for ly in band * BAND..(band + 1) * BAND {
                 let y = ty * TILE + ly;
                 if y >= h {
                     break;
+                }
+                if step > 1 && ly % step == 0 {
+                    sampled.fill(None);
                 }
                 for lx in 0..TILE {
                     let x = tx * TILE + lx;
@@ -1788,7 +1922,12 @@ fn composite_block(
                     let ob = ((ly - band * BAND) * TILE + lx) as usize;
                     let covered = inp.gbuf.tri.get(gi).is_some_and(|t| *t != NO_TRI);
                     let mut acc = defaults;
-                    if covered {
+                    let block = if step > 1 { sampled.get_mut((lx / step) as usize) } else { None };
+                    let repeated = block.as_ref().and_then(|b| **b);
+                    if covered && let Some(a) = repeated {
+                        any = true;
+                        acc = a;
+                    } else if covered {
                         any = true;
                         let mut tex = Texel::new(inp, x, y, o, stroke_at(preview_tile, o));
                         // Reuse one anchor buffer per band.
@@ -1819,6 +1958,12 @@ fn composite_block(
                         }
                         anchors = tex.anchors;
                         anchors.clear();
+                    }
+                    if covered
+                        && repeated.is_none()
+                        && let Some(slot) = block
+                    {
+                        *slot = Some(acc);
                     }
                     for (l, buf) in lanes.iter().zip(&mut bufs) {
                         let v = acc.get(l.ch).copied().unwrap_or([0.0; 3]);
