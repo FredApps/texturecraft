@@ -322,14 +322,14 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
     if crate::keymap::capturing(ctx) || (ctx.memory(|memory| memory.focused().is_some()) && ctx.egui_wants_keyboard_input()) {
         return;
     }
+
     #[cfg(not(target_arch = "wasm32"))]
     if crate::updates_ui::blocks_input(app) {
         return;
     }
 
-    // The dispatcher reads Copy, Cut and Paste as their chords. A pasted image is Ctrl+V here, and
-    // Shift+Delete and Shift+Insert (Cut and Paste on Windows) are Ctrl+X and Ctrl+V unless
-    // something is bound to them.
+    // The dispatcher reads clipboard events as shortcuts; a pasted image also means Ctrl+V
+    // Unless bound, Shift+Delete and Shift+Insert become Ctrl+X and Ctrl+V
     ctx.input_mut(|input| {
         let held = input.modifiers;
         let aliases: Vec<_> = input
@@ -365,7 +365,7 @@ pub fn shortcuts(app: &mut TextureCraftApp, ctx: &egui::Context) {
 
         if !popup_open && app.properties_popup.is_some() && input.consume_key(Modifiers::NONE, Key::Escape) {
             app.properties_popup = None;
-        } else if !popup_open && app.ui.rail_panel.is_some() && input.consume_key(Modifiers::NONE, Key::Escape) {
+        } else if !popup_open && crate::rail_popup::is_visible(app) && input.consume_key(Modifiers::NONE, Key::Escape) {
             app.ui.rail_panel = None;
         } else if !popup_open && app.picking_id_color.is_some() && input.consume_key(Modifiers::NONE, Key::Escape) {
             crate::id_color_pick::IdColorPick::end(app);

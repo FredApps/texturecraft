@@ -2,7 +2,7 @@
 
 use egui::{Event, Modifiers, PointerButton, Pos2, Role};
 use egui_kittest::Harness;
-use egui_kittest::kittest::{NodeT, Queryable};
+use egui_kittest::kittest::{NodeT, Queryable, by};
 use texturecraft_ui_egui::TextureCraftApp;
 use texturecraft_ui_egui::docking::Panel;
 use texturecraft_ui_egui::state::ViewLayout;
@@ -91,7 +91,7 @@ fn drag(harness: &mut Harness<'_, TextureCraftApp>, from: Pos2, to: Pos2) {
 /// The popup's Close button, left of the rail (the window's own Close sits above the rail)
 fn popup_close_button(harness: &Harness<'_, TextureCraftApp>) -> Option<egui::Rect> {
     harness
-        .get_all_by_role(Role::Button)
+        .query_all(by().role(Role::Button))
         .find(|button| button.rect().max.x < RAIL_LEFT_EDGE && button.accesskit_node().label().as_deref() == Some("Close"))
         .map(|button| button.rect())
 }
@@ -363,4 +363,75 @@ fn opening_a_rail_popup_during_a_stroke_still_finishes_the_stroke() {
     assert!(popup_shows(&harness, "Log"));
     assert!(!harness.state().session.stroke_active());
     assert_eq!(harness.state().session.history_labels().len(), history + 1);
+}
+
+#[test]
+fn escape_cancels_a_stroke_with_a_hidden_rail_popup() {
+    let mut harness = app();
+    texturecraft_engine::execute(&mut harness.state_mut().session, "layer.add.paint", &serde_json::Value::Null).unwrap();
+    harness.state_mut().ui.layout = ViewLayout::Only3D;
+    harness.run_steps(SETTLE_FRAMES);
+    click_rail(&mut harness, "Log");
+    harness.key_press(egui::Key::Tab);
+    harness.run_steps(SETTLE_FRAMES);
+    assert!(harness.state().ui.hide_ui);
+    assert!(popup_closed(&harness));
+    let center = harness.state().viewport_rect.center();
+    let history = harness.state().session.history_labels();
+    harness.drag_at(center);
+    harness.run_steps(FRAMES_PER_DRAG_EVENT);
+    harness.hover_at(center + egui::vec2(20.0, 0.0));
+    harness.run_steps(FRAMES_PER_DRAG_EVENT);
+    assert!(harness.state().session.stroke_active());
+
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(SETTLE_FRAMES);
+
+    assert!(!harness.state().session.stroke_active(), "one Escape cancels the stroke despite the hidden popup");
+    harness.drop_at(center + egui::vec2(30.0, 0.0));
+    harness.run_steps(SETTLE_FRAMES);
+    assert_eq!(harness.state().session.history_labels(), history, "the canceled stroke must not be committed on release");
+}
+
+#[test]
+fn escape_cancels_a_path_with_a_hidden_rail_popup() {
+    for stored_path in [false, true] {
+        let mut harness = app();
+        texturecraft_engine::execute(&mut harness.state_mut().session, "layer.add.paint", &serde_json::Value::Null).unwrap();
+        let path = texturecraft_engine::execute(
+            &mut harness.state_mut().session,
+            "tool.path",
+            &serde_json::json!({"uvPoints": [[0.2, 0.5], [0.8, 0.5]], "commit": stored_path}),
+        )
+        .unwrap();
+        if stored_path {
+            texturecraft_engine::execute(
+                &mut harness.state_mut().session,
+                "path.edit",
+                &serde_json::json!({"effect": path["committed"]["effect"], "index": 0}),
+            )
+            .unwrap();
+        }
+        harness.run_steps(SETTLE_FRAMES);
+        click_rail(&mut harness, "Log");
+        harness.key_press(egui::Key::Tab);
+        harness.run_steps(SETTLE_FRAMES);
+        assert!(harness.state().ui.hide_ui);
+        assert!(popup_closed(&harness));
+        assert_eq!(harness.state().session.tool.path.points.len(), 2);
+        assert_eq!(harness.state().session.tool.path.editing.is_some(), stored_path);
+        let history = harness.state().session.history_labels();
+
+        harness.key_press(egui::Key::Escape);
+        harness.run_steps(SETTLE_FRAMES);
+
+        assert!(harness.state().session.tool.path.points.is_empty(), "one Escape clears the path despite the hidden popup");
+        assert!(harness.state().session.tool.path.editing.is_none());
+        assert_eq!(harness.state().session.history_labels(), history);
+
+        harness.key_press(egui::Key::Tab);
+        harness.run_steps(SETTLE_FRAMES);
+
+        assert!(popup_shows(&harness, "Log"), "showing the UI restores its remembered popup");
+    }
 }

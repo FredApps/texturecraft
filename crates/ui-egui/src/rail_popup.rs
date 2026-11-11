@@ -67,6 +67,11 @@ pub(crate) fn is_rail_panel(panel: Panel) -> bool {
     RAIL_PANELS.iter().any(|(rail_panel, _, _)| *rail_panel == panel)
 }
 
+/// Whether the rail's open popup is visible in the current UI mode
+pub(crate) fn is_visible(app: &TextureCraftApp) -> bool {
+    app.ui.rail_panel.is_some() && !app.ui.hide_ui && app.ui.mode != Mode::Baking
+}
+
 /// Record the rail's strip before its icons, so the popup can line up with them
 pub(crate) fn begin_rail(ctx: &egui::Context, strip: Rect) {
     ctx.data_mut(|data| {
@@ -125,10 +130,9 @@ pub(crate) fn blocks_paint_input(app: &TextureCraftApp, ctx: &egui::Context) -> 
 
     // Both views must ignore the release, which would otherwise start a single-dab stroke
     let closing = ctx.data(|data| data.get_temp::<bool>(closing_id)).unwrap_or(false);
-    let open = app.ui.rail_panel.is_some() && !app.ui.hide_ui && app.ui.mode != Mode::Baking;
 
     // A shortcut may open the panel during a stroke; let that existing stroke finish
-    !app.session.stroke_active() && (open || closing)
+    !app.session.stroke_active() && (is_visible(app) || closing)
 }
 
 /// Draw the open popup beside its icon; a press outside it closes it, as for a menu (Escape does too, in `menus.rs`)
