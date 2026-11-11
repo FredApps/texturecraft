@@ -408,6 +408,26 @@ fn nested_layers_snapshot() {
 
 #[test]
 #[ignore]
+fn path_tool_snapshots() {
+    let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else { return };
+
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
+    texturecraft_engine::execute(&mut session, "layer.add.paint", &serde_json::Value::Null).unwrap();
+    texturecraft_engine::execute(&mut session, "tool.path", &serde_json::json!({"uvPoints": [[0.25, 0.5], [0.5, 0.3], [0.75, 0.5]]})).unwrap();
+    let mut harness =
+        Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    harness.state_mut().ui.layout = texturecraft_ui_egui::state::ViewLayout::Only2D;
+    harness.state_mut().session.select_path_point(1);
+    harness.hover_at(egui::pos2(800.0, 600.0));
+    save(&mut harness, &output_dir, "path-preview-2d");
+
+    harness.state_mut().session.commit_path(texturecraft_engine::geom::glam::Vec2::splat(400.0)).unwrap();
+    save(&mut harness, &output_dir, "path-stored-2d");
+}
+
+#[test]
+#[ignore]
 fn rail_window_snapshots() {
     let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else {
         eprintln!("set TC_UI_SNAPSHOTS=<dir> to write the pictures");

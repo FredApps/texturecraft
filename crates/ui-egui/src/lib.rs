@@ -34,6 +34,8 @@ pub mod menus;
 pub mod new_project_advanced;
 mod orb_shape;
 pub mod parity;
+mod path_hit;
+mod path_surface_cache;
 mod preview_image;
 mod preview_request;
 mod preview_worker;
@@ -667,7 +669,7 @@ impl eframe::App for TextureCraftApp {
         self.poll_bake(ctx);
         self.poll_resize(ctx);
         self.poll_link_cooks(ctx);
-        // The library shelf rescans when the window comes back (MaterialCraft may have sent a material).
+        // The library shelf rescans when the window comes back (MaterialCraft may have sent a material)
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         if focused && !self.focused {
             self.library = None;
@@ -690,9 +692,9 @@ impl eframe::App for TextureCraftApp {
         updates_ui::tick(self, ctx);
         self.bindings.sync(&self.ui.keymap, craft_keymap::egui::platform(ctx));
         menus::shortcuts(self, ctx);
-        // A stored path being edited repaints its sublayer as its points, brush or material change.
+        // The Path tool's curve repaints (a preview while placed) as its points, brush or material change
         if let Err(e) = self.session.path_live() {
-            self.session.stop_path_edit();
+            self.session.cancel_path();
             self.toast(e.to_string(), true);
         }
         profile::drive(self, ctx);
@@ -718,7 +720,7 @@ impl eframe::App for TextureCraftApp {
         }
         let hide = self.ui.hide_ui;
         let tk = theme::Tokens::get(&ctx);
-        // The dock keeps the cards' gutter from the bars and rails around it.
+        // The dock keeps the cards' gutter from the bars and rails around it
         let panel_frame = if hide { egui::Frame::NONE.fill(tk.viewport) } else { egui::Frame::NONE.fill(tk.chrome).inner_margin(theme::GUTTER) };
         egui::CentralPanel::default().frame(panel_frame).show(ui, |ui| if hide { viewport::central(self, ui) } else { docking::show(self, ui) });
         windows::show(self, &ctx);
