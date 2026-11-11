@@ -1885,7 +1885,7 @@ mod tests {
 
         // Every path in the selection stays warm, and leaving it releases every sampled buffer
         for _ in 0..4 {
-            let _ = context.run_ui(Default::default(), |ui| {
+            let output = context.run_ui(Default::default(), |ui| {
                 for index in 0..8 {
                     let surface = stored_surface(harness.state(), ui, effect, index).unwrap();
                     assert!(surface.iter().map(Vec::len).sum::<usize>() > 10);
@@ -1896,22 +1896,26 @@ mod tests {
                     }
                 }
             });
+
+            // This cache lifecycle test has no renderer to consume texture updates
+            output.drop_without_applying_deltas();
         }
 
         let EffectKind::Path(paths) = &mut harness.state_mut().session.doc.project.effect_mut(effect).unwrap().kind else { panic!("path effect") };
         for path in paths {
             path.viewport = [800.0, 800.0];
         }
-        let _ = context.run_ui(Default::default(), |ui| {
+        let output = context.run_ui(Default::default(), |ui| {
             for (index, previous) in previous.iter_mut().enumerate() {
                 let surface = stored_surface(harness.state(), ui, effect, index).unwrap();
                 assert!(previous.upgrade().is_none(), "editing a path releases its obsolete samples");
                 *previous = Arc::downgrade(&surface);
             }
         });
+        output.drop_without_applying_deltas();
 
         for _ in 0..2 {
-            let _ = context.run_pass(Default::default(), |_| {});
+            context.run_pass(Default::default(), |_| {}).drop_without_applying_deltas();
         }
 
         assert!(previous.iter().all(|surface| surface.upgrade().is_none()), "unused path surfaces must be freed while the window stays open");
