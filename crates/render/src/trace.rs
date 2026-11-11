@@ -134,6 +134,7 @@ impl TraceScene {
         scene.set_scatter(display.scatter_color, display.scatter_radius);
         scene.ior = display.ior;
         scene.lens = display.dof.enabled.then_some([display.dof.focus_distance, display.dof.aperture]);
+
         scene
     }
 

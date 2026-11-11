@@ -113,11 +113,10 @@ pub struct GpuTracer {
     env: Option<EnvGpu>,
     materials: Option<Materials>,
     acc: Option<Accum>,
-    /// The accumulation buffers of the size before the last size change. Rendering switches
-    /// between two sizes (small while the camera moves, full when it stops), and allocating
-    /// ~100 MB of buffers on every switch costs tens of milliseconds, a visible hitch.
+    /// Keep the preceding size so motion/full-resolution switches can reuse allocations.
     spare_acc: Option<Accum>,
     /// How many sets of accumulation buffers were allocated (for tests).
+    #[cfg(test)]
     acc_allocations: u32,
     scene: Option<SceneConst>,
     bind: Option<wgpu::BindGroup>,
@@ -316,6 +315,7 @@ impl GpuTracer {
             materials: None,
             acc: None,
             spare_acc: None,
+            #[cfg(test)]
             acc_allocations: 0,
             scene: None,
             bind: None,
@@ -509,30 +509,36 @@ impl GpuTracer {
 
     /// Start over at `width × height` (the accumulation buffers are cleared or reallocated).
     pub fn reset(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, width: u32, height: u32) -> Result<(), String> {
-        let (w, h) = (width.clamp(1, 8192), height.clamp(1, 8192));
+        let (width, height) = (width.clamp(1, 8192), height.clamp(1, 8192));
         self.samples = 0;
-        if let Some(a) = self.acc.as_ref().filter(|a| (a.width, a.height) == (w, h)) {
-            for b in &a.acc {
-                encoder.clear_buffer(b, 0, None);
+        if let Some(accumulation) = self.acc.as_ref().filter(|accumulation| (accumulation.width, accumulation.height) == (width, height)) {
+            for buffer in &accumulation.acc {
+                encoder.clear_buffer(buffer, 0, None);
             }
+
             return Ok(());
         }
+
         self.bind = None;
-        // Back to the size before the last change: reuse that set (cleared) instead of allocating.
-        if let Some(spare) = self.spare_acc.take_if(|a| (a.width, a.height) == (w, h)) {
-            for b in spare.acc.iter().chain(&spare.illum) {
-                encoder.clear_buffer(b, 0, None);
+
+        // Reused buffers must not retain samples from the previous view
+        if let Some(spare) = self.spare_acc.take_if(|accumulation| (accumulation.width, accumulation.height) == (width, height)) {
+            for buffer in spare.acc.iter().chain(&spare.illum) {
+                encoder.clear_buffer(buffer, 0, None);
             }
+
             self.spare_acc = self.acc.replace(spare);
             return Ok(());
         }
+
         self.spare_acc = self.acc.take();
-        let bytes = u64::from(w) * u64::from(h) * 16;
+        let bytes = u64::from(width) * u64::from(height) * 16;
         let limits = device.limits();
         if bytes > limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) {
-            return Err(format!("a {w}×{h} render exceeds this GPU's buffer limit"));
+            return Err(format!("a {width}×{height} render exceeds this GPU's buffer limit"));
         }
-        let buf = |label| {
+
+        let create_buffer = |label| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
                 size: bytes,
@@ -541,12 +547,16 @@ impl GpuTracer {
             })
         };
         self.acc = Some(scoped(device, "GPU path tracing: accumulation buffers", || Accum {
-            width: w,
-            height: h,
-            acc: ["tc_acc_hit", "tc_acc_albedo", "tc_acc_normal", "tc_acc_env"].map(buf),
-            illum: ["tc_illum_a", "tc_illum_b"].map(buf),
+            width,
+            height,
+            acc: ["tc_acc_hit", "tc_acc_albedo", "tc_acc_normal", "tc_acc_env"].map(create_buffer),
+            illum: ["tc_illum_a", "tc_illum_b"].map(create_buffer),
         })?);
-        self.acc_allocations += 1;
+        #[cfg(test)]
+        {
+            self.acc_allocations += 1;
+        }
+
         Ok(())
     }
 
@@ -818,35 +828,56 @@ mod tests {
 
     /// The radiance accumulation, read back.
     fn accumulation(h: &Headless, t: &GpuTracer) -> Vec<[f32; 4]> {
-        let acc = t.acc.as_ref().unwrap();
-        let bytes = acc.width as u64 * acc.height as u64 * 16;
-        let staging = h.device.create_buffer(&wgpu::BufferDescriptor {
+        read_buffer(h, &t.acc.as_ref().unwrap().acc[0])
+    }
+
+    fn read_buffer(headless: &Headless, buffer: &wgpu::Buffer) -> Vec<[f32; 4]> {
+        let bytes = buffer.size();
+        let staging = headless.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
             size: bytes,
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let mut enc = h.device.create_command_encoder(&Default::default());
-        enc.copy_buffer_to_buffer(&acc.acc[0], 0, &staging, 0, bytes);
-        h.queue.submit([enc.finish()]);
+        let mut encoder = headless.device.create_command_encoder(&Default::default());
+        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, bytes);
+        headless.queue.submit([encoder.finish()]);
         staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        h.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+        headless.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+
         bytemuck::cast_slice(&staging.slice(..).get_mapped_range().unwrap()).to_vec()
     }
 
     #[test]
     fn switching_between_two_sizes_reuses_the_accumulation_buffers() {
-        let Some((h, mut t)) = gpu() else { return };
-        let mut enc = h.device.create_command_encoder(&Default::default());
-        for (w, ht) in [(64, 48), (32, 24), (64, 48), (32, 24), (64, 48)] {
-            t.reset(&h.device, &mut enc, w, ht).unwrap();
-            let a = t.acc.as_ref().unwrap();
-            assert_eq!((a.width, a.height), (w, ht));
+        let Some((headless, mut tracer)) = gpu() else { return };
+
+        for (width, height) in [(64, 48), (32, 24), (64, 48), (32, 24), (64, 48)] {
+            let mut encoder = headless.device.create_command_encoder(&Default::default());
+            tracer.reset(&headless.device, &mut encoder, width, height).unwrap();
+            headless.queue.submit([encoder.finish()]);
+
+            let accumulation = tracer.acc.as_ref().unwrap();
+            assert_eq!((accumulation.width, accumulation.height), (width, height));
+            assert_eq!(tracer.samples(), 0);
+            for buffer in accumulation.acc.iter().chain(&accumulation.illum) {
+                assert!(read_buffer(&headless, buffer).iter().all(|pixel| *pixel == [0.0; 4]), "reused buffers must be cleared");
+
+                // Leave nonzero contents to detect stale pixels on the next reuse
+                let pixels = vec![[1.0f32; 4]; (width * height) as usize];
+                headless.queue.write_buffer(buffer, 0, bytemuck::cast_slice(&pixels));
+            }
+            tracer.samples = 7;
         }
-        assert_eq!(t.acc_allocations, 2, "two sizes, two allocations, however often it switches");
-        t.reset(&h.device, &mut enc, 16, 16).unwrap();
-        assert_eq!(t.acc_allocations, 3, "a third size allocates (and drops the oldest set)");
-        h.queue.submit([enc.finish()]);
+
+        assert_eq!(tracer.acc_allocations, 2, "two sizes, two allocations, however often it switches");
+        let mut encoder = headless.device.create_command_encoder(&Default::default());
+        tracer.reset(&headless.device, &mut encoder, 16, 16).unwrap();
+        headless.queue.submit([encoder.finish()]);
+        assert_eq!(tracer.acc_allocations, 3, "a third size allocates (and drops the oldest set)");
+
+        tracer.release();
+        assert!(tracer.acc.is_none() && tracer.spare_acc.is_none(), "leaving Rendering mode frees both sizes");
     }
 
     const WHITE: [(Channel, [f32; 3]); 3] = [(Channel::BaseColor, [1.0; 3]), (Channel::Metallic, [0.0; 3]), (Channel::Roughness, [0.5; 3])];

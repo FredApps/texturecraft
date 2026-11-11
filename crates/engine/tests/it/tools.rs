@@ -2,10 +2,10 @@
 //! agents paint.
 
 use serde_json::{Value, json};
-use texturecraft_engine::core::Channel;
+use texturecraft_engine::core::{Channel, LayerId};
 use texturecraft_engine::geom::glam::Vec2;
 use texturecraft_engine::geom::primitives;
-use texturecraft_engine::{Session, execute};
+use texturecraft_engine::{Session, StackTarget, execute};
 
 const RES: f32 = 256.0;
 
@@ -179,4 +179,68 @@ fn quick_mask_limits_painting() {
     execute(&mut s, "tool.material", &json!({"channel": "baseColor", "color": [0.0, 1.0, 0.0]})).unwrap();
     dab(&mut s, 150.0, 200.0);
     assert!(color_at(&s, 150.0, 200.0)[1] > 0.85, "disabled: everything is open");
+}
+
+/// How much redder than green a texel must be to count as painted (faded edges included)
+const PAINTED_TINT: f32 = 0.05;
+
+/// Separate painted runs down texture column `x` (base color tinted red)
+fn painted_runs(session: &Session, x: u32) -> usize {
+    let painted = |y: u32| {
+        let color = session.caches[0].composite.value(Channel::BaseColor, x, y);
+        color[0] - color[1] > PAINTED_TINT
+    };
+    (0..RES as u32).filter(|&y| painted(y) && (y == 0 || !painted(y - 1))).count()
+}
+
+#[test]
+fn a_stroke_to_the_edge_of_the_mesh_fades_without_breaking_into_dots() {
+    let mut session = session();
+    paint_red(&mut session, 4.0);
+    // From the middle of the view to past the ball's right edge, above center
+    let points: Vec<Value> = (0..40).map(|step| json!([200.0 + step as f32 * 6.0, 165.0])).collect();
+    execute(&mut session, "tool.stroke", &json!({"points": points})).unwrap();
+    session.update();
+
+    // The stroke crosses each texture column once, also where the surface turns away from the camera
+    let broken: Vec<u32> = (0..RES as u32).filter(|&x| painted_runs(&session, x) > 1).collect();
+    assert!(broken.is_empty(), "columns with gaps: {broken:?}");
+}
+
+#[test]
+fn swap_mask_value_inverts_only_while_a_mask_is_the_target() {
+    let mut session = session();
+    execute(&mut session, "layer.add.paint", &Value::Null).unwrap();
+    let swap = |session: &mut Session| execute(session, "tool.swapMaskValue", &Value::Null);
+    let effect_target = |result: Value| StackTarget::Effect(LayerId(result["effect"].as_u64().unwrap()));
+
+    assert!(swap(&mut session).is_err(), "painting the layer content: nothing to invert");
+
+    let content_effect = effect_target(execute(&mut session, "effect.add.paint", &json!({"target": "content"})).unwrap());
+    session.target = content_effect;
+    assert!(swap(&mut session).is_err(), "a content effect is not a mask");
+
+    execute(&mut session, "mask.add.white", &Value::Null).unwrap();
+    session.target = StackTarget::Mask;
+    session.tool.mask_value = 0.2;
+
+    swap(&mut session).unwrap();
+
+    assert_eq!(session.tool.mask_value, 0.8);
+
+    session.tool.mask_value = 1.0;
+
+    swap(&mut session).unwrap();
+
+    assert_eq!(session.tool.mask_value, 0.0);
+
+    swap(&mut session).unwrap();
+
+    assert_eq!(session.tool.mask_value, 1.0, "pressing it again goes back");
+
+    session.target = effect_target(execute(&mut session, "effect.add.paint", &json!({"target": "mask"})).unwrap());
+
+    swap(&mut session).unwrap();
+
+    assert_eq!(session.tool.mask_value, 0.0, "a mask effect paints the mask too");
 }

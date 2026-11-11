@@ -26,6 +26,15 @@ use crate::TextureCraftApp;
 use crate::i18n::{n_, tr, trf};
 use crate::theme::Tokens;
 
+mod frame_floor;
+mod motion;
+mod spp_control;
+#[cfg(test)]
+mod tests;
+
+use motion::Motion;
+use spp_control::{SppControl, rescale_spp};
+
 /// A finished pass, ready to show.
 struct Frame {
     width: u32,
@@ -133,7 +142,7 @@ struct GpuView {
     out_view: wgpu::TextureView,
     texture: egui::TextureId,
     status: Arc<Mutex<GpuStatus>>,
-    /// Samples per pixel per frame: grows while frames are quick, halves when they are slow.
+    /// Samples per pixel per frame: grows while frames are quick, decreases when they are slow.
     spp: u32,
     /// What steers `spp`.
     spp_control: SppControl,
@@ -171,8 +180,8 @@ const LOADING_MAX_SPP: u32 = 8;
 
 /// Whether textures are still loading: tiles wait to be composited, or composited ones to be
 /// uploaded (the GPU render copies the uploaded display textures).
-fn textures_loading(s: &texturecraft_engine::Session) -> bool {
-    s.pending_tiles() > 0 || s.caches.iter().any(|c| !c.upload.is_empty())
+fn textures_loading(session: &texturecraft_engine::Session) -> bool {
+    session.pending_tiles() > 0 || session.caches.iter().any(|cache| !cache.upload.is_empty())
 }
 
 /// Whether changed textures are taken into the render now: always, except while loading, when at
@@ -195,138 +204,13 @@ fn holds_previous(samples: u32, elapsed: f64) -> bool {
     samples < SETTLE_HOLD_SAMPLES && elapsed < SETTLE_HOLD_MAX_S
 }
 
-/// Most samples per pixel one frame adds.
-const MAX_SPP: u32 = 16;
-
-/// Frames over which [`FrameFloor`] keeps the quickest frame time.
-const FLOOR_FRAMES: usize = 30;
-
-/// The range the quickest frame time is held to (seconds): from 75 frames a second to 30, so a
-/// run of slow frames never makes slow look normal. The quick end matters as much: frames that
-/// are not paced by the display (or tiny ones while little is traced) can take 3 ms, and taking
-/// that as the baseline cuts the samples per frame to one at the first frame that does real work,
-/// which left the render grainy for seconds. Below this, frames count as quick, not as the target.
-const FLOOR_RANGE_S: (f64, f64) = (1.0 / 75.0, 1.0 / 30.0);
-
-/// A frame quicker than this many times the quickest recent one adds one more sample next time.
-/// With vsync, frames come at the display's refresh rate however light they are, so the limits
-/// are relative to it (a fixed 1/90 s never let a 60 Hz display grow at all).
-const SPP_GROW_BELOW: f64 = 1.25;
-
-/// A frame at least this many times the quickest recent one (a missed refresh with vsync is two;
-/// wide enough that ordinary variation in a busy frame does not cut) cuts the samples per frame (by a
-/// quarter, by the same ratio the frame overshoots when that is larger), so a slow frame is
-/// followed by a short one, not a long one. With vsync a frame that misses the refresh takes two.
-const SPP_CUT_ABOVE: f64 = 1.75;
-
-/// Frames after a cut during which the samples per frame do not grow again, so they settle
-/// below the limit instead of climbing straight back to the frame that missed it (a hitch every
-/// few frames).
-const SPP_GROW_PAUSE_FRAMES: u32 = 6;
-
-/// The quickest of the last [`FLOOR_FRAMES`] frame times: about the display's refresh interval
-/// while the GPU keeps up.
-#[derive(Default)]
-struct FrameFloor {
-    recent: std::collections::VecDeque<f64>,
-}
-
-impl FrameFloor {
-    /// Record frame time `dt` (seconds); the quickest recent one, within [`FLOOR_RANGE_S`].
-    fn push(&mut self, dt: f64) -> f64 {
-        if dt.is_finite() && dt > 0.0 {
-            if self.recent.len() >= FLOOR_FRAMES {
-                self.recent.pop_front();
-            }
-            self.recent.push_back(dt);
-        }
-        self.recent.iter().copied().fold(FLOOR_RANGE_S.1, f64::min).clamp(FLOOR_RANGE_S.0, FLOOR_RANGE_S.1)
-    }
-}
-
-/// Samples per pixel for the next frame, from the last frame's time `dt` and the quickest recent
-/// one `floor` (seconds; see [`FrameFloor`]): one more while frames are quick, fewer when slow,
-/// steady in between and for [`SPP_GROW_PAUSE_FRAMES`] after a cut (`since_cut` frames ago).
-/// Steady between the two limits is what stops the count from climbing until the GPU backs up,
-/// jumping down, and climbing again.
-fn next_spp(spp: u32, dt: f64, floor: f64, since_cut: u32) -> u32 {
-    let cut_above = floor * SPP_CUT_ABOVE;
-    if dt >= cut_above {
-        let by_ratio = (f64::from(spp) * cut_above / dt) as u32;
-        by_ratio.min(spp * 3 / 4).max(1)
-    } else if dt < floor * SPP_GROW_BELOW && since_cut >= SPP_GROW_PAUSE_FRAMES {
-        (spp + 1).min(MAX_SPP)
-    } else {
-        spp
-    }
-}
-
-/// What steers the GPU render's samples per pixel per frame (see [`next_spp`]).
-struct SppControl {
-    floor: FrameFloor,
-    /// Frames since the samples per frame were last cut.
-    since_cut: u32,
-}
-
-impl Default for SppControl {
-    /// A new render may grow from its first frame.
-    fn default() -> SppControl {
-        SppControl { floor: FrameFloor::default(), since_cut: SPP_GROW_PAUSE_FRAMES }
-    }
-}
-
-impl SppControl {
-    /// The samples per frame after a frame of `dt` seconds traced with `spp`.
-    fn next(&mut self, spp: u32, dt: f64) -> u32 {
-        let floor = self.floor.push(dt);
-        let next = next_spp(spp, dt, floor, self.since_cut);
-        self.since_cut = if next < spp { 0 } else { self.since_cut.saturating_add(1) };
-        next
-    }
-}
-
-/// Samples per frame after the traced size changed from `old` to `new` pixels (frame time is
-/// about proportional to samples times pixels).
-fn rescale_spp(spp: u32, old: (u32, u32), new: (u32, u32)) -> u32 {
-    let (o, n) = (u64::from(old.0) * u64::from(old.1), (u64::from(new.0) * u64::from(new.1)).max(1));
-    ((u64::from(spp) * o / n).max(1) as u32).min(MAX_SPP)
-}
-
-/// Whether the camera is moving, for [`MOVING_SCALE`].
-#[derive(Default)]
-struct Motion {
-    /// The camera as last seen (compared, never parsed).
-    camera: String,
-    /// When it last changed. The first frame counts as a change: a render that has just started
-    /// begins at the smaller size too (four times the samples at once, so it opens smooth
-    /// instead of as raw one-sample noise) and grows to full size like after any move.
-    last_change: Option<f64>,
-}
-
-impl Motion {
-    /// Record `camera` at time `now` (seconds); true while it changed within [`MOTION_SETTLE_S`].
-    /// `loading`: textures are still being composited. Each finished tile restarts the render, so
-    /// like a moving camera it keeps being redone from no samples, and is traced small for the
-    /// same reason (four times the samples per restart).
-    fn moving(&mut self, camera: &OrbitCamera, now: f64, loading: bool) -> bool {
-        if loading {
-            self.last_change = Some(now);
-        }
-        let c = format!("{camera:?}");
-        if self.camera != c {
-            self.last_change = Some(now);
-            self.camera = c;
-        }
-        self.last_change.is_some_and(|t| now - t < MOTION_SETTLE_S)
-    }
-}
-
-/// The size to trace at for a view of `full` pixels: smaller while the camera `moving`.
+/// Trace fewer pixels while the camera is moving, keeping tiny views at their original size.
 fn traced_size(full: (u32, u32), moving: bool) -> (u32, u32) {
     if !moving {
         return full;
     }
-    let scale = |n: u32| ((n as f32 * MOVING_SCALE) as u32).clamp(16.min(n), n);
+
+    let scale = |dimension: u32| ((dimension as f32 * MOVING_SCALE) as u32).clamp(16.min(dimension), dimension);
     (scale(full.0), scale(full.1))
 }
 
@@ -374,43 +258,47 @@ fn render_size(rect: Rect) -> (u32, u32) {
     ((rect.width() * scale).max(16.0) as u32, (rect.height() * scale).max(16.0) as u32)
 }
 
+/// Build a scene while retaining unchanged geometry and the decoded environment.
 fn trace_scene(app: &TextureCraftApp) -> TraceScene {
-    let s = &app.session;
-    let d = &s.doc.project.display;
-    let sets: Vec<TraceSet> = s
+    let session = &app.session;
+    let display = &session.doc.project.display;
+    let sets: Vec<TraceSet> = session
         .doc
         .project
         .texture_sets
         .iter()
-        .zip(&s.caches)
-        .map(|(ts, c)| TraceSet { material: ts.material, composite: c.composite.clone(), height_strength: ts.atlas_height_strength() })
+        .zip(&session.caches)
+        .map(|(set, cache)| TraceSet { material: set.material, composite: cache.composite.clone(), height_strength: set.atlas_height_strength() })
         .collect();
-    let env_image = d.environment_resource().and_then(|n| s.images.get(n));
-    // Only displaced geometry depends on the composites (their heights).
-    let revisions: Vec<u64> = if d.displacement { s.caches.iter().map(|c| c.revision).collect() } else { Vec::new() };
-    let strengths: Vec<f32> = sets.iter().map(|t| t.height_strength).collect();
-    let key = format!("{}|{revisions:?}|{strengths:?}|{}", s.mesh_id, d.displacement);
+    let env_image = display.environment_resource().and_then(|n| session.images.get(n));
+
+    // Only displaced geometry depends on the composites (their heights)
+    let revisions: Vec<u64> = if display.displacement { session.caches.iter().map(|cache| cache.revision).collect() } else { Vec::new() };
+    let strengths: Vec<f32> = sets.iter().map(|set| set.height_strength).collect();
+    let key = format!("{}|{revisions:?}|{strengths:?}|{}", session.mesh_id, display.displacement);
     let mut cached = app.render.geometry.lock().unwrap_or_else(PoisonError::into_inner);
     let (mesh, bvh) = match cached.as_ref() {
-        Some((k, m, b)) if *k == key => (m.clone(), b.clone()),
+        Some((cached_key, mesh, bvh)) if *cached_key == key => (mesh.clone(), bvh.clone()),
         _ => {
-            let (m, b) = trace_geometry(&s.mesh, &s.bvh, &sets, d);
-            *cached = Some((key, m.clone(), b.clone()));
-            (m, b)
+            let (mesh, bvh) = trace_geometry(&session.mesh, &session.bvh, &sets, display);
+            *cached = Some((key, mesh.clone(), bvh.clone()));
+            (mesh, bvh)
         }
     };
     drop(cached);
-    let env_key: EnvKey = (d.environment.clone(), env_image.map_or(0, |i| Arc::as_ptr(i) as usize));
+
+    let env_key: EnvKey = (display.environment.clone(), env_image.map_or(0, |image| Arc::as_ptr(image) as usize));
     let mut env_cached = app.render.env.lock().unwrap_or_else(PoisonError::into_inner);
     let env = match env_cached.as_ref() {
-        Some((k, e)) if *k == env_key => e.clone(),
+        Some((cached_key, environment)) if *cached_key == env_key => environment.clone(),
         _ => {
-            let e = Arc::new(TraceScene::display_env(d, env_image.map(|i| i.as_ref())));
-            *env_cached = Some((env_key, e.clone()));
-            e
+            let environment = Arc::new(TraceScene::display_env(display, env_image.map(|image| image.as_ref())));
+            *env_cached = Some((env_key, environment.clone()));
+            environment
         }
     };
-    TraceScene::for_display_env(mesh, bvh, sets, d, env)
+
+    TraceScene::for_display_env(mesh, bvh, sets, display, env)
 }
 
 fn settings(app: &TextureCraftApp) -> TraceSettings {
@@ -434,17 +322,19 @@ fn work(app: &TextureCraftApp, size: (u32, u32)) -> Work {
 
 /// What the traced scene depends on. `composites`: the texture-set composites too (their
 /// revisions bump with every composited chunk, so while textures load this changes every frame).
-fn scene_key(s: &texturecraft_engine::Session, composites: bool) -> String {
-    let revisions: Vec<u64> = if composites { s.caches.iter().map(|c| c.revision).collect() } else { Vec::new() };
-    format!("{}|{revisions:?}|{:?}", s.mesh_id, s.doc.project.display)
+fn scene_key(session: &texturecraft_engine::Session, composites: bool) -> String {
+    let revisions: Vec<u64> = if composites { session.caches.iter().map(|cache| cache.revision).collect() } else { Vec::new() };
+    let sets: Vec<_> = session.doc.project.texture_sets.iter().map(|set| (set.material, set.atlas_height_strength())).collect();
+
+    format!("{}|{revisions:?}|{sets:?}|{:?}", session.mesh_id, session.doc.project.display)
 }
 
 /// [`scene_key`] of the GPU render. It takes texture changes in by copying the display textures
 /// when their content changes (throttled while textures load, see [`take_in_textures`]), so the
 /// composites only count when they displace the geometry. Restarting on every composited chunk
 /// would rebuild the scene and reset the render every frame of a load.
-fn gpu_scene_key(s: &texturecraft_engine::Session) -> String {
-    scene_key(s, s.doc.project.display.displacement)
+fn gpu_scene_key(session: &texturecraft_engine::Session) -> String {
+    scene_key(session, session.doc.project.display.displacement)
 }
 
 /// What the render of scene `scene_key` depends on; a change restarts it.
@@ -492,38 +382,42 @@ pub fn show(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect) {
     overlay(app, ui, rect, on_gpu);
 }
 
+/// Advance the CPU render and keep the last completed image visible during restarts.
 fn show_cpu(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect) {
     let ctx = ui.ctx().clone();
     let size = render_size(rect);
-    // The CPU tracer reads the composites themselves: every change restarts it.
-    let k = key(app, &scene_key(&app.session, true), size);
-    if app.render.job.as_ref().is_none_or(|j| j.key != k) {
-        app.render.job = Some(start(app, &ctx, k, size));
+
+    // The CPU tracer reads the composites themselves: every change restarts it
+    let render_key = key(app, &scene_key(&app.session, true), size);
+    if app.render.job.as_ref().is_none_or(|job| job.key != render_key) {
+        app.render.job = Some(start(app, &ctx, render_key, size));
         app.render.samples = 0;
     }
+
     let now = ctx.input(|i| i.time);
     if let Some(job) = app.render.job.as_mut() {
         #[cfg(target_arch = "wasm32")]
         {
-            if let Some(f) = job.work.step_for(30.0) {
-                *job.latest.lock().unwrap_or_else(PoisonError::into_inner) = Some(f);
+            if let Some(frame) = job.work.step_for(30.0) {
+                *job.latest.lock().unwrap_or_else(PoisonError::into_inner) = Some(frame);
             }
             if job.work.tracer.samples < job.work.max_samples {
                 ctx.request_repaint();
             }
         }
-        if let Some(f) = job.latest.lock().unwrap_or_else(PoisonError::into_inner).take() {
-            let img = ColorImage::from_rgba_unmultiplied([f.width as usize, f.height as usize], &f.rgba);
+        if let Some(frame) = job.latest.lock().unwrap_or_else(PoisonError::into_inner).take() {
+            let image = ColorImage::from_rgba_unmultiplied([frame.width as usize, frame.height as usize], &frame.rgba);
             match app.render.texture.as_mut() {
-                Some(t) => t.set(img, TextureOptions::LINEAR),
-                None => app.render.texture = Some(ctx.load_texture("render-view", img, TextureOptions::LINEAR)),
+                Some(texture) => texture.set(image, TextureOptions::LINEAR),
+                None => app.render.texture = Some(ctx.load_texture("render-view", image, TextureOptions::LINEAR)),
             }
-            app.render.samples = f.samples;
+            app.render.samples = frame.samples;
             app.render.elapsed = now - job.started;
-            app.render.shown = Some((f.width, f.height, f.rgba));
+            app.render.shown = Some((frame.width, frame.height, frame.rgba));
         }
     }
-    let shown = app.render.texture.as_ref().filter(|_| show_image(true, app.render.samples)).map(TextureHandle::id);
+
+    let shown = app.render.texture.as_ref().map(TextureHandle::id);
     paint(ui, rect, shown);
 }
 
@@ -552,64 +446,77 @@ fn paint(ui: &Ui, rect: Rect, texture: Option<egui::TextureId>) {
 
 /// Trace on the GPU; false when it can't (no compute shaders, or it failed on this scene).
 fn show_gpu(app: &mut TextureCraftApp, ui: &Ui, rect: Rect) -> bool {
-    let Some(rs) = app.render_state.clone() else { return false };
+    let Some(render_state) = app.render_state.clone() else { return false };
     let scene_key = gpu_scene_key(&app.session);
-    if !GpuTracer::supported(&rs.device) || app.render.gpu_error.as_ref().is_some_and(|(k, _)| *k == scene_key) {
+    if !GpuTracer::supported(&render_state.device) || app.render.gpu_error.as_ref().is_some_and(|(k, _)| *k == scene_key) {
         return false;
     }
+
     app.render.gpu_error = None;
     if app.render.job.take().is_some() {
         app.render.texture = None;
         app.render.shown = None;
     }
+
     let ctx = ui.ctx().clone();
     let now = ctx.input(|i| i.time);
     let full = (rect.width().max(16.0) as u32, rect.height().max(16.0) as u32);
     let loading = textures_loading(&app.session);
     let moving = app.render.motion.moving(&app.session.camera, now, loading);
     if moving {
-        // Come back and restore the full size once the camera has been still, even with no input.
+        // Come back and restore the full size once the camera has been still, even with no input
         ctx.request_repaint_after(std::time::Duration::from_secs_f64(MOTION_SETTLE_S));
     }
+
     let size = traced_size(full, moving);
     let key = key(app, &scene_key, size);
-    let mut g = match app.render.gpu.take() {
-        Some(g) if g.size == size => g,
+    let mut previous = app.render.gpu.take();
+    if let Some(view) = previous.as_mut() {
+        // Read the completed callback before resizing replaces its status
+        view.has_image |= view.status.lock().unwrap_or_else(PoisonError::into_inner).samples > 0;
+    }
+
+    let mut view = match previous {
+        Some(view) if view.size == size => view,
         old => {
-            let out = GpuTracer::output_texture(&rs.device, size.0, size.1);
+            let out = GpuTracer::output_texture(&render_state.device, size.0, size.1);
             let out_view = out.create_view(&Default::default());
-            // A resized view keeps its scene and egui texture id.
-            let old_has_image = old.as_ref().is_some_and(|o| o.has_image);
-            let old_spp = old.as_ref().map_or(1, |o| rescale_spp(o.spp, o.size, size));
-            let mut held_since = old.as_ref().map_or(now, |o| o.held_since);
-            let growing = old.as_ref().is_some_and(|o| u64::from(o.size.0) * u64::from(o.size.1) < u64::from(size.0) * u64::from(size.1));
+
+            // A resized view keeps its scene and egui texture id
+            let old_has_image = old.as_ref().is_some_and(|previous| previous.has_image);
+            let old_spp = old.as_ref().map_or(1, |previous| rescale_spp(previous.spp, previous.size, size));
+            let mut held_since = old.as_ref().map_or(now, |previous| previous.held_since);
+            let growing = old.as_ref().is_some_and(|previous| u64::from(previous.size.0) * u64::from(previous.size.1) < u64::from(size.0) * u64::from(size.1));
             let mut held = None;
             let (texture, scene_key, scene, spp_control) = match old {
-                // Returning to full size: the old image stays up under its own texture id.
+                // Returning to full size: the old image stays up under its own texture id
                 Some(old) if growing && old.has_image => {
-                    let mut r = rs.renderer.write();
-                    if let Some(h) = old.held {
-                        r.free_texture(&h);
+                    let mut renderer = render_state.renderer.write();
+                    if let Some(texture) = old.held {
+                        renderer.free_texture(&texture);
                     }
+
                     held = Some(old.texture);
                     held_since = now;
-                    (r.register_native_texture(&rs.device, &out_view, wgpu::FilterMode::Linear), old.scene_key, old.scene, old.spp_control)
+                    (renderer.register_native_texture(&render_state.device, &out_view, wgpu::FilterMode::Linear), old.scene_key, old.scene, old.spp_control)
                 }
                 Some(old) => {
-                    let mut r = rs.renderer.write();
-                    if let Some(h) = old.held {
-                        r.free_texture(&h);
+                    let mut renderer = render_state.renderer.write();
+                    if let Some(texture) = old.held {
+                        renderer.free_texture(&texture);
                     }
-                    r.update_egui_texture_from_wgpu_texture(&rs.device, &out_view, wgpu::FilterMode::Linear, old.texture);
+
+                    renderer.update_egui_texture_from_wgpu_texture(&render_state.device, &out_view, wgpu::FilterMode::Linear, old.texture);
                     (old.texture, old.scene_key, old.scene, old.spp_control)
                 }
                 None => (
-                    rs.renderer.write().register_native_texture(&rs.device, &out_view, wgpu::FilterMode::Linear),
+                    render_state.renderer.write().register_native_texture(&render_state.device, &out_view, wgpu::FilterMode::Linear),
                     scene_key.clone(),
                     Arc::new(trace_scene(app)),
                     SppControl::default(),
                 ),
             };
+
             GpuView {
                 size,
                 scene_key,
@@ -629,65 +536,75 @@ fn show_gpu(app: &mut TextureCraftApp, ui: &Ui, rect: Rect) -> bool {
             }
         }
     };
+
     let (samples, error) = {
-        let mut st = g.status.lock().unwrap_or_else(PoisonError::into_inner);
-        g.has_image |= st.samples > 0;
-        if g.key != key {
-            st.samples = 0;
+        let mut status = view.status.lock().unwrap_or_else(PoisonError::into_inner);
+        if view.key != key {
+            status.samples = 0;
         }
-        (st.samples, st.error.take())
+
+        (status.samples, status.error.take())
     };
-    if let Some(e) = error {
-        log::warn!("GPU path tracing failed, rendering on the CPU: {e}");
-        app.render.gpu_error = Some((scene_key, e));
-        app.render.gpu = Some(g);
+
+    if let Some(error) = error {
+        log::warn!("GPU path tracing failed, rendering on the CPU: {error}");
+        app.render.gpu_error = Some((scene_key, error));
+        app.render.gpu = Some(view);
         return false;
     }
-    if g.key != key {
-        g.key = key.clone();
-        g.started = now;
+
+    if view.key != key {
+        view.key = key.clone();
+        view.started = now;
     }
-    if g.scene_key != scene_key {
-        g.scene = Arc::new(trace_scene(app));
-        g.scene_key = scene_key;
+    if view.scene_key != scene_key {
+        view.scene = Arc::new(trace_scene(app));
+        view.scene_key = scene_key;
     }
+
     let max_samples = app.ui.render.max_samples.max(1);
     if samples < max_samples {
-        // While textures load the frame time is the compositor's, not the tracer's: reading it
-        // would cut the samples to one. Keep them as they are (see `LOADING_MAX_SPP`).
-        g.spp = if loading { g.spp.min(LOADING_MAX_SPP) } else { g.spp_control.next(g.spp, f64::from(ctx.input(|i| i.stable_dt))) };
-        app.render.elapsed = now - g.started;
+        // Loading time includes compositing, so it cannot reliably steer the tracer's sample count
+        view.spp = if loading { view.spp.min(LOADING_MAX_SPP) } else { view.spp_control.next(view.spp, f64::from(ctx.input(|i| i.stable_dt))) };
+        app.render.elapsed = now - view.started;
         ctx.request_repaint();
     }
+
     app.render.samples = samples;
-    if poll_read(app, &rs.device, &g) {
+    if poll_read(app, &render_state.device, &view) {
         ctx.request_repaint();
     }
-    let cb = TraceCallback {
+
+    let callback = TraceCallback {
         key,
-        scene: g.scene.clone(),
+        scene: view.scene.clone(),
         camera: app.session.camera,
         settings: settings(app),
         display: display(app),
         max_samples,
-        spp: g.spp,
+        spp: view.spp,
         loading,
         now,
         size,
-        out: g.out.clone(),
-        out_view: g.out_view.clone(),
-        status: g.status.clone(),
-        read: g.read.clone(),
+        out: view.out.clone(),
+        out_view: view.out_view.clone(),
+        status: view.status.clone(),
+        read: view.read.clone(),
     };
-    ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, cb));
-    if g.held.is_some()
-        && !holds_previous(samples, now - g.held_since)
-        && let Some(h) = g.held.take()
-    {
-        rs.renderer.write().free_texture(&h);
+    ui.painter().add(egui_wgpu::Callback::new_paint_callback(rect, callback));
+    if let Some(held) = view.held {
+        let elapsed = now - view.held_since;
+        if holds_previous(samples, elapsed) {
+            // A render capped below the hold threshold still needs a frame to release the image
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64((SETTLE_HOLD_MAX_S - elapsed).max(0.0)));
+        } else {
+            render_state.renderer.write().free_texture(&held);
+            view.held = None;
+        }
     }
-    paint(ui, rect, show_image(g.has_image, samples).then_some(g.held.unwrap_or(g.texture)));
-    app.render.gpu = Some(g);
+
+    paint(ui, rect, show_image(view.has_image, samples).then_some(view.held.unwrap_or(view.texture)));
+    app.render.gpu = Some(view);
     true
 }
 
@@ -750,40 +667,45 @@ struct TraceCallback {
 }
 
 impl TraceCallback {
+    /// Synchronize scene data, add samples and resolve the frame for the UI.
     fn run(
         &self,
-        st: &mut TraceState,
+        state: &mut TraceState,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         renderer: &Renderer,
     ) -> Result<(), String> {
-        let t = &mut st.tracer;
-        if !st.scene.as_ref().is_some_and(|s| Arc::ptr_eq(s, &self.scene)) {
-            t.set_scene(device, queue, &self.scene)?;
-            st.scene = Some(self.scene.clone());
+        let tracer = &mut state.tracer;
+        if !state.scene.as_ref().is_some_and(|scene| Arc::ptr_eq(scene, &self.scene)) {
+            tracer.set_scene(device, queue, &self.scene)?;
+            state.scene = Some(self.scene.clone());
         }
-        let take_in = take_in_textures(self.loading, self.now, st.last_sync);
-        if take_in {
-            st.last_sync = self.now;
+
+        let sync_textures = take_in_textures(self.loading, self.now, state.last_sync);
+        if sync_textures {
+            state.last_sync = self.now;
         }
-        if (take_in && t.sync_materials(device, queue, encoder, renderer)?) || st.key != self.key {
-            t.reset(device, encoder, self.size.0, self.size.1)?;
-            st.key.clone_from(&self.key);
-            st.resolved = None;
+        if (sync_textures && tracer.sync_materials(device, queue, encoder, renderer)?) || state.key != self.key {
+            tracer.reset(device, encoder, self.size.0, self.size.1)?;
+            state.key.clone_from(&self.key);
+            state.resolved = None;
         }
-        let done = t.samples();
-        if done < self.max_samples {
-            t.pass(device, queue, encoder, &self.camera, &self.settings, self.spp.min(self.max_samples - done));
+
+        let samples = tracer.samples();
+        if samples < self.max_samples {
+            tracer.pass(device, queue, encoder, &self.camera, &self.settings, self.spp.min(self.max_samples - samples));
         }
-        if st.resolved != Some(t.samples()) {
-            t.resolve(device, queue, encoder, &self.display, &self.out_view);
-            st.resolved = Some(t.samples());
+        if state.resolved != Some(tracer.samples()) {
+            tracer.resolve(device, queue, encoder, &self.display, &self.out_view);
+            state.resolved = Some(tracer.samples());
         }
+
         let mut read = self.read.lock().unwrap_or_else(PoisonError::into_inner);
         if matches!(*read, Read::Wanted) {
             *read = Read::Copied(Readback::new(device, encoder, &self.out));
         }
+
         Ok(())
     }
 }
@@ -823,19 +745,21 @@ impl CallbackTrait for TraceCallback {
 
 /// Free the GPU render (its texture and the tracer's scene memory; the pipelines stay).
 fn drop_gpu(app: &mut TextureCraftApp) {
-    let Some(g) = app.render.gpu.take() else { return };
-    if let Some(rs) = &app.render_state {
-        let mut r = rs.renderer.write();
-        r.free_texture(&g.texture);
-        if let Some(h) = g.held {
-            r.free_texture(&h);
+    let Some(view) = app.render.gpu.take() else { return };
+    if let Some(render_state) = &app.render_state {
+        let mut renderer = render_state.renderer.write();
+        renderer.free_texture(&view.texture);
+        if let Some(held) = view.held {
+            renderer.free_texture(&held);
         }
-        if let Some(st) = r.callback_resources.get_mut::<TraceState>() {
-            st.tracer.release();
-            (st.scene, st.resolved) = (None, None);
-            st.key.clear();
-            // The materials went with the release: the next render takes textures in at once.
-            st.last_sync = f64::MIN;
+
+        if let Some(state) = renderer.callback_resources.get_mut::<TraceState>() {
+            state.tracer.release();
+            (state.scene, state.resolved) = (None, None);
+            state.key.clear();
+
+            // The materials went with the release: the next render takes textures in at once
+            state.last_sync = f64::MIN;
         }
     }
 }
@@ -927,181 +851,4 @@ impl RenderView {
 pub fn stop(app: &mut TextureCraftApp) {
     drop_gpu(app);
     app.render = RenderView::default();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        FLOOR_FRAMES, FLOOR_RANGE_S, FrameFloor, LOADING_RESTART_S, MAX_SPP, MOTION_SETTLE_S, Motion, OrbitCamera, SETTLE_HOLD_MAX_S, SETTLE_HOLD_SAMPLES,
-        SPP_GROW_PAUSE_FRAMES, SppControl, gpu_scene_key, holds_previous, next_spp, rescale_spp, scene_key, show_image, take_in_textures, textures_loading,
-        traced_size,
-    };
-    use texturecraft_engine::Session;
-    use texturecraft_engine::geom::primitives;
-
-    fn session() -> Session {
-        let mut s = Session::new_project("t", primitives::sphere(1.0, 16, 8), "builtin:sphere", None, 128).unwrap();
-        s.update();
-        s
-    }
-
-    /// Every composited chunk bumps a revision. The CPU render restarts on it (it reads the
-    /// composites); the GPU render does not (it copies the display textures when they change,
-    /// throttled while loading) unless the heights displace its geometry.
-    #[test]
-    fn composited_chunks_restart_the_gpu_render_only_when_displaced() {
-        let mut s = session();
-        let (cpu, gpu) = (scene_key(&s, true), gpu_scene_key(&s));
-        s.caches[0].revision += 1;
-        assert_ne!(scene_key(&s, true), cpu);
-        assert_eq!(gpu_scene_key(&s), gpu, "the GPU scene is kept while textures load");
-        s.doc.project.display.displacement = true;
-        let displaced = gpu_scene_key(&s);
-        s.caches[0].revision += 1;
-        assert_ne!(gpu_scene_key(&s), displaced, "displaced geometry follows the heights");
-    }
-
-    /// Loading lasts until the composited tiles are uploaded too (the GPU render reads them).
-    #[test]
-    fn textures_load_until_their_tiles_are_uploaded() {
-        let mut s = session();
-        s.caches[0].upload.clear();
-        assert!(!textures_loading(&s));
-        s.caches[0].upload.insert((0, 0));
-        assert!(textures_loading(&s), "a tile waits to be uploaded");
-        s.caches[0].upload.clear();
-        s.caches[0].invalidate_all();
-        assert!(textures_loading(&s), "tiles wait to be composited");
-    }
-
-    /// Orbiting restarts the render every frame (samples back to 0): the last image stays up.
-    #[test]
-    fn a_restart_keeps_the_previous_image_on_screen() {
-        assert!(show_image(true, 0), "restart with an earlier frame must not show the placeholder");
-        assert!(show_image(true, 5));
-        assert!(show_image(false, 1));
-    }
-
-    /// Before anything was traced there is nothing to show but the placeholder.
-    #[test]
-    fn a_moving_camera_traces_smaller_and_a_still_one_at_full_size() {
-        assert_eq!(traced_size((1600, 900), false), (1600, 900));
-        assert_eq!(traced_size((1600, 900), true), (800, 450));
-        // Tiny views are never made smaller than they are or than 16 pixels.
-        assert_eq!(traced_size((10, 10), true), (10, 10));
-        assert_eq!(traced_size((20, 400), true), (16, 200));
-    }
-
-    #[test]
-    fn motion_starts_on_a_camera_change_and_settles_after_a_moment() {
-        let mut m = Motion::default();
-        let mut cam = OrbitCamera::default();
-        assert!(m.moving(&cam, 0.0, false), "a render that just started opens at the smaller size");
-        assert!(!m.moving(&cam, 1.0, false));
-        cam.yaw += 0.1;
-        assert!(m.moving(&cam, 2.0, false));
-        assert!(m.moving(&cam, 2.0 + MOTION_SETTLE_S * 0.5, false));
-        assert!(!m.moving(&cam, 2.0 + MOTION_SETTLE_S * 1.5, false));
-        assert!(m.moving(&cam, 5.0, true), "textures still loading count as motion");
-        assert!(m.moving(&cam, 5.0 + MOTION_SETTLE_S * 0.5, false), "and settle a moment after they finish");
-        assert!(!m.moving(&cam, 5.0 + MOTION_SETTLE_S * 1.5, false));
-    }
-
-    #[test]
-    fn the_soft_image_stays_until_the_full_size_render_has_samples_or_time_runs_out() {
-        assert!(holds_previous(0, 0.0));
-        assert!(holds_previous(SETTLE_HOLD_SAMPLES - 1, SETTLE_HOLD_MAX_S * 0.5));
-        assert!(!holds_previous(SETTLE_HOLD_SAMPLES, 0.0), "enough samples: show the new render");
-        assert!(!holds_previous(0, SETTLE_HOLD_MAX_S), "a slow GPU: don't hold it forever");
-    }
-
-    #[test]
-    fn samples_per_frame_grow_slowly_hold_in_between_and_drop_fast() {
-        let (floor, free) = (1.0 / 144.0, SPP_GROW_PAUSE_FRAMES);
-        assert_eq!(next_spp(4, floor, floor, free), 5, "frames at the refresh rate: one more");
-        assert_eq!(next_spp(MAX_SPP, floor, floor, free), MAX_SPP);
-        assert_eq!(next_spp(4, floor, floor, 0), 4, "just after a cut: no growth yet");
-        assert_eq!(next_spp(6, floor * 1.4, floor, free), 6, "between the limits: steady");
-        assert_eq!(next_spp(8, floor * 2.5, floor, free), 5, "slow frame: cut by the overshoot (8 * 1.75/2.5), more than a quarter");
-        assert_eq!(next_spp(8, floor * 1.7, floor, free), 8, "a little slow: steady, not a cut (cuts are for real overload)");
-        assert_eq!(next_spp(8, floor * 1.8, floor, free), 6, "slightly over the limit: a quarter fewer");
-        assert_eq!(next_spp(8, floor * 20.0, floor, free), 1, "very slow frame: by the overshoot, at least one");
-        assert_eq!(next_spp(1, floor * 20.0, floor, free), 1);
-    }
-
-    /// With vsync on a 60 Hz display every frame takes ~16.7 ms however light: that is the
-    /// refresh, not a slow GPU, so the samples grow; a missed refresh (two intervals) cuts them.
-    #[test]
-    fn samples_per_frame_grow_at_60_hz_and_drop_on_a_missed_refresh() {
-        let hz60 = 1.0 / 60.0;
-        let mut c = SppControl::default();
-        let mut spp = 2;
-        for _ in 0..10 {
-            spp = c.next(spp, hz60);
-        }
-        assert_eq!(spp, 12, "one more per frame at the refresh rate");
-        let cut = c.next(spp, 2.0 * hz60);
-        assert!(cut < spp && cut >= spp / 2, "a missed refresh cuts: {spp} -> {cut}");
-        // No climb straight back to the frame that missed: steady for a while, then growth again.
-        let mut after = cut;
-        for _ in 0..SPP_GROW_PAUSE_FRAMES - 1 {
-            after = c.next(after, hz60);
-        }
-        assert_eq!(after, cut, "steady after the cut");
-        for _ in 0..3 {
-            after = c.next(after, hz60);
-        }
-        assert!(after > cut, "then it grows again");
-    }
-
-    /// Frames that are not paced by the display (or take almost no work) can be a few ms; a frame
-    /// that then does real work must not read as slow and cut the samples to one (the render was
-    /// left grainy for seconds).
-    #[test]
-    fn a_few_very_quick_frames_do_not_collapse_the_samples_per_frame() {
-        let mut c = SppControl::default();
-        for _ in 0..5 {
-            c.next(4, 0.003);
-        }
-        let working = 0.012;
-        let mut spp = 4;
-        for _ in 0..10 {
-            spp = c.next(spp, working);
-        }
-        assert!(spp >= 4, "12 ms frames after 3 ms ones are fine: {spp}");
-    }
-
-    #[test]
-    fn the_frame_floor_is_the_quickest_recent_frame_within_range() {
-        let mut f = FrameFloor::default();
-        assert_eq!(f.push(1.0 / 60.0), 1.0 / 60.0);
-        assert_eq!(f.push(0.05), 1.0 / 60.0, "a slow frame does not raise it");
-        assert_eq!(f.push(f64::NAN), 1.0 / 60.0, "a broken time is ignored");
-        assert_eq!(f.push(0.0001), FLOOR_RANGE_S.0, "never below the quick end of the range");
-        for _ in 0..FLOOR_FRAMES {
-            f.push(0.2);
-        }
-        assert_eq!(f.push(0.2), FLOOR_RANGE_S.1, "only recent frames count, and at most 1/30 s");
-    }
-
-    #[test]
-    fn samples_per_frame_follow_the_pixel_count_when_the_size_changes() {
-        assert_eq!(rescale_spp(12, (500, 400), (1000, 800)), 3, "four times the pixels: a quarter of the samples");
-        assert_eq!(rescale_spp(3, (1000, 800), (500, 400)), 12);
-        assert_eq!(rescale_spp(1, (500, 400), (1000, 800)), 1, "never below one");
-        assert_eq!(rescale_spp(16, (100, 100), (10, 10)), MAX_SPP, "never above the cap");
-    }
-
-    #[test]
-    fn loading_textures_are_taken_in_at_a_limited_rate() {
-        assert!(take_in_textures(false, 1.0, 1.0), "not loading: every frame");
-        assert!(!take_in_textures(true, 1.0 + LOADING_RESTART_S * 0.5, 1.0));
-        assert!(take_in_textures(true, 1.0 + LOADING_RESTART_S, 1.0));
-        assert!(take_in_textures(true, 0.0, f64::MIN), "the first frame always");
-    }
-
-    #[test]
-    fn nothing_traced_yet_shows_the_placeholder() {
-        assert!(!show_image(false, 0));
-    }
 }

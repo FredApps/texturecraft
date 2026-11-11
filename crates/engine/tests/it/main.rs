@@ -17,11 +17,15 @@ mod materialx;
 mod materialx_import;
 mod meshmap_import;
 mod painter_gaps;
+mod path_perf;
 mod path_tool;
 mod perf;
 mod polygon_fill;
 mod project_recovery;
 mod sample;
+mod thumbs;
 mod tools;
 mod udim;
 mod uv_strokes;
+
+mod symmetry;

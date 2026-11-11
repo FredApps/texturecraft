@@ -257,6 +257,9 @@ pub struct UiState {
     /// The docked, tabbed and floating panels around the viewport.
     #[serde(default)]
     pub dock: Dock,
+    /// The panel open against the icon rail, if any; not saved, so the app starts with the rail closed
+    #[serde(skip)]
+    pub rail_panel: Option<crate::docking::Panel>,
     #[serde(default = "Dock::for_baking")]
     pub(crate) inactive_mode_dock: Dock,
     #[serde(default)]
@@ -304,6 +307,9 @@ pub struct UiState {
     /// The brush that paints the skew correction map in the 2D view of bake mode.
     #[serde(default)]
     pub bake_paint_brush: crate::bake_mode::BakePaintBrush,
+    /// How the 3D view shows symmetry
+    #[serde(default)]
+    pub symmetry: crate::symmetry::SymmetryDisplay,
     /// What bake mode's 3D view draws besides the low poly (the Baking Visualization panel)
     #[serde(default)]
     pub bake_visualization: crate::bake_mode::BakeVisualizationToggles,
@@ -353,6 +359,7 @@ impl Default for UiState {
             layout: ViewLayout::Split,
             split_ratio: default_split_ratio(),
             dock: Dock::default(),
+            rail_panel: None,
             inactive_mode_dock: Dock::for_baking(),
             dock_is_baking: false,
             bake_layout_version: BAKE_LAYOUT_VERSION,
@@ -376,6 +383,7 @@ impl Default for UiState {
             recent: Vec::new(),
             keymap: Keymap::new(),
             bake_paint_brush: crate::bake_mode::BakePaintBrush::default(),
+            symmetry: crate::symmetry::SymmetryDisplay::default(),
             bake_visualization: crate::bake_mode::BakeVisualizationToggles::default(),
         }
     }
