@@ -571,11 +571,15 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
         }
     }
 
+    // A dismissing click cannot paint or place a decal through the rail popup
+    let rail_popup = crate::rail_popup::blocks_paint_input(app, ui.ctx());
+
     // Decal placement: a click moves the decal being placed there, unless it dismisses a waiting image drop's menu
     let placing = app.placing_decal.filter(|_| app.ui.mode == crate::state::Mode::Painting);
     if let Some(layer) = placing {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
         if !alt
+            && !rail_popup
             && !DecalDrop::blocks_input(ui.ctx())
             && response.clicked_by(PointerButton::Primary)
             && let Some(pointer) = response.interact_pointer_pos()
@@ -587,7 +591,7 @@ fn view_3d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     }
 
     crate::properties_popup::open_on_right_click(app, ui, &response, rect, s_held || v_held);
-    let popup = app.properties_popup.is_some();
+    let popup = app.properties_popup.is_some() || rail_popup;
 
     // A pending ID color pick takes the next click instead of the brush
     let picking_id_color = app.picking_id_color.is_some();
@@ -1435,6 +1439,7 @@ fn view_2d(app: &mut TextureCraftApp, ui: &mut Ui, rect: Rect, sync: &mut Pendin
     // Painting in UV space
     let painting = app.ui.mode == crate::state::Mode::Painting
         && app.properties_popup.is_none()
+        && !crate::rail_popup::blocks_paint_input(app, ui.ctx())
         && !alt
         && !adjusting
         && !v_held

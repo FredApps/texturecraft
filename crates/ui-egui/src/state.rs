@@ -257,6 +257,9 @@ pub struct UiState {
     /// The docked, tabbed and floating panels around the viewport.
     #[serde(default)]
     pub dock: Dock,
+    /// The panel open against the icon rail, if any; not saved, so the app starts with the rail closed
+    #[serde(skip)]
+    pub rail_panel: Option<crate::docking::Panel>,
     #[serde(default = "Dock::for_baking")]
     pub(crate) inactive_mode_dock: Dock,
     #[serde(default)]
@@ -353,6 +356,7 @@ impl Default for UiState {
             layout: ViewLayout::Split,
             split_ratio: default_split_ratio(),
             dock: Dock::default(),
+            rail_panel: None,
             inactive_mode_dock: Dock::for_baking(),
             dock_is_baking: false,
             bake_layout_version: BAKE_LAYOUT_VERSION,
