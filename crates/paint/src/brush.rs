@@ -145,7 +145,7 @@ pub struct Symmetry {
     /// Radial copies around `axis`, spread over `angle_span` (0 or 1: off; at most [`MAX_RADIAL_COPIES`])
     #[serde(default)]
     pub radial: u8,
-    /// Axis of radial symmetry (0 = X, 1 = Y, 2 = Z), also the one axis the settings popup mirrors on
+    /// Axis of radial symmetry (0 = X, 1 = Y, 2 = Z), independent of the mirror axes
     #[serde(default = "radial_axis")]
     pub axis: u8,
     /// Where the mirror planes and the radial axis cross, relative to the mesh center (world units)

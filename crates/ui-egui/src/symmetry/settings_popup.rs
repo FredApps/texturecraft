@@ -1,9 +1,9 @@
-//! The symmetry settings popup: type, axis, axis position, radial settings and display
+//! The symmetry settings popup: independent mirror and radial copies, their position and display
 
 use egui::{Align, Color32, Layout, Stroke, Ui, vec2};
 use texturecraft_engine::paint::{FULL_TURN_DEGREES, MAX_RADIAL_COPIES, Symmetry};
 
-use super::{current_axis, movable_axes, set_mode};
+use super::{DEFAULT_RADIAL_COUNT, movable_axes};
 use crate::TextureCraftApp;
 use crate::i18n::tr;
 use crate::widgets::{color_swatch, section, slider};
@@ -11,12 +11,12 @@ use crate::widgets::{color_swatch, section, slider};
 /// The popup's width (points)
 const POPUP_WIDTH: f32 = 340.0;
 
-/// Width of the label column of the Type and Axis rows
+/// Width of the radial Axis row's label column
 const LABEL_WIDTH: f32 = 64.0;
 
 const AXIS_NAMES: [&str; 3] = ["X", "Y", "Z"];
 
-/// Space between the Type and Axis rows and the first section
+/// Space between the mirror section and the radial toggle
 const SECTIONS_GAP: f32 = 4.0;
 
 /// The color square's width (points) and the Manipulator size slider's range
@@ -29,46 +29,38 @@ const PREVIEW_SIZE: f32 = 96.0;
 /// The popup's content, applying brush changes through the engine and display preferences in place
 pub(super) fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
     ui.set_width(POPUP_WIDTH);
-    let (lo, hi) = app.session.mesh.bounds();
-    let half_extent = (hi - lo) * 0.5;
+    let (minimum, maximum) = app.session.mesh.bounds();
+    let half_extent = (maximum - minimum) * 0.5;
     let display = &mut app.ui.symmetry;
     let mut edited = app.session.tool.brush.symmetry;
     let symmetry = &mut edited;
-    let radial = symmetry.radial > 1;
-    let axis = current_axis(symmetry);
-
-    labelled_row(ui, tr("Type"), |ui| {
-        let type_name = if radial { tr("Radial symmetry") } else { tr("Mirror symmetry") };
-        egui::ComboBox::from_id_salt("symmetry_type").width(ui.available_width()).selected_text(type_name).show_ui(ui, |ui| {
-            if ui.selectable_label(!radial, tr("Mirror symmetry")).clicked() {
-                set_mode(symmetry, false, axis);
-            }
-            if ui.selectable_label(radial, tr("Radial symmetry")).clicked() {
-                set_mode(symmetry, true, axis);
+    section(ui, "symmetry_mirror", tr("Mirror symmetry"), true, |ui| {
+        ui.horizontal(|ui| {
+            let cell = vec2(ui.available_width() / AXIS_NAMES.len() as f32, ui.spacing().interact_size.y);
+            for (name, enabled) in AXIS_NAMES.into_iter().zip([&mut symmetry.x, &mut symmetry.y, &mut symmetry.z]) {
+                ui.allocate_ui_with_layout(cell, Layout::left_to_right(Align::Center), |ui| {
+                    ui.checkbox(enabled, name);
+                });
             }
         });
     });
-    labelled_row(ui, tr("Axis"), |ui| {
-        let cell = vec2(ui.available_width() / AXIS_NAMES.len() as f32, ui.spacing().interact_size.y);
-        for (choice, name) in AXIS_NAMES.into_iter().enumerate() {
-            ui.allocate_ui_with_layout(cell, Layout::left_to_right(Align::Center), |ui| {
-                if ui.radio(axis == choice, name).clicked() {
-                    set_mode(symmetry, radial, choice);
-                }
-            });
-        }
-    });
     ui.add_space(SECTIONS_GAP);
 
-    let movable = movable_axes(symmetry);
-    section(ui, "symmetry_axis_position", tr("Axis position"), true, |ui| {
-        for (along, name) in AXIS_NAMES.into_iter().enumerate() {
-            ui.add_enabled_ui(movable[along], |ui| slider(ui, name, &mut symmetry.offset[along], -half_extent[along]..=half_extent[along], 2));
-        }
-    });
+    let mut radial = symmetry.radial > 1;
+    if ui.checkbox(&mut radial, tr("Radial symmetry")).changed() {
+        symmetry.radial = if radial { DEFAULT_RADIAL_COUNT } else { 0 };
+    }
 
     if radial {
         section(ui, "symmetry_radial", tr("Radial settings"), true, |ui| {
+            labelled_row(ui, tr("Axis"), |ui| {
+                let cell = vec2(ui.available_width() / AXIS_NAMES.len() as f32, ui.spacing().interact_size.y);
+                for (axis, name) in AXIS_NAMES.into_iter().enumerate() {
+                    ui.allocate_ui_with_layout(cell, Layout::left_to_right(Align::Center), |ui| {
+                        ui.radio_value(&mut symmetry.axis, axis as u8, name);
+                    });
+                }
+            });
             ui.horizontal_top(|ui| {
                 let sliders_width = ui.available_width() - PREVIEW_SIZE - ui.spacing().item_spacing.x;
                 ui.allocate_ui_with_layout(vec2(sliders_width, PREVIEW_SIZE), Layout::top_down(Align::Min), |ui| {
@@ -83,15 +75,23 @@ pub(super) fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
         });
     }
 
+    let movable = movable_axes(symmetry);
+    section(ui, "symmetry_axis_position", tr("Axis position"), true, |ui| {
+        for (axis, name) in AXIS_NAMES.into_iter().enumerate() {
+            ui.add_enabled_ui(movable[axis], |ui| slider(ui, name, &mut symmetry.offset[axis], -half_extent[axis]..=half_extent[axis], 2));
+        }
+    });
+
     section(ui, "symmetry_display", tr("Display"), true, |ui| {
         ui.horizontal(|ui| {
             ui.label(tr("Symmetry color display"));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| color_swatch(ui, "symmetry_color", &mut display.color, COLOR_SWATCH_WIDTH));
         });
+        if symmetry.x || symmetry.y || symmetry.z {
+            ui.checkbox(&mut display.show_plane, tr("Show plane"));
+        }
         if radial {
             ui.checkbox(&mut display.show_axis, tr("Show axis"));
-        } else {
-            ui.checkbox(&mut display.show_plane, tr("Show plane"));
         }
         ui.checkbox(&mut display.show_intersection, tr("Show intersection"));
         ui.checkbox(&mut display.show_cursor, tr("Show cursor"));
