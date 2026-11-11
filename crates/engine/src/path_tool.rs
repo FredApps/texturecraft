@@ -595,6 +595,35 @@ impl Session {
         self.tool.tool == Tool::Path && steps.iter().any(|s| !s.same_curve(&self.tool.path))
     }
 
+    /// Undo calls needed to move back through document history, including pending path operations.
+    /// With zero document steps, only an uncommitted draft is canceled; stored edits stay applied.
+    pub fn history_undo_steps(&self, document_steps: usize) -> usize {
+        if document_steps == 0 && self.path_draft.is_none() {
+            return 0;
+        }
+
+        let mut steps = document_steps;
+        let mut current = &self.tool.path;
+        if self.tool.tool == Tool::Path {
+            for state in self.path_steps.0.iter().rev() {
+                if state.same_curve(current) {
+                    continue;
+                }
+
+                steps = steps.saturating_add(1);
+
+                // Restoring an empty curve cancels the draft and clears point history in the same undo
+                if state.points.is_empty() {
+                    return steps;
+                }
+
+                current = state;
+            }
+        }
+
+        steps.saturating_add(usize::from(self.path_draft.is_some()))
+    }
+
     /// Undo (`back`) or redo a point change and repaint before returning; failure preserves the curve and history
     pub(crate) fn step_path(&mut self, back: bool) -> Result<bool> {
         if self.tool.tool != Tool::Path {

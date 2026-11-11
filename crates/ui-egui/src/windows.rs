@@ -367,7 +367,8 @@ pub(crate) fn history(app: &mut TextureCraftApp, ui: &mut Ui) {
                     // Each row is the state after that many steps
                     let steps = done_count - row as i64;
                     if ui.selectable_label(steps == 0, text).on_hover_text(tr("Return to this step")).clicked() {
-                        jump = steps;
+                        // Undo consumes point edits and drafts before the document rows shown here
+                        jump = if steps >= 0 { app.session.history_undo_steps(steps as usize) as i64 } else { steps };
                     }
                 }
             });
