@@ -87,6 +87,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Anisotropy level", "Anisotropiestärke"),
     ("Antialiasing", "Kantenglättung"),
     ("Aperture", "Blende"),
+    ("Apply", "Anwenden"),
     ("ArtCraft website...", "ArtCraft-Website..."),
     ("Assets", "Assets"),
     ("Auto", "Auto"),

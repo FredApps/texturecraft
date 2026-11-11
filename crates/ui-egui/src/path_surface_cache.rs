@@ -17,6 +17,7 @@ pub(crate) struct PathSurfaceCache {
 }
 
 impl PathSurfaceCache {
+    /// Reuse an unchanged curve and retain it for this pass; UV or missing paths have no surface curve
     pub(crate) fn get(&mut self, session: &Session, effect: LayerId, index: usize) -> Option<SurfaceCurve> {
         let shape = session.paths(effect)?.get(index)?;
         let key = (session.mesh_id, effect, index);

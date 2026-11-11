@@ -84,6 +84,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Anisotropy level", "مستوى تباين الخواص"),
     ("Antialiasing", "تنعيم الحواف"),
     ("Aperture", "فتحة العدسة"),
+    ("Apply", "تطبيق"),
     ("ArtCraft website...", "موقع ArtCraft الإلكتروني..."),
     ("Assets", "الأصول"),
     ("Auto", "تلقائي"),

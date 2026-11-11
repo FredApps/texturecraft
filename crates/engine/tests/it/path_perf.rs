@@ -6,11 +6,13 @@ use serde_json::json;
 use texturecraft_engine::execute;
 use texturecraft_engine::geom::glam::Vec2;
 
+/// Sort a nonempty timing sample in place and report its middle value in milliseconds
 fn median_ms(samples: &mut [Duration]) -> f64 {
     samples.sort_unstable();
     samples[samples.len() / 2].as_secs_f64() * 1_000.0
 }
 
+/// Separate repaint cost from dirty-tile and full-set compositing across representative brush sizes
 #[test]
 #[ignore = "release benchmark: two texture resolutions and brush sizes"]
 fn path_preview_timings() {
@@ -62,12 +64,14 @@ fn path_preview_timings() {
     }
 }
 
+/// Observe resident memory without treating allocator-retained pages as a leak
 #[cfg(target_os = "linux")]
 fn resident_kib() -> usize {
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
     status.lines().find_map(|line| line.strip_prefix("VmRSS:").and_then(|rest| rest.split_whitespace().next()).and_then(|n| n.parse().ok())).unwrap()
 }
 
+/// Check that repeated canceled previews release tile buffers and leave no document history
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "release memory soak: 1,000 edits across 100 canceled previews"]

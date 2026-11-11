@@ -328,6 +328,7 @@ pub fn path_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
     let path = &app.session.tool.path;
     let (closed, fill) = (path.closed, path.fill);
     let selected = path.selected.is_some_and(|i| i < path.points.len());
+    let has_points = !path.points.is_empty();
     if icon_button(ui, ic::POLYGON, tr("Closed path"), closed, button_size).clicked() {
         app.session.set_path_closed(!closed);
     }
@@ -339,6 +340,10 @@ pub fn path_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
 
     if ui.add_enabled_ui(selected, |ui| icon_button(ui, ic::BACKSPACE, tr("Remove point"), false, button_size)).inner.clicked() {
         app.session.remove_selected_path_point();
+    }
+
+    if ui.add_enabled_ui(has_points, |ui| icon_button(ui, ic::CHECK, tr("Apply"), false, button_size)).inner.clicked() {
+        app.run("tool.path", json!({"commit": true}));
     }
 }
 

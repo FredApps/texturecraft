@@ -647,24 +647,32 @@ impl Session {
         }
     }
 
+    /// Whether a point edit, an uncommitted path preview, or a document edit can be undone
     pub fn can_undo(&self) -> bool {
         !self.undo.is_empty() || self.path_draft.is_some() || self.path_step_pending(true)
     }
+
+    /// Whether a point edit or document edit can be restored
     pub fn can_redo(&self) -> bool {
         !self.redo.is_empty() || self.path_step_pending(false)
     }
+
+    /// Label of the next undo action, giving an active path's point edits and preview priority
     pub fn undo_label(&self) -> Option<&str> {
         if self.path_draft.is_some() || self.path_step_pending(true) {
             return Some(crate::path_tool::NEW_PATH_LABEL);
         }
         self.undo.last().map(|(l, _)| l.as_str())
     }
+
+    /// Label of the next redo action, giving an active path's point history priority
     pub fn redo_label(&self) -> Option<&str> {
         if self.path_step_pending(false) {
             return Some(crate::path_tool::NEW_PATH_LABEL);
         }
         self.redo.last().map(|(l, _)| l.as_str())
     }
+
     /// The undone steps, the next one to redo first.
     pub fn redo_labels(&self) -> Vec<String> {
         self.redo.iter().rev().map(|(l, _)| l.clone()).collect()
@@ -673,13 +681,14 @@ impl Session {
         self.undo.iter().map(|(l, _)| l.clone()).collect()
     }
 
+    /// Undo a point edit, cancel an uncommitted path, or restore a document snapshot, in that order
     pub fn undo(&mut self) -> Result<String> {
         // A stroke, a box fill or an edited path under way would otherwise write over the restored document
         self.cancel_stroke();
         self.end_polygon_fill_box();
 
         // While a path is edited, undo steps back through its point changes first
-        if self.step_path(true) {
+        if self.step_path(true)? {
             return Ok(crate::path_tool::NEW_PATH_LABEL.to_string());
         }
 
@@ -699,12 +708,13 @@ impl Session {
         Ok(label)
     }
 
+    /// Restore a point edit and its pixels before considering document redo
     pub fn redo(&mut self) -> Result<String> {
         // A stroke, a box fill or an edited path under way would otherwise write over the restored document
         self.cancel_stroke();
         self.end_polygon_fill_box();
 
-        if self.step_path(false) {
+        if self.step_path(false)? {
             return Ok(crate::path_tool::NEW_PATH_LABEL.to_string());
         }
 

@@ -2,6 +2,7 @@
 
 use egui::{Event, Key, Modifiers, PointerButton, Pos2, pos2};
 use egui_kittest::Harness;
+use egui_kittest::kittest::{NodeT, Queryable};
 use serde_json::json;
 use texturecraft_engine::core::LayerId;
 use texturecraft_engine::execute;
@@ -15,6 +16,7 @@ const A: Pos2 = pos2(600.0, 500.0);
 const B: Pos2 = pos2(700.0, 500.0);
 const C: Pos2 = pos2(800.0, 500.0);
 
+/// A Path tool session whose texture fills the test pointer coordinates in the 2D view
 fn harness() -> AppHarness<'static> {
     let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
     execute(&mut session, "layer.add.paint", &serde_json::Value::Null).unwrap();
@@ -26,6 +28,7 @@ fn harness() -> AppHarness<'static> {
     h
 }
 
+/// Advance one input frame, optionally changing the primary button's state
 fn pointer(h: &mut AppHarness<'_>, pos: Pos2, pressed: Option<bool>) {
     let events = &mut h.input_mut().events;
     events.push(Event::PointerMoved(pos));
@@ -35,12 +38,14 @@ fn pointer(h: &mut AppHarness<'_>, pos: Pos2, pressed: Option<bool>) {
     h.step();
 }
 
+/// Send a complete pointer click and allow the resulting preview to update
 fn click(h: &mut AppHarness<'_>, at: Pos2) {
     pointer(h, at, Some(true));
     pointer(h, at, Some(false));
     h.run_steps(2);
 }
 
+/// Move through several frames so the test exercises drag grouping as well as its final position
 fn drag(h: &mut AppHarness<'_>, from: Pos2, to: Pos2) {
     pointer(h, from, Some(true));
     for k in 1..=6 {
@@ -50,6 +55,7 @@ fn drag(h: &mut AppHarness<'_>, from: Pos2, to: Pos2) {
     h.run_steps(2);
 }
 
+/// Dispatch an unmodified tool key and settle the resulting UI state
 fn key(h: &mut AppHarness<'_>, key: Key) {
     h.input_mut().events.push(Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE });
     h.run_steps(2);
@@ -83,6 +89,34 @@ fn placing_points_previews_the_path_and_enter_applies_it_as_one_step() {
     assert_eq!(h.state().session.undo_label(), Some("Path"));
     assert!(h.state().session.tool.path.points.is_empty());
     assert_eq!(path_sublayers(&h), vec![(eid, 1)]);
+}
+
+/// Applying with the pointer commits the preview without leaving the current texture set
+#[test]
+fn apply_button_commits_the_path_in_the_current_texture_set() {
+    let mut h = harness();
+    assert!(h.get_all_by_label("Apply").next().unwrap().accesskit_node().is_disabled());
+    let steps = h.state().session.history_labels().len();
+    let texture_set = h.state().session.ts();
+    for at in [A, B, C] {
+        click(&mut h, at);
+    }
+    let paths = path_sublayers(&h);
+    let preview = h.state().session.doc.pixels.layers.clone();
+
+    // Path controls share the horizontally scrolling brush toolbar
+    h.get_all_by_label("Apply").next().unwrap().scroll_to_me();
+    h.run_steps(30);
+    assert!(!h.get_all_by_label("Apply").next().unwrap().accesskit_node().is_disabled());
+    h.get_all_by_label("Apply").next().unwrap().click();
+    h.run_steps(2);
+
+    assert_eq!(h.state().session.ts(), texture_set);
+    assert_eq!(h.state().session.history_labels().len(), steps + 1);
+    assert!(h.state().session.tool.path.points.is_empty());
+    assert_eq!(path_sublayers(&h), paths);
+    assert_eq!(h.state().session.doc.pixels.layers, preview);
+    assert!(h.get_all_by_label("Apply").next().unwrap().accesskit_node().is_disabled());
 }
 
 #[test]

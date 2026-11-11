@@ -517,6 +517,7 @@ fn preview_uses_the_commands_explicit_viewport() {
     assert_eq!(preview, path_pixels(&direct));
 }
 
+/// Headless history commands must restore geometry and pixels before any frame or subsequent edit
 #[test]
 fn stored_point_edits_undo_and_redo_in_order_without_selection_steps() {
     let mut session = session(wall());
@@ -524,33 +525,110 @@ fn stored_point_edits_undo_and_redo_in_order_without_selection_steps() {
     let effect = texturecraft_engine::core::LayerId(report["committed"]["effect"].as_u64().unwrap());
     execute(&mut session, "path.edit", &json!({"effect": effect.0, "index": 0})).unwrap();
     let original = session.tool.path.points.clone();
+    let original_pixels = session.doc.pixels.clone();
     let history = session.history_labels().len();
     session.insert_path_point(1, Vec3::new(0.5, 0.5, 0.0));
     session.path_live().unwrap();
     let inserted = session.tool.path.points.clone();
+    let inserted_pixels = session.doc.pixels.clone();
     session.move_path_point(1, Vec3::new(0.5, 0.6, 0.0), true);
     session.move_path_point(1, Vec3::new(0.5, 0.7, 0.0), false);
     session.path_live().unwrap();
     let moved = session.tool.path.points.clone();
+    let moved_pixels = session.doc.pixels.clone();
     session.remove_selected_path_point();
     session.path_live().unwrap();
     let removed = session.tool.path.points.clone();
+    let removed_pixels = session.doc.pixels.clone();
 
-    for expected in [&moved, &inserted, &original] {
-        session.undo().unwrap();
-        session.path_live().unwrap();
+    for (expected, pixels) in [(&moved, &moved_pixels), (&inserted, &inserted_pixels), (&original, &original_pixels)] {
+        execute(&mut session, "edit.undo", &Value::Null).unwrap();
         assert_eq!(&session.tool.path.points, expected);
         assert_eq!(session.paths(effect).unwrap()[0].points, expected.iter().map(|point| point.to_array()).collect::<Vec<_>>());
+        assert_eq!(session.doc.pixels.layers, pixels.layers);
+        assert_eq!(session.doc.pixels.masks, pixels.masks);
     }
 
     session.select_path_point(0);
     assert!(session.can_redo(), "selection must preserve point redo");
-    for expected in [&inserted, &moved, &removed] {
-        session.redo().unwrap();
-        session.path_live().unwrap();
+    for (expected, pixels) in [(&inserted, &inserted_pixels), (&moved, &moved_pixels), (&removed, &removed_pixels)] {
+        execute(&mut session, "edit.redo", &Value::Null).unwrap();
         assert_eq!(&session.tool.path.points, expected);
+        assert_eq!(session.paths(effect).unwrap()[0].points, expected.iter().map(|point| point.to_array()).collect::<Vec<_>>());
+        assert_eq!(session.doc.pixels.layers, pixels.layers);
+        assert_eq!(session.doc.pixels.masks, pixels.masks);
     }
     assert_eq!(session.history_labels().len(), history + 1, "all point edits share one document step");
+
+    execute(&mut session, "edit.undo", &Value::Null).unwrap();
+    execute(&mut session, "layer.add.paint", &Value::Null).unwrap();
+    execute(&mut session, "edit.undo", &Value::Null).unwrap();
+    assert_eq!(session.paths(effect).unwrap()[0].points, moved.iter().map(|point| point.to_array()).collect::<Vec<_>>());
+    assert_eq!(session.doc.pixels.layers, moved_pixels.layers, "a subsequent command keeps the undone path pixels");
+}
+
+/// A bad path above the edited one must not consume undo or redo when repainting fails
+#[test]
+fn point_history_repaint_errors_preserve_the_edit_and_can_be_retried() {
+    use texturecraft_engine::core::{EffectKind, LayerId};
+
+    let mut session = session(wall());
+    let report = execute(&mut session, "tool.path", &json!({"uvPoints": [[0.2, 0.5], [0.8, 0.5]], "commit": true})).unwrap();
+    let effect = LayerId(report["committed"]["effect"].as_u64().unwrap());
+    execute(&mut session, "tool.path", &json!({"uvPoints": [[0.2, 0.8], [0.8, 0.8]], "commit": true})).unwrap();
+    let paint = session.paths(effect).unwrap()[1].paint.clone();
+    execute(&mut session, "path.edit", &json!({"effect": effect.0, "index": 0})).unwrap();
+    let original = session.tool.path.points.clone();
+    session.move_path_point(0, Vec3::new(0.2, 0.3, 0.0), true);
+    session.path_live().unwrap();
+    let moved = session.tool.path.points.clone();
+
+    for (command, expected) in [("edit.undo", &original), ("edit.redo", &moved)] {
+        let EffectKind::Path(paths) = &mut session.doc.project.effect_mut(effect).unwrap().kind else { panic!("path sublayer") };
+        paths[1].paint = Value::Null;
+        let before = session.doc.clone();
+        let path = session.tool.path.clone();
+        let history = (session.history_labels(), session.redo_labels());
+
+        let error = execute(&mut session, command, &Value::Null).unwrap_err();
+
+        assert!(error.to_string().contains("unreadable path settings"), "{error}");
+        assert_eq!(session.tool.path, path);
+        assert_eq!(session.doc.project, before.project);
+        assert_eq!(session.doc.pixels.layers, before.pixels.layers);
+        assert_eq!((session.history_labels(), session.redo_labels()), history);
+
+        let EffectKind::Path(paths) = &mut session.doc.project.effect_mut(effect).unwrap().kind else { panic!("path sublayer") };
+        paths[1].paint = paint.clone();
+        execute(&mut session, command, &Value::Null).unwrap();
+        assert_eq!(&session.tool.path.points, expected, "the failed step remains available");
+        assert_eq!(session.paths(effect).unwrap()[0].points, expected.iter().map(|point| point.to_array()).collect::<Vec<_>>());
+    }
+}
+
+/// Point history repaints an uncommitted preview without creating document undo steps
+#[test]
+fn draft_point_history_repaints_immediately_and_undoing_all_points_cancels() {
+    let mut session = session(wall());
+    execute(&mut session, "tool.select", &json!({"tool": "path"})).unwrap();
+    let before = session.doc.clone();
+    let history = session.history_labels();
+    session.append_path_point(Vec3::new(0.2, 0.5, 0.0), true);
+    session.path_live().unwrap();
+    let one_point = session.doc.clone();
+    session.append_path_point(Vec3::new(0.8, 0.5, 0.0), true);
+    session.path_live().unwrap();
+    let two_points = session.doc.clone();
+
+    for (command, expected) in [("edit.undo", &one_point), ("edit.redo", &two_points), ("edit.undo", &one_point), ("edit.undo", &before)] {
+        execute(&mut session, command, &Value::Null).unwrap();
+
+        assert_eq!(session.doc.project, expected.project);
+        assert_eq!(session.doc.pixels.layers, expected.pixels.layers);
+        assert_eq!(session.history_labels(), history);
+    }
+    assert!(session.tool.path.points.is_empty());
+    assert!(session.tool.path.editing.is_none());
 }
 
 #[test]

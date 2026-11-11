@@ -166,6 +166,7 @@ pub fn specs() -> Vec<CommandSpec> {
     ]
 }
 
+/// Set the curve from command parameters, then preview or commit it in the supplied viewport
 fn path(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "tool.path";
     if s.tool.tool != Tool::Path {
@@ -232,6 +233,7 @@ fn path_ref(s: &Session, cmd: &str, p: &Value) -> Result<(LayerId, usize, PathSh
     Ok((eid, i, shape))
 }
 
+/// Finish any draft and load a stored path's geometry and paint settings for live editing
 fn edit_path(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "path.edit";
     let (eid, index, shape) = path_ref(s, CMD, p)?;
@@ -249,6 +251,7 @@ fn edit_path(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "effect": eid.0, "index": index, "points": s.tool.path.points.len() }))
 }
 
+/// Remove one stored curve and repaint its sublayer as an atomic document edit
 fn remove_path(s: &mut Session, p: &Value) -> Result<Value> {
     const CMD: &str = "path.remove";
     let (eid, index, _) = path_ref(s, CMD, p)?;
@@ -592,27 +595,31 @@ impl Session {
         self.tool.tool == Tool::Path && steps.iter().any(|s| !s.same_curve(&self.tool.path))
     }
 
-    /// Undo (`back`) or redo the edited path's last point change, false when there is none; with no points left the path is gone
-    pub(crate) fn step_path(&mut self, back: bool) -> bool {
+    /// Undo (`back`) or redo a point change and repaint before returning; failure preserves the curve and history
+    pub(crate) fn step_path(&mut self, back: bool) -> Result<bool> {
         if self.tool.tool != Tool::Path {
-            return false;
+            return Ok(false);
         }
 
-        let (from, to) = if back { (&mut self.path_steps.0, &mut self.path_steps.1) } else { (&mut self.path_steps.1, &mut self.path_steps.0) };
-        // A checkpoint taken by a press that changed nothing isn't a step
-        while from.last().is_some_and(|s| s.same_curve(&self.tool.path)) {
-            from.pop();
-        }
-        let Some(state) = from.pop() else { return false };
+        // Skip no-change checkpoints without consuming history until the repaint succeeds
+        let from = if back { &self.path_steps.0 } else { &self.path_steps.1 };
+        let Some((index, state)) = from.iter().enumerate().rfind(|(_, state)| !state.same_curve(&self.tool.path)) else { return Ok(false) };
 
         let path = &mut self.tool.path;
-        let now = std::mem::replace(path, PathState { editing: path.editing, edited: path.edited, ..state });
-        to.push(now);
+        let previous = std::mem::replace(path, PathState { editing: path.editing, edited: path.edited, ..state.clone() });
+        if let Err(error) = self.path_live() {
+            self.tool.path = previous;
+            return Err(error);
+        }
 
         if self.tool.path.points.is_empty() {
             self.stop_path_edit();
+        } else {
+            let (from, to) = if back { (&mut self.path_steps.0, &mut self.path_steps.1) } else { (&mut self.path_steps.1, &mut self.path_steps.0) };
+            from.truncate(index);
+            to.push(previous);
         }
-        true
+        Ok(true)
     }
 
     /// Apply a new path being placed (as Enter would) and end the edit of a stored one, e.g. before the active texture set changes
@@ -989,7 +996,7 @@ mod tests {
         session.tool.path.points = vec![Vec3::ZERO; MAX_PATH_POINTS];
         session.path_checkpoint();
         assert!(!session.path_step_pending(true));
-        assert!(!session.step_path(true));
+        assert!(!session.step_path(true).unwrap());
 
         for index in 0..crate::session::MAX_HISTORY + 10 {
             session.path_checkpoint();
@@ -999,7 +1006,7 @@ mod tests {
         assert_eq!(session.path_steps.0.len(), crate::session::MAX_HISTORY);
         assert_eq!(session.path_steps.0.iter().map(|state| state.points.len()).sum::<usize>(), crate::session::MAX_HISTORY * MAX_PATH_POINTS);
         session.path_checkpoint();
-        assert!(session.step_path(true), "a no-change checkpoint does not consume an undo");
+        assert!(session.step_path(true).unwrap(), "a no-change checkpoint does not consume an undo");
         assert_eq!(session.tool.path.points[0].x, (crate::session::MAX_HISTORY + 9) as f32);
     }
 
