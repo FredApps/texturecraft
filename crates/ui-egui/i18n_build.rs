@@ -28,6 +28,7 @@ pub fn generate(dir: Option<&Path>, required: bool) -> Result<String, String> {
     }
     paths.sort();
     let mut count = 0;
+    let mut catalogs = Vec::new();
     for path in paths {
         // Watch directories too: adding/removing an app catalog must rebuild the embedding.
         println!("cargo::rerun-if-changed={}", path.display());
@@ -37,19 +38,28 @@ pub fn generate(dir: Option<&Path>, required: bool) -> Result<String, String> {
         }
         let locale = path.file_name().and_then(|n| n.to_str()).ok_or("non-UTF-8 locale")?;
         let common = path.join("common.tsv");
-        let embed = |file: &Path| -> Result<String, String> {
-            std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
+        let embed = |file: &Path| -> Result<(String, &'static str), String> {
+            let text = std::fs::read_to_string(file).map_err(|e| format!("{}: {e}", file.display()))?;
             let name = file.to_str().ok_or("non-UTF-8 catalog path")?;
             println!("cargo::rerun-if-changed={name}");
-            Ok(format!("include_str!({name:?})"))
+            // The shared runtime requires static inputs; this short-lived build process owns them.
+            Ok((format!("include_str!({name:?})"), Box::leak(text.into_boxed_str())))
         };
-        let shared = if common.is_file() { embed(&common)? } else { "\"\"".into() };
-        let app = embed(&app)?;
+        let (shared, shared_text) = if common.is_file() { embed(&common)? } else { ("\"\"".into(), "") };
+        let (app, app_text) = embed(&app)?;
+        let code: &'static str = Box::leak(locale.to_owned().into_boxed_str());
+        catalogs.push((code, shared_text, app_text));
         let _ = writeln!(source, "    ({locale:?}, {shared}, {app}),");
         count += 1;
     }
     if required && count == 0 {
         return Err("no TextureCraft translation catalogs found".into());
+    }
+    // Reject the same rows the runtime would skip, before required builds can ship English fallbacks.
+    let (runtime, mut problems) = craft_i18n::I18n::new(Box::leak(catalogs.into_boxed_slice()), &[]);
+    problems.extend(runtime.check_all());
+    if !problems.is_empty() {
+        return Err(format!("invalid translation catalogs in {}: {}", locales.display(), problems.join("; ")));
     }
     source.push_str("];\n");
     Ok(source)

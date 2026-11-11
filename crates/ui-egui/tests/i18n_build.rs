@@ -76,3 +76,25 @@ fn generated_paths_compile_and_embed_the_catalog_contents() {
     assert!(std::process::Command::new("rustc").arg(&source).arg("-o").arg(&binary).status().unwrap().success());
     assert!(std::process::Command::new(binary).status().unwrap().success());
 }
+
+#[test]
+fn malformed_utf8_catalogs_and_invalid_rows_fail_during_generation() {
+    for file in ["texturecraft.tsv", "common.tsv"] {
+        for invalid in [
+            "not a TSV row\n",
+            "\tLayers\t\n",
+            "\tSave {name}\tGuardar\n",
+            "\tOpen…\tAbrir\n",
+            "\tSave\tGuardar\n\tSave\tSalvar\n",
+            "@plural\t{n} layer|{n} layers\t{n} capa\n",
+            "@unknown\tSave\tGuardar\n",
+        ] {
+            let fixture = Fixture::new();
+            std::fs::write(fixture.0.join("locales/es/texturecraft.tsv"), "\tLayers\tCapas\n").unwrap();
+            std::fs::write(fixture.0.join("locales/es").join(file), invalid).unwrap();
+            for required in [false, true] {
+                assert!(i18n_build::generate(Some(&fixture.0), required).is_err(), "accepted {file}: {invalid:?}");
+            }
+        }
+    }
+}
