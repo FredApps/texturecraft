@@ -115,9 +115,31 @@ pub(crate) fn hand_drag_to_dock(ctx: &egui::Context, dock_area: Id) {
     }
 }
 
+/// A rail popup and its dismissing press cannot start a paint stroke or move a decal
+pub(crate) fn blocks_paint_input(app: &TextureCraftApp, ctx: &egui::Context) -> bool {
+    let closing_id = area_id().with("closing");
+    let pointer_active = ctx.input(|input| input.pointer.any_down() || input.pointer.any_released());
+    if !pointer_active {
+        ctx.data_mut(|data| data.remove::<bool>(closing_id));
+    }
+
+    // Both views must ignore the release, which would otherwise start a single-dab stroke
+    let closing = ctx.data(|data| data.get_temp::<bool>(closing_id)).unwrap_or(false);
+    let open = app.ui.rail_panel.is_some() && !app.ui.hide_ui && app.ui.mode != Mode::Baking;
+
+    // A shortcut may open the panel during a stroke; let that existing stroke finish
+    !app.session.stroke_active() && (open || closing)
+}
+
 /// Draw the open popup beside its icon; a press outside it closes it, as for a menu (Escape does too, in `menus.rs`)
 pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
+    // The dock has drawn both views, so a released dismissal must not suppress the next click
+    if !ctx.input(|input| input.pointer.any_down()) {
+        ctx.data_mut(|data| data.remove::<bool>(area_id().with("closing")));
+    }
+
     let Some(panel) = app.ui.rail_panel else { return };
+
     if app.ui.mode == Mode::Baking || app.ui.dock.is_open(panel) {
         app.ui.rail_panel = None;
         return;
@@ -133,6 +155,8 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     let shown = ctx.memory(|memory| memory.area_rect(area_id()));
     if closed_by_input(ctx, shown, strip) {
         app.ui.rail_panel = None;
+        let held = ctx.input(|input| input.pointer.any_down());
+        ctx.data_mut(|data| data.insert_temp(area_id().with("closing"), held));
         return;
     }
 
@@ -144,9 +168,14 @@ pub(crate) fn show(app: &mut TextureCraftApp, ctx: &egui::Context) {
     egui::Area::new(area_id()).order(egui::Order::Foreground).pivot(egui::Align2::RIGHT_TOP).fixed_pos(top_right).show(ctx, |ui| {
         frame.show(ui, |ui| {
             ui.set_width(width - frame.total_margin().sum().x);
+            let title_top = ui.cursor().top();
             (closed, dragged_from) = title_row(ui, &tokens, panel);
             ui.separator();
-            body(app, ui, panel);
+
+            // Keep the title, frame and body on screen even when the window is shorter than the usual popup
+            let title_height = ui.cursor().top() - title_top;
+            let body_height = (ctx.content_rect().height() - frame.total_margin().sum().y - title_height).max(0.0);
+            body(app, ui, panel, body_height);
         });
     });
 
@@ -171,21 +200,23 @@ fn placement(ctx: &egui::Context, strip: Rect, icon: Rect) -> (Pos2, f32) {
 /// A press outside the popup and the rail, unless in one of the popup's own dropdowns
 fn closed_by_input(ctx: &egui::Context, shown: Option<Rect>, strip: Rect) -> bool {
     let pressed_at = ctx.input(|input| input.pointer.press_origin().filter(|_| input.pointer.any_pressed()));
+
     // A press on the rail is left to its icons, which switch or close the popup themselves
     let outside = pressed_at.is_some_and(|at| !strip.contains(at) && shown.is_some_and(|rect| !rect.contains(at)));
     outside && !egui::Popup::is_any_open(ctx)
 }
 
 /// The panel's contents: History and Log at one height, the settings panels as tall as their contents up to a limit
-fn body(app: &mut TextureCraftApp, ui: &mut Ui, panel: Panel) {
+fn body(app: &mut TextureCraftApp, ui: &mut Ui, panel: Panel, available_height: f32) {
     // A child Ui, so the height limits start below the title row instead of moving the cursor back up to it
     ui.scope(|ui| {
         if matches!(panel, Panel::History | Panel::Log) {
-            ui.set_height(LIST_HEIGHT);
+            ui.set_height(LIST_HEIGHT.min(available_height));
         } else {
             // The area's remembered size would otherwise cap the height
-            ui.set_max_height(SETTINGS_MAX_HEIGHT);
+            ui.set_max_height(SETTINGS_MAX_HEIGHT.min(available_height));
         }
+
         crate::docking::panel_body(app, ui, panel);
     });
 }

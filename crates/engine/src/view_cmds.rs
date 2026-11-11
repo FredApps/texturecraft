@@ -88,7 +88,13 @@ fn frame(s: &mut Session, _: &Value) -> Result<Value> {
 }
 
 fn set_view(s: &mut Session, v: ViewMode) -> Result<Value> {
-    s.view = v;
+    if s.bake_preview.is_some() {
+        // During a bake the view follows the preview: a mesh map pins it, another mode comes back afterwards
+        s.bake_preview_user_view(v);
+    } else {
+        s.view = v;
+    }
+    let v = s.view;
     s.revision = s.revision.wrapping_add(1);
     Ok(json!({ "view": v.label() }))
 }

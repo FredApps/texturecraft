@@ -1,28 +1,22 @@
 use super::curvature::Curvature;
-use super::sampling::{interpolate, pack, splitmix64, tangent_normal, welded};
+use super::sampling::{pack, splitmix64, tangent_normal};
 use super::{position_projection::PositionProjection, source::Source, traced::Traced, transfer::Transfer};
-use crate::skew::PreparedSkew;
+use crate::cage::{RayFrame, RayStart};
 use crate::tracing::{ANY, Hemisphere, Query, Ray, RayKind, RayScene, TraceMesh};
-use crate::{BakeError, BakeRequest};
+use crate::{BakeError, BakeRequest, MeshExtent};
 use rayon::prelude::*;
-use std::collections::HashMap;
 use texturecraft_core::{
-    AmbientOcclusionAttenuation, BackfaceMode, BakeSettings, BakedMap, CageType, CurvatureMethod, MeshMatchMode, RayDistribution, RaySettings, SelfOcclusion,
+    AmbientOcclusionAttenuation, BackfaceMode, BakeSettings, BakedMap, CurvatureMethod, MeshMatchMode, RayDistribution, RaySettings, SelfOcclusion,
 };
-use texturecraft_geom::glam::Vec3;
-use texturecraft_geom::{Hit, Mesh, Surface, surface_at};
+use texturecraft_geom::{Hit, Surface, surface_at};
 
 const CURVATURE_CHUNK: usize = 1 << 15;
 
 pub(crate) struct BakeContext<'a> {
     low: Source<'a>,
     high: Option<Source<'a>>,
-    cage: Option<&'a Mesh>,
-    skew: Option<PreparedSkew<'a>>,
-    cage_paint: Option<&'a crate::BakePaintMap>,
-    ray_normals: Vec<Vec3>,
+    ray_frame: RayFrame<'a>,
     settings: &'a BakeSettings,
-    eps: f32,
     frontal: f32,
     rear: f32,
     position: PositionProjection,
@@ -36,36 +30,10 @@ pub(crate) struct BakeContext<'a> {
 impl<'a> BakeContext<'a> {
     pub(crate) fn new(request: &BakeRequest<'a>) -> Result<BakeContext<'a>, BakeError> {
         let settings = request.settings;
-        let (bounds_min, bounds_max) = request.mesh.bounds();
-        let mesh_diagonal = (bounds_max - bounds_min).length().max(1e-6);
-        if !mesh_diagonal.is_finite() {
-            return Err(BakeError::Invalid("mesh bounds are too large".into()));
-        }
-
-        let mesh_scale = (bounds_max - bounds_min).max_element().max(1e-6);
-        let mut name_keys = HashMap::new();
-        let low = Source::new(request.mesh, request.bvh, request.low_base_color, &[], &settings.high_poly.low_suffix, &settings.high_poly, &mut name_keys);
-        let high = request.high.map(|high_mesh| {
-            Source::new(
-                high_mesh.mesh,
-                high_mesh.bvh,
-                high_mesh.base_color,
-                high_mesh.file_ids,
-                &settings.high_poly.high_suffix,
-                &settings.high_poly,
-                &mut name_keys,
-            )
-        });
-        let ray_normals = match settings.cage.average_normals && high.is_some() {
-            true => {
-                let (welded_indices, _, normals) = welded(request.mesh, mesh_diagonal);
-                welded_indices.iter().map(|index| normals.get(*index as usize).copied().unwrap_or(Vec3::Y)).collect()
-            }
-            false => Vec::new(),
-        };
-
-        let skew = request.skew.map(|skew_map| PreparedSkew::new(skew_map, request.mesh, mesh_scale, settings.skew)).transpose()?;
-        let ray_epsilon = 1e-6 * mesh_diagonal;
+        let extent = MeshExtent::of(request.mesh)?;
+        let (low, high) = Source::of_request(request);
+        let ray_frame = RayFrame::new(request, extent)?;
+        let (mesh_scale, ray_epsilon) = (extent.scale, extent.ray_epsilon());
         let pass = |map: BakedMap, ray_settings: &RaySettings, kind: RayKind| {
             let half_angle_radians = (ray_settings.spread.clamp(0.0, 180.0) * 0.5).to_radians();
             let units = if ray_settings.relative_to_bounding_box { mesh_scale } else { 1.0 };
@@ -91,27 +59,26 @@ impl<'a> BakeContext<'a> {
             pass.ignore_backface = parameters.ignore_backface;
             pass.same_key = parameters.self_occlusion == SelfOcclusion::SameMeshName;
             pass.attenuation = parameters.attenuation;
-            pass.ground_height = parameters.ground_plane.enabled.then_some(bounds_min.y - parameters.ground_plane.offset);
+            pass.ground_height = parameters.ground_plane.enabled.then_some(extent.bounds_min.y - parameters.ground_plane.offset);
         }
+
         let mut bent = pass(BakedMap::BentNormal, &settings.maps.bent_normal.parameters.rays, RayKind::Occlusion);
         if let Some(pass) = &mut bent {
             pass.ignore_backface = settings.maps.bent_normal.parameters.ignore_backface;
             pass.same_key = settings.maps.bent_normal.parameters.self_occlusion == SelfOcclusion::SameMeshName;
         }
+
         let mut thickness = pass(BakedMap::Thickness, &settings.maps.thickness.parameters.rays, RayKind::Thickness);
         if let Some(pass) = &mut thickness {
             pass.same_key = settings.maps.thickness.parameters.self_occlusion == SelfOcclusion::SameMeshName;
         }
-        let cage_units = if settings.cage.relative_to_bounding_box { mesh_scale } else { 1.0 };
+
+        let cage_units = ray_frame.cage_units;
         Ok(BakeContext {
             low,
             high,
-            cage: if settings.cage.kind == CageType::CustomFile { request.cage } else { None },
-            skew,
-            cage_paint: request.cage_paint,
-            ray_normals,
+            ray_frame,
             settings,
-            eps: ray_epsilon,
             frontal: settings.cage.max_frontal * cage_units,
             rear: settings.cage.max_rear * cage_units,
             position: PositionProjection::new(request.mesh, request.material, settings.maps.position.parameters),
@@ -140,22 +107,11 @@ impl<'a> BakeContext<'a> {
     }
 
     pub(crate) fn transfer_ray(&self, surface: &Surface, barycentric: [f32; 2]) -> (Ray, f32) {
-        let averaged_normal = interpolate(self.low.mesh, &self.ray_normals, surface.tri, barycentric).and_then(Vec3::try_normalize).unwrap_or(surface.nrm);
-        let cage = self
-            .cage
-            .and_then(|cage_mesh| interpolate(cage_mesh, &cage_mesh.positions, surface.tri, barycentric))
-            .map(|cage_position| surface.pos - cage_position)
-            .filter(|offset| offset.length() > self.eps);
-        let cage_scale = self.cage_paint.map_or(1.0, |map| map.sample(surface.uv));
-        let (origin, direction, front) = match cage {
-            Some(offset) => (surface.pos - offset, offset.normalize(), offset.length()),
-            None => {
-                let up = match &self.skew {
-                    Some(skew) => skew.correct(self.low.mesh, surface, averaged_normal),
-                    None => averaged_normal,
-                };
-                (surface.pos + up * self.frontal * cage_scale, -up, self.frontal * cage_scale)
-            }
+        let start = self.ray_frame.start(surface, barycentric);
+        let origin = start.origin(surface.pos, self.frontal);
+        let (direction, front) = match start {
+            RayStart::CageMesh(offset) => (offset.normalize(), offset.length()),
+            RayStart::Distance { up, scale } => (-up, self.frontal * scale),
         };
         let key = match self.settings.high_poly.match_mode {
             MeshMatchMode::Always => ANY,

@@ -4,6 +4,9 @@ use glam::{Vec2, Vec3, Vec4};
 
 use crate::{GeomError, Result};
 
+/// An edge by the bits of its two end positions, the lower one first
+type EdgePositions = ([u32; 3], [u32; 3]);
+
 /// A contiguous index range drawn with one material.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SubMesh {
@@ -107,6 +110,47 @@ impl Mesh {
             .collect()
     }
 
+    /// Edges where the UV layout splits: two triangles meet there in 3D but not in UV space, per material in `0..materials.len().max(1)`
+    pub fn uv_seam_edges(&self) -> Vec<Vec<(u32, u32)>> {
+        // Signed zero denotes the same position on either side of an imported seam
+        let bits = |position: Vec3| position.to_array().map(|coordinate| if coordinate == 0.0 { 0 } else { coordinate.to_bits() });
+        let mut seams = vec![Vec::new(); self.materials.len().max(1)];
+        // Match across materials before grouping the lines for texture-set visibility
+        let mut sides: std::collections::HashMap<EdgePositions, Vec<(u32, u32, usize)>> = std::collections::HashMap::new();
+        for material in 0..seams.len() {
+            for triangle in self.triangles_of(material) {
+                let Some(corners) = self.indices.get(triangle * 3..triangle * 3 + 3) else { continue };
+
+                for (from, to) in [(corners[0], corners[1]), (corners[1], corners[2]), (corners[2], corners[0])] {
+                    let (Some(from_position), Some(to_position)) = (self.positions.get(from as usize), self.positions.get(to as usize)) else { continue };
+
+                    let (from_bits, to_bits) = (bits(*from_position), bits(*to_position));
+                    let (edge, pair) = if from_bits <= to_bits { ((from_bits, to_bits), (from, to)) } else { ((to_bits, from_bits), (to, from)) };
+                    sides.entry(edge).or_default().push((pair.0, pair.1, material));
+                }
+            }
+        }
+
+        let uv = |index: u32| self.uvs.get(index as usize).copied();
+        for pairs in sides.into_values() {
+            let Some(&(first_from, first_to, _)) = pairs.first() else { continue };
+
+            if pairs.iter().any(|&(from, to, _)| (uv(from), uv(to)) != (uv(first_from), uv(first_to))) {
+                for (from, to, material) in pairs {
+                    if let Some(edges) = seams.get_mut(material) {
+                        edges.push((from.min(to), from.max(to)));
+                    }
+                }
+            }
+        }
+        for edges in &mut seams {
+            edges.sort_unstable();
+            edges.dedup();
+        }
+
+        seams
+    }
+
     /// Material of triangle `t`.
     pub fn material_of(&self, t: usize) -> Option<usize> {
         let idx = (t * 3) as u32;
@@ -155,18 +199,19 @@ impl Mesh {
 
     /// Area-weighted smooth normals over the index buffer.
     pub fn compute_normals(&mut self) {
-        let mut n = vec![Vec3::ZERO; self.positions.len()];
-        for t in self.indices.chunks_exact(3) {
-            let (a, b, c) = (t[0] as usize, t[1] as usize, t[2] as usize);
+        let mut normals = vec![Vec3::ZERO; self.positions.len()];
+        for &[a, b, c] in self.indices.as_chunks::<3>().0 {
+            let (a, b, c) = (a as usize, b as usize, c as usize);
             let (Some(pa), Some(pb), Some(pc)) = (self.positions.get(a), self.positions.get(b), self.positions.get(c)) else { continue };
             let face = (*pb - *pa).cross(*pc - *pa);
             for v in [a, b, c] {
-                if let Some(x) = n.get_mut(v) {
+                if let Some(x) = normals.get_mut(v) {
                     *x += face;
                 }
             }
         }
-        self.normals = n.into_iter().map(|v| v.try_normalize().unwrap_or(Vec3::Y)).collect();
+
+        self.normals = normals.into_iter().map(|v| v.try_normalize().unwrap_or(Vec3::Y)).collect();
     }
 
     /// MikkTSpace tangents (falls back to per-triangle tangents if generation fails).
@@ -193,25 +238,27 @@ impl Mesh {
     }
 
     fn simple_tangents(&mut self) {
-        let mut acc = vec![Vec3::ZERO; self.positions.len()];
-        for t in self.indices.chunks_exact(3) {
-            let (a, b, c) = (t[0] as usize, t[1] as usize, t[2] as usize);
+        let mut tangents = vec![Vec3::ZERO; self.positions.len()];
+        for &[a, b, c] in self.indices.as_chunks::<3>().0 {
+            let (a, b, c) = (a as usize, b as usize, c as usize);
             let (Some(pa), Some(pb), Some(pc)) = (self.positions.get(a), self.positions.get(b), self.positions.get(c)) else { continue };
             let (Some(ua), Some(ub), Some(uc)) = (self.uvs.get(a), self.uvs.get(b), self.uvs.get(c)) else { continue };
             let (e1, e2) = (*pb - *pa, *pc - *pa);
             let (d1, d2) = (*ub - *ua, *uc - *ua);
-            let r = d1.x * d2.y - d2.x * d1.y;
-            if r.abs() < 1e-12 {
+            let determinant = d1.x * d2.y - d2.x * d1.y;
+            if determinant.abs() < 1e-12 {
                 continue;
             }
-            let tan = (e1 * d2.y - e2 * d1.y) / r;
+
+            let tangent = (e1 * d2.y - e2 * d1.y) / determinant;
             for v in [a, b, c] {
-                if let Some(x) = acc.get_mut(v) {
-                    *x += tan;
+                if let Some(x) = tangents.get_mut(v) {
+                    *x += tangent;
                 }
             }
         }
-        self.tangents = acc.into_iter().map(|t| t.try_normalize().unwrap_or(Vec3::X).extend(1.0)).collect();
+
+        self.tangents = tangents.into_iter().map(|t| t.try_normalize().unwrap_or(Vec3::X).extend(1.0)).collect();
     }
 
     /// The UV tiles material `m` covers: integer parts of its triangles' UV centroids (v down),
@@ -236,39 +283,44 @@ impl Mesh {
     /// material's triangles using the vertex: piecewise maps (UV tiles of different sizes) then
     /// place a vertex on a tile border with its own triangle's tile.
     pub fn map_material_uvs_with(&mut self, m: usize, f: impl Fn(Vec2, Vec2) -> Vec2) {
-        let mine: Vec<usize> = self.triangles_of(m).collect();
-        let mut is_mine = vec![false; self.triangle_count()];
-        for t in &mine {
-            if let Some(x) = is_mine.get_mut(*t) {
+        let material_triangles: Vec<usize> = self.triangles_of(m).collect();
+        let mut in_material = vec![false; self.triangle_count()];
+        for t in &material_triangles {
+            if let Some(x) = in_material.get_mut(*t) {
                 *x = true;
             }
         }
+
         let mut shared = vec![false; self.positions.len()];
-        for (_, tri) in self.indices.chunks_exact(3).enumerate().filter(|(t, _)| !is_mine.get(*t).copied().unwrap_or(false)) {
+        for (_, tri) in self.indices.as_chunks::<3>().0.iter().enumerate().filter(|(t, _)| !in_material.get(*t).copied().unwrap_or(false)) {
             for v in tri {
                 if let Some(s) = shared.get_mut(*v as usize) {
                     *s = true;
                 }
             }
         }
-        let mut copies = std::collections::HashMap::new();
-        for k in mine.iter().flat_map(|t| t * 3..t * 3 + 3) {
+
+        let mut duplicates = std::collections::HashMap::new();
+        for k in material_triangles.iter().flat_map(|t| t * 3..t * 3 + 3) {
             let Some(&v) = self.indices.get(k) else { continue };
-            let v = if shared.get(v as usize).copied().unwrap_or(false) { *copies.entry(v).or_insert_with(|| self.duplicate_vertex(v as usize)) } else { v };
+            let v =
+                if shared.get(v as usize).copied().unwrap_or(false) { *duplicates.entry(v).or_insert_with(|| self.duplicate_vertex(v as usize)) } else { v };
             if let Some(i) = self.indices.get_mut(k) {
                 *i = v;
             }
         }
-        // (vertex, centroid of its first triangle), each vertex once.
-        let mut verts = Vec::with_capacity(mine.len() * 3);
-        for t in &mine {
+
+        // (vertex, centroid of its first triangle), each vertex once
+        let mut vertices = Vec::with_capacity(material_triangles.len() * 3);
+        for t in &material_triangles {
             let Some(tri) = self.tri(*t) else { continue };
             let centroid = tri.iter().map(|v| self.uvs.get(*v).copied().unwrap_or_default()).sum::<Vec2>() / 3.0;
-            verts.extend(tri.map(|v| (v, centroid)));
+            vertices.extend(tri.map(|v| (v, centroid)));
         }
-        verts.sort_by_key(|(v, _)| *v);
-        verts.dedup_by_key(|(v, _)| *v);
-        for (v, centroid) in verts {
+
+        vertices.sort_by_key(|(v, _)| *v);
+        vertices.dedup_by_key(|(v, _)| *v);
+        for (v, centroid) in vertices {
             if let Some(uv) = self.uvs.get_mut(v) {
                 *uv = f(centroid, *uv);
             }
@@ -431,6 +483,55 @@ mod tests {
         a.append(&m);
         assert_eq!(a.diagonals, vec![0, 0b100, 0b001]);
         assert_eq!(crate::primitives::plane(1.0, 2).wire_edges()[0].len(), 12, "a 2×2 grid of quads has 12 edges");
+    }
+
+    #[test]
+    fn uv_seams_are_where_the_uv_layout_splits() {
+        let mesh = quad();
+        assert_eq!(mesh.uv_seam_edges(), vec![Vec::<(u32, u32)>::new()], "one UV island has no seam");
+
+        // Vertex 4 copies vertex 0's position with another UV: the diagonal (0, 2) / (4, 2) is cut
+        let mut seam = mesh.clone();
+        seam.positions.push(seam.positions[0]);
+        seam.normals.push(seam.normals[0]);
+        seam.tangents.push(seam.tangents[0]);
+        seam.uvs.push(Vec2::new(0.9, 0.9));
+        seam.indices[3] = 4;
+        assert_eq!(seam.uv_seam_edges(), vec![vec![(0, 2), (2, 4)]]);
+
+        // The same split with the same UV is a hard edge, not a seam
+        let mut hard = seam.clone();
+        hard.uvs[4] = hard.uvs[0];
+        assert_eq!(hard.uv_seam_edges(), vec![Vec::<(u32, u32)>::new()]);
+    }
+
+    #[test]
+    fn uv_seams_join_positions_with_opposite_signed_zero() {
+        let mut mesh = quad();
+        mesh.positions.push(Vec3::new(-0.0, 0.0, 0.0));
+        mesh.normals.push(mesh.normals[0]);
+        mesh.tangents.push(mesh.tangents[0]);
+        mesh.uvs.push(Vec2::new(0.9, 0.9));
+        mesh.indices[3] = 4;
+        assert_eq!(mesh.positions[0], mesh.positions[4]);
+        assert_eq!(mesh.uv_seam_edges(), vec![vec![(0, 2), (2, 4)]]);
+    }
+
+    #[test]
+    fn uv_seams_between_materials_belong_to_both_materials() {
+        let mut mesh = quad();
+        mesh.positions.push(mesh.positions[0]);
+        mesh.normals.push(mesh.normals[0]);
+        mesh.tangents.push(mesh.tangents[0]);
+        mesh.uvs.push(Vec2::new(0.9, 0.9));
+        mesh.indices[3] = 4;
+        mesh.materials.push("second".into());
+        mesh.submeshes[0].count = 3;
+        mesh.submeshes.push(SubMesh { name: "second".into(), material: 1, start: 3, count: 3 });
+
+        assert_eq!(mesh.uv_seam_edges(), vec![vec![(0, 2)], vec![(2, 4)]]);
+        mesh.uvs[4] = mesh.uvs[0];
+        assert_eq!(mesh.uv_seam_edges(), vec![Vec::<(u32, u32)>::new(); 2], "a material boundary alone is not a UV seam");
     }
 
     #[test]

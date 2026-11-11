@@ -5,6 +5,7 @@ use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT, Queryable};
 use texturecraft_ui_egui::TextureCraftApp;
 use texturecraft_ui_egui::docking::Panel;
+use texturecraft_ui_egui::state::ViewLayout;
 
 const WINDOW_SIZE: egui::Vec2 = egui::vec2(1600.0, 960.0);
 
@@ -41,9 +42,11 @@ fn app() -> Harness<'static, TextureCraftApp> {
 fn app_of_size(size: egui::Vec2) -> Harness<'static, TextureCraftApp> {
     let session = texturecraft_engine::sample_session(TEXTURE_RESOLUTION, BAKE_RESOLUTION).unwrap();
     let mut harness = Harness::builder().with_size(size).build_eframe(|cc| TextureCraftApp::new(cc, session));
+
     // The labels below are English; a first run would speak the system's language
     harness.state_mut().ui.prefs.language = "en".into();
     harness.run_steps(STARTUP_FRAMES);
+
     harness
 }
 
@@ -61,16 +64,26 @@ fn click_rail(harness: &mut Harness<'_, TextureCraftApp>, name: &str) {
     harness.run_steps(SETTLE_FRAMES);
 }
 
+fn click_at(harness: &mut Harness<'_, TextureCraftApp>, position: Pos2) {
+    harness.hover_at(position);
+    harness.event(Event::PointerButton { pos: position, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+    harness.run_steps(1);
+    harness.event(Event::PointerButton { pos: position, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+    harness.run_steps(SETTLE_FRAMES);
+}
+
 /// Drag with the primary button from `from` to `to` in a few moves
 fn drag(harness: &mut Harness<'_, TextureCraftApp>, from: Pos2, to: Pos2) {
     harness.hover_at(from);
     harness.run_steps(FRAMES_PER_DRAG_EVENT);
     harness.event(Event::PointerButton { pos: from, button: PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
     harness.run_steps(FRAMES_PER_DRAG_EVENT);
+
     for step in 1..=DRAG_STEPS {
         harness.hover_at(from + (to - from) * (step as f32 / DRAG_STEPS as f32));
         harness.run_steps(FRAMES_PER_DRAG_EVENT);
     }
+
     harness.event(Event::PointerButton { pos: to, button: PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
     harness.run_steps(SETTLE_FRAMES);
 }
@@ -109,16 +122,19 @@ fn the_rail_shows_one_panel_at_a_time() {
     let mut harness = app();
 
     click_rail(&mut harness, "Shader Settings");
+
     assert!(popup_shows(&harness, "Shader Settings"));
     assert!(harness.query_by_label(SHADER_SETTING).is_some());
 
     click_rail(&mut harness, "Display Settings");
+
     assert!(popup_shows(&harness, "Display Settings"));
     assert!(harness.query_by_label(SHADER_SETTING).is_none(), "opening Display Settings closed Shader Settings");
     assert!(harness.query_by_label(DISPLAY_SETTING).is_some());
     assert!(!harness.state().ui.dock.is_open(Panel::Shader), "the rail's panels are not dock windows");
 
     click_rail(&mut harness, "Display Settings");
+
     assert!(popup_closed(&harness), "its own icon closes it");
 }
 
@@ -129,6 +145,7 @@ fn the_popup_lines_up_with_its_icon() {
     click_rail(&mut harness, "History");
     let icon = rail_icon(&harness, "History").expect("the History icon").rect();
     let title = popup_title(&harness, "History");
+
     assert!(title.top() >= icon.top() && title.top() <= icon.bottom(), "the title {title:?} is not level with the icon {icon:?}");
 }
 
@@ -139,16 +156,19 @@ fn the_close_button_a_press_outside_and_escape_close_it() {
     click_rail(&mut harness, "Display Settings");
     harness.get_by_role_and_label(Role::Button, "Close").click();
     harness.run_steps(SETTLE_FRAMES);
+
     assert!(popup_closed(&harness), "Close");
 
     click_rail(&mut harness, "Log");
     harness.get_by_label("Assets").click();
     harness.run_steps(SETTLE_FRAMES);
+
     assert!(popup_closed(&harness), "a press outside");
 
     click_rail(&mut harness, "Log");
     harness.key_press(egui::Key::Escape);
     harness.run_steps(SETTLE_FRAMES);
+
     assert!(popup_closed(&harness), "Escape");
 }
 
@@ -159,11 +179,13 @@ fn dragging_the_title_out_floats_the_panel_and_frees_the_rail() {
     click_rail(&mut harness, "History");
     let title = popup_title(&harness, "History").center();
     drag(&mut harness, title, title + INTO_THE_VIEWPORT);
+
     assert!(popup_closed(&harness));
     assert!(harness.state().ui.dock.is_visible(Panel::History), "History floats on its own");
     assert!(rail_icon(&harness, "History").is_none(), "a panel in the dock has no rail icon");
 
     click_rail(&mut harness, "Shader Settings");
+
     assert!(popup_shows(&harness, "Shader Settings"));
     assert!(harness.state().ui.dock.is_visible(Panel::History), "History stays open beside the rail's panel");
 }
@@ -189,6 +211,7 @@ fn a_panel_closed_in_the_dock_returns_to_the_rail() {
     harness.state_mut().ui.dock.close(Panel::TextureSetSettings);
     harness.run_steps(SETTLE_FRAMES);
     click_rail(&mut harness, "Texture Set Settings");
+
     assert!(popup_shows(&harness, "Texture Set Settings"));
 }
 
@@ -199,12 +222,14 @@ fn window_views_open_the_rail_panels_popup() {
     let ctx = harness.ctx.clone();
     texturecraft_ui_egui::menus::invoke(harness.state_mut(), &ctx, "ui.view.shader");
     harness.run_steps(SETTLE_FRAMES);
+
     assert!(popup_shows(&harness, "Shader Settings"));
     assert!(!harness.state().ui.dock.is_open(Panel::Shader));
 
     // Project configuration opens Display Settings, in its popup too
     texturecraft_ui_egui::menus::invoke(harness.state_mut(), &ctx, "ui.projectConfig");
     harness.run_steps(SETTLE_FRAMES);
+
     assert!(popup_shows(&harness, "Display Settings"));
 }
 
@@ -217,5 +242,125 @@ fn a_popup_that_would_run_past_the_bottom_moves_up() {
     click_rail(&mut harness, "Display Settings");
     let icon = rail_icon(&harness, "Display Settings").expect("the Display Settings icon").rect();
     let title = popup_title(&harness, "Display Settings");
+
     assert!(title.top() < icon.top(), "the popup at {title:?} did not move up from the icon at {icon:?}");
+}
+
+#[test]
+fn display_settings_remain_reachable_in_a_short_window() {
+    let mut harness = app_of_size(egui::vec2(1600.0, 600.0));
+    click_rail(&mut harness, "Display Settings");
+
+    let last_setting = "Temporal anti-aliasing (refines the 3D view while it is still)";
+    harness.get_by_label(last_setting).scroll_to_me();
+    harness.run_steps(SETTLE_FRAMES);
+
+    let setting = harness.get_by_label(last_setting).rect();
+    assert!(harness.ctx.content_rect().contains_rect(setting), "the last setting must be reachable: {setting:?}");
+}
+
+#[test]
+fn history_actions_remain_reachable_in_a_short_window() {
+    let mut harness = app_of_size(egui::vec2(1600.0, 400.0));
+    click_rail(&mut harness, "History");
+
+    for label in ["Undo", "Redo"] {
+        let button = harness
+            .get_all_by_role(Role::Button)
+            .find(|button| button.accesskit_node().label().is_some_and(|text| text.ends_with(label)))
+            .expect("the History action")
+            .rect();
+        assert!(harness.ctx.content_rect().contains_rect(button), "{label} must be reachable: {button:?}");
+    }
+}
+
+#[test]
+fn opening_the_window_menu_closes_the_rail_popup() {
+    let mut harness = app();
+    click_rail(&mut harness, "Shader Settings");
+
+    harness.get_by_role_and_label(Role::Button, "Window").click();
+    harness.run_steps(SETTLE_FRAMES);
+
+    assert!(popup_closed(&harness));
+}
+
+#[test]
+fn escape_closes_a_dropdown_before_its_rail_popup() {
+    let mut harness = app();
+    click_rail(&mut harness, "Display Settings");
+    let environment_row = harness.get_by_label("Environment map").rect();
+    harness
+        .get_all_by_role(Role::ComboBox)
+        .find(|combo| (combo.rect().center().y - environment_row.center().y).abs() < 1.0)
+        .expect("the environment dropdown")
+        .click();
+    harness.run_steps(SETTLE_FRAMES);
+
+    assert!(egui::Popup::is_any_open(&harness.ctx));
+
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(SETTLE_FRAMES);
+
+    assert!(!egui::Popup::is_any_open(&harness.ctx));
+    assert!(popup_shows(&harness, "Display Settings"));
+
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(SETTLE_FRAMES);
+
+    assert!(popup_closed(&harness));
+}
+
+#[test]
+fn dismissing_a_rail_popup_does_not_paint_the_viewport() {
+    for layout in [ViewLayout::Only3D, ViewLayout::Only2D] {
+        let mut harness = app();
+        texturecraft_engine::execute(&mut harness.state_mut().session, "layer.add.paint", &serde_json::Value::Null).unwrap();
+        harness.state_mut().ui.layout = layout;
+        harness.run_steps(SETTLE_FRAMES);
+        click_rail(&mut harness, "Log");
+        let center = if layout == ViewLayout::Only2D { egui::pos2(700.0, 420.0) } else { harness.state().viewport_rect.center() };
+        let history = harness.state().session.history_labels().len();
+
+        click_at(&mut harness, center);
+
+        assert!(popup_closed(&harness));
+        assert_eq!(harness.state().session.history_labels().len(), history, "dismissing the popup must not paint in {layout:?}");
+
+        click_at(&mut harness, center);
+
+        assert_eq!(harness.state().session.history_labels().len(), history + 1, "the next click paints in {layout:?}");
+
+        click_rail(&mut harness, "Log");
+        drag(&mut harness, center, center + egui::vec2(40.0, 0.0));
+
+        assert!(popup_closed(&harness));
+        assert!(!harness.state().session.stroke_active());
+        assert_eq!(harness.state().session.history_labels().len(), history + 1, "a dismissing drag must not paint in {layout:?}");
+    }
+}
+
+#[test]
+fn opening_a_rail_popup_during_a_stroke_still_finishes_the_stroke() {
+    let mut harness = app();
+    texturecraft_engine::execute(&mut harness.state_mut().session, "layer.add.paint", &serde_json::Value::Null).unwrap();
+    harness.state_mut().ui.layout = ViewLayout::Only3D;
+    harness.run_steps(SETTLE_FRAMES);
+    let center = harness.state().viewport_rect.center();
+    let history = harness.state().session.history_labels().len();
+    harness.drag_at(center);
+    harness.run_steps(FRAMES_PER_DRAG_EVENT);
+    harness.hover_at(center + egui::vec2(20.0, 0.0));
+    harness.run_steps(FRAMES_PER_DRAG_EVENT);
+    assert!(harness.state().session.stroke_active());
+
+    let context = harness.ctx.clone();
+    texturecraft_ui_egui::menus::invoke(harness.state_mut(), &context, "ui.view.log");
+    harness.run_steps(SETTLE_FRAMES);
+    harness.drop_at(center + egui::vec2(30.0, 0.0));
+    harness.run_steps(SETTLE_FRAMES);
+
+    assert!(popup_shows(&harness, "Log"));
+    assert!(!harness.state().session.stroke_active());
+    assert_eq!(harness.state().session.history_labels().len(), history + 1);
 }

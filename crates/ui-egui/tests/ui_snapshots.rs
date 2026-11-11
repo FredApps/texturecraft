@@ -77,7 +77,7 @@ fn window_snapshots() {
     save(&mut harness, &output_dir, "bake-settings");
     harness.state_mut().session.add_high_poly_bytes("High Poly.obj", b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n".to_vec()).unwrap();
     save(&mut harness, &output_dir, "bake-settings-high-poly");
-    harness.get_by_label("Cage").scroll_to_me();
+    harness.get_by_role_and_label(egui::Role::ComboBox, "Cage Type").scroll_to_me();
     save(&mut harness, &output_dir, "bake-settings-cage-skew");
     harness.get_by_label("Edge Contrast").scroll_to_me();
     save(&mut harness, &output_dir, "bake-settings-skew");
@@ -129,7 +129,40 @@ fn window_snapshots() {
         texturecraft_engine::execute(session, id, &params).unwrap();
     }
     save(&mut harness, &output_dir, "properties-levels");
-
+    // Show the Layers panel thumbnails with a hidden content effect, a folder and a mask
+    let session = &mut harness.state_mut().session;
+    for (id, params) in [
+        ("effect.add.filter", serde_json::json!({"target": "content", "filter": "hsl"})),
+        ("effect.add.filter", serde_json::json!({"target": "content", "filter": "invert"})),
+        ("layer.add.paint", serde_json::Value::Null),
+        ("layer.group", serde_json::Value::Null),
+    ] {
+        texturecraft_engine::execute(session, id, &params).unwrap();
+    }
+    let hidden = harness
+        .state()
+        .session
+        .doc
+        .project
+        .layers
+        .values()
+        .flat_map(|layer| layer.content_effects.iter())
+        .find(|effect| effect.name == "Invert")
+        .map(|effect| effect.id.0);
+    if let Some(effect) = hidden {
+        texturecraft_engine::execute(&mut harness.state_mut().session, "effect.set", &serde_json::json!({"effect": effect, "visible": false})).unwrap();
+    }
+    harness.state_mut().ui.dock.focus(Panel::Layers);
+    harness.set_size(egui::vec2(1600.0, 1400.0));
+    for _ in 0..400 {
+        harness.run_steps(1);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        if !harness.state().layer_panel.service().busy() {
+            break;
+        }
+    }
+    save(&mut harness, &output_dir, "panel-layers");
+    harness.set_size(egui::vec2(1600.0, 960.0));
     // Show the second path selected in Properties
     let session = &mut harness.state_mut().session;
     for (id, params) in [
@@ -301,4 +334,79 @@ fn smart_material_shelf_snapshot() {
     harness.run_steps(60);
     assert_eq!(harness.query_all_by_label(material.label).count(), 2, "the popup shows the material name");
     save(&mut harness, &output_dir, "smart-material-hover");
+}
+
+/// Compact nested rows must keep their content, mask and effect controls in the panel.
+#[test]
+#[ignore]
+fn nested_layers_snapshot() {
+    use craft_ui::docking::Node;
+    use craft_ui::layout::SplitSize;
+    use serde_json::{Value, json};
+    use texturecraft_engine::execute;
+    use texturecraft_ui_egui::docking::Dock;
+
+    let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else { return };
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
+    execute(&mut session, "layer.add.fill", &json!({"color": "#336699"})).unwrap();
+    execute(&mut session, "mask.add.white", &Value::Null).unwrap();
+    execute(&mut session, "effect.add.filter", &json!({"target": "content", "filter": "invert"})).unwrap();
+    for _ in 0..6 {
+        execute(&mut session, "layer.group", &Value::Null).unwrap();
+    }
+    let mut harness =
+        Harness::builder().with_size(egui::vec2(1600.0, 1600.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    harness.run_steps(4);
+    let mut workspace = harness.state().ui.dock.workspace().clone();
+    let Some(Node::Split { second, .. }) = workspace.layout.root.as_mut() else { panic!("default columns") };
+    let Node::Split { size, .. } = second.as_mut() else { panic!("viewport and right column") };
+    *size = SplitSize::Ratio(0.99);
+    harness.state_mut().ui.dock = Dock::from_value(serde_json::to_value(workspace).unwrap());
+    for _ in 0..100 {
+        harness.run_steps(1);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        if !harness.state().layer_panel.service().busy() {
+            break;
+        }
+    }
+    save(&mut harness, &output_dir, "panel-layers-narrow-nested");
+}
+
+#[test]
+#[ignore]
+fn rail_window_snapshots() {
+    let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else {
+        eprintln!("set TC_UI_SNAPSHOTS=<dir> to write the pictures");
+        return;
+    };
+
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let session = texturecraft_engine::sample_session(256, 64).unwrap();
+    let mut harness =
+        Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    harness.state_mut().ui.prefs.language = "en".into();
+    harness.state_mut().ui.dock.close(Panel::TextureSetSettings);
+    let context = harness.ctx.clone();
+
+    for (command, name) in [
+        ("ui.view.textureSetSettings", "rail-texture-set-settings"),
+        ("ui.view.display", "rail-display"),
+        ("ui.view.shader", "rail-shader"),
+        ("ui.view.history", "rail-history"),
+        ("ui.view.log", "rail-log"),
+    ] {
+        texturecraft_ui_egui::menus::invoke(harness.state_mut(), &context, command);
+        save(&mut harness, &output_dir, name);
+    }
+
+    harness.set_size(egui::vec2(1600.0, 600.0));
+    texturecraft_ui_egui::menus::invoke(harness.state_mut(), &context, "ui.view.display");
+    harness.run_steps(6);
+    harness.get_by_label("Temporal anti-aliasing (refines the 3D view while it is still)").scroll_to_me();
+    save(&mut harness, &output_dir, "rail-display-short");
+
+    harness.set_size(egui::vec2(1600.0, 400.0));
+    texturecraft_ui_egui::menus::invoke(harness.state_mut(), &context, "ui.view.history");
+    save(&mut harness, &output_dir, "rail-history-short");
 }

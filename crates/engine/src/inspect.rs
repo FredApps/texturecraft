@@ -42,6 +42,10 @@ fn effect_json(session: &Session, effect: &Effect, content: bool) -> Value {
     match &effect.kind {
         EffectKind::Generator(generator) => out["generator"] = generator_json(generator),
         EffectKind::Levels(levels) => out["levels"] = json!([levels.in_low, levels.in_high, levels.gamma, levels.out_low, levels.out_high]),
+        EffectKind::ColorSelection { colors, tolerance } => {
+            out["colors"] = json!(colors);
+            out["tolerance"] = json!(tolerance);
+        }
         EffectKind::Path(paths) => {
             out["paths"] = json!(
                 paths.iter().map(|path| json!({ "points": path.points.len(), "uv": path.uv, "closed": path.closed, "fill": path.fill })).collect::<Vec<_>>()
@@ -183,6 +187,7 @@ pub fn session(s: &Session) -> Value {
         "layers": stack(s, ts),
         "tool": { "tool": s.tool.tool.id(), "brush": crate::tool_cmds::brush_json(s) },
         "view": s.view.label(),
+        "bakePreview": crate::bake_preview::preview_json(s),
         "camera": crate::view_cmds::camera_json(s),
         "display": s.doc.project.display,
         "history": { "undo": s.undo_label(), "redo": s.redo_label(), "depth": s.history_labels().len() },

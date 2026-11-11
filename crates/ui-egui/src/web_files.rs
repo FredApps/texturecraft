@@ -77,28 +77,33 @@ pub fn poll(app: &mut TextureCraftApp) {
     }
 }
 
-/// Bake mode: add high-definition meshes (or load the cage) with the native file dialog; in
-/// the browser they arrive on a later frame.
+/// Bake mode: add high-definition meshes (or load the cage) with the native file dialog. The
+/// meshes load on a later frame, when the dialog answers.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn import_bake_mesh(app: &mut TextureCraftApp, _ctx: &egui::Context, cage: bool) {
-    let dialog = rfd::FileDialog::new().add_filter(tr("Meshes"), &MESH_EXTENSIONS);
-    let paths = if cage { dialog.pick_file().into_iter().collect() } else { dialog.pick_files().unwrap_or_default() };
-    for p in paths {
-        let cmd = if cage { "bake.cage.set" } else { "bake.highPoly.add" };
-        app.run(cmd, serde_json::json!({ "path": p.display().to_string() }));
-    }
+    use crate::file_dialogs::{Bound, FileDialog};
+    let dialog = if cage { FileDialog::open() } else { FileDialog::open_many() };
+    app.ask_file(dialog.filter(tr("Meshes"), &MESH_EXTENSIONS), Bound::Project, move |app, paths| {
+        for p in paths {
+            let cmd = if cage { "bake.cage.set" } else { "bake.highPoly.add" };
+            app.run(cmd, serde_json::json!({ "path": p.display().to_string() }));
+        }
+    });
 }
 
 /// Display settings › Import HDR: pick an equirect `.hdr`/`.exr`, import it as a resource and
-/// light the scene with it (in the browser the file arrives on a later frame).
+/// light the scene with it, on a later frame when the dialog answers.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn import_environment(app: &mut TextureCraftApp, _ctx: &egui::Context) {
-    let Some(p) = rfd::FileDialog::new().add_filter(tr("HDR environments"), ENV_EXTS).pick_file() else { return };
-    if let Some(r) = app.run("resource.import", serde_json::json!({ "path": p.display().to_string() }))
-        && let Some(name) = r.get("name").and_then(|n| n.as_str())
-    {
-        use_environment(app, name);
-    }
+    use crate::file_dialogs::{Bound, FileDialog};
+    app.ask_file(FileDialog::open().filter(tr("HDR environments"), ENV_EXTS), Bound::Project, |app, paths| {
+        let Some(p) = paths.first() else { return };
+        if let Some(r) = app.run("resource.import", serde_json::json!({ "path": p.display().to_string() }))
+            && let Some(name) = r.get("name").and_then(|n| n.as_str())
+        {
+            use_environment(app, name);
+        }
+    });
 }
 
 /// Make image resource `name` the environment.

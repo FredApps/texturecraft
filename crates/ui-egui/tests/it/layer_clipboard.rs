@@ -31,6 +31,34 @@ fn ctrl_x_cuts_the_clicked_layer() {
     assert!(h.state().session.clipboard.is_some(), "and keeps it on the layer clipboard");
 }
 
+/// Windows reports Shift+Delete and Shift+Insert as Cut and Paste with Shift held.
+#[test]
+fn shift_delete_cuts_and_shift_insert_pastes() {
+    let (mut h, layer) = harness();
+    let before = count(&h);
+    h.event_modifiers(egui::Event::Cut, egui::Modifiers::SHIFT);
+    h.run_steps(3);
+    assert!(!h.state().session.doc.project.layers.contains_key(&layer), "Shift+Delete cuts the layer");
+    h.event_modifiers(egui::Event::Paste("Layer".into()), egui::Modifiers::SHIFT);
+    h.run_steps(3);
+    assert_eq!(count(&h), before, "Shift+Insert pastes it back");
+}
+
+#[test]
+fn a_binding_on_shift_insert_runs_instead_of_the_paste() {
+    let (mut h, _) = harness();
+    let before = count(&h);
+    h.event(egui::Event::Copy);
+    h.run_steps(3);
+    assert!(h.state().session.clipboard.is_some(), "there is something to paste");
+    h.state_mut().ui.keymap.insert("ui.layout.3d".into(), "Shift+Insert".into());
+    h.run_steps(2);
+    h.event_modifiers(egui::Event::Paste("Layer".into()), egui::Modifiers::SHIFT);
+    h.run_steps(3);
+    assert_eq!(h.state().ui.layout, texturecraft_ui_egui::state::ViewLayout::Only3D, "the shortcut ran");
+    assert_eq!(count(&h), before, "and nothing was pasted");
+}
+
 #[test]
 fn ctrl_c_then_ctrl_v_pastes_a_copy() {
     let (mut h, _) = harness();
