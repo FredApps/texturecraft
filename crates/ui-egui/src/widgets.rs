@@ -161,6 +161,10 @@ const ICON_SCALE: f32 = 0.62;
 /// Extra width an `icon_dropdown_button` gives its caret, as a fraction of the button height
 const CARET_STRIP_SCALE: f32 = 0.34;
 
+/// Caret glyph size, and how far its center sits from the right edge, as fractions of the button height
+const CARET_SCALE: f32 = 0.34;
+const CARET_INSET_SCALE: f32 = 0.25;
+
 /// An `icon_button` with no tooltip, whose `label` still names it for screen readers
 pub fn icon_button_without_tooltip(ui: &mut Ui, icon: &str, label: &str, selected: bool, size: f32) -> Response {
     let style = icon_button_style(&Tokens::get(ui.ctx()));
@@ -176,15 +180,37 @@ pub fn icon_dropdown_button_width(size: f32) -> f32 {
 
 /// An `icon_button_without_tooltip` with a dropdown caret after the icon, drawn in the icon's color
 pub fn icon_dropdown_button(ui: &mut Ui, icon: &str, label: &str, selected: bool, size: f32) -> Response {
-    // Caret glyph size, and how far its center sits from the right edge, as fractions of the height
-    const CARET_SCALE: f32 = 0.34;
-    const CARET_INSET_SCALE: f32 = 0.25;
-
     let style = icon_button_style(&Tokens::get(ui.ctx()));
     IconButton::new(label, vec2(icon_dropdown_button_width(size), size), &style).selected(selected).show(ui, |ui, rect, color| {
         let icon_center = rect.left_center() + vec2(size / 2.0, 0.0);
         let caret_center = rect.right_center() - vec2(size * CARET_INSET_SCALE, 0.0);
         ui.painter().text(icon_center, egui::Align2::CENTER_CENTER, icon, egui::FontId::proportional(size * ICON_SCALE), color);
+        ui.painter().text(caret_center, egui::Align2::CENTER_CENTER, egui_phosphor::regular::CARET_DOWN, egui::FontId::proportional(size * CARET_SCALE), color);
+    })
+}
+
+/// An `icon_dropdown_button` whose icon carries a small `badge` glyph at its lower right (e.g. a gear for a feature's settings)
+pub fn icon_badge_dropdown_button(ui: &mut Ui, icon: &str, badge: &str, label: &str, selected: bool, size: f32) -> Response {
+    // Badge glyph size and inset, as fractions of the height
+    const BADGE_SCALE: f32 = 0.5;
+    const BADGE_INSET_SCALE: f32 = 0.24;
+    // The icon shrinks a little and moves up and left, making room for the badge
+    const ICON_WITH_BADGE_SCALE: f32 = 0.78;
+    const ICON_SHIFT_SCALE: f32 = 0.09;
+
+    let style = icon_button_style(&Tokens::get(ui.ctx()));
+    IconButton::new(label, vec2(icon_dropdown_button_width(size), size), &style).selected(selected).show(ui, |ui, rect, color| {
+        let icon_center = rect.left_center() + vec2(size / 2.0, 0.0);
+        let badge_center = rect.left_top() + vec2(size - size * BADGE_INSET_SCALE, size - size * BADGE_INSET_SCALE);
+        let caret_center = rect.right_center() - vec2(size * CARET_INSET_SCALE, 0.0);
+        ui.painter().text(
+            icon_center - vec2(size, size) * ICON_SHIFT_SCALE,
+            egui::Align2::CENTER_CENTER,
+            icon,
+            egui::FontId::proportional(size * ICON_SCALE * ICON_WITH_BADGE_SCALE),
+            color,
+        );
+        ui.painter().text(badge_center, egui::Align2::CENTER_CENTER, badge, egui::FontId::proportional(size * BADGE_SCALE), color);
         ui.painter().text(caret_center, egui::Align2::CENTER_CENTER, egui_phosphor::regular::CARET_DOWN, egui::FontId::proportional(size * CARET_SCALE), color);
     })
 }

@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
 use texturecraft_core::{BakedMap, Channel, Fill, Layer, LayerId, LayerKind, LinkParam, MaterialLink, Source};
-use texturecraft_formats::mcmat::{MCMAT_EXT, MCRAFT_EXT, PortableMaterial, is_mcraft, read_mcmat};
+#[cfg(not(target_arch = "wasm32"))]
+use texturecraft_formats::mcmat::MCMAT_EXT;
+use texturecraft_formats::mcmat::{MCRAFT_EXT, PortableMaterial, is_mcraft, read_mcmat};
 
 use crate::commands::{CommandSpec, bad, boolp, has_layer, layer_param, strp};
 use crate::materials::Place;

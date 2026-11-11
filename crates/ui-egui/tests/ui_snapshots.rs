@@ -30,6 +30,39 @@ fn save(h: &mut Harness<'_, TextureCraftApp>, dir: &Path, name: &str) {
 
 #[test]
 #[ignore]
+fn symmetry_snapshots() {
+    let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else { return };
+
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let session = texturecraft_engine::sample_session(1024, 256).unwrap();
+    let mut harness =
+        Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    harness.state_mut().ui.prefs.language = "en".into();
+    harness.state_mut().run("tool.brush", serde_json::json!({"symmetryY": true, "symmetryOffset": [0, 0.1, 0]})).unwrap();
+    harness.state_mut().ui.symmetry.show_plane = true;
+    harness.state_mut().ui.symmetry.show_manipulator = true;
+    harness.run_steps(4);
+    harness.get_by_label("Symmetry settings").click();
+
+    for (brightness, name) in [(Brightness::MediumDark, "medium"), (Brightness::Dark, "dark"), (Brightness::Light, "light")] {
+        harness.state_mut().ui.prefs.brightness = brightness;
+        save(&mut harness, &output_dir, &format!("symmetry-mirror-{name}"));
+    }
+
+    harness.state_mut().run("tool.brush", serde_json::json!({"symmetryY": false, "symmetryRadial": 6, "symmetryAxis": "y", "symmetryAngleSpan": 240})).unwrap();
+    harness.state_mut().ui.symmetry.show_axis = true;
+    harness.state_mut().ui.prefs.brightness = Brightness::MediumDark;
+    save(&mut harness, &output_dir, "symmetry-radial");
+
+    harness.state_mut().run("tool.brush", serde_json::json!({"symmetryX": true, "symmetryY": true})).unwrap();
+    for (brightness, name) in [(Brightness::MediumDark, "medium"), (Brightness::Dark, "dark"), (Brightness::Light, "light")] {
+        harness.state_mut().ui.prefs.brightness = brightness;
+        save(&mut harness, &output_dir, &format!("symmetry-combined-{name}"));
+    }
+}
+
+#[test]
+#[ignore]
 fn window_snapshots() {
     let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else {
         eprintln!("set TC_UI_SNAPSHOTS=<dir> to write the pictures");

@@ -384,6 +384,7 @@ pub(crate) fn history(app: &mut TextureCraftApp, ui: &mut Ui) {
 /// What the start window was asked for.
 enum Start {
     Menu(&'static str),
+    #[cfg(not(target_arch = "wasm32"))]
     Recent(String),
     Close,
 }
@@ -393,7 +394,9 @@ fn start(app: &mut TextureCraftApp, ctx: &egui::Context) {
     if !app.ui.windows.start {
         return;
     }
-    let tk = Tokens::get(ctx);
+
+    #[cfg(not(target_arch = "wasm32"))]
+    let tokens = Tokens::get(ctx);
     let mut open = true;
     let mut action = None;
     dialog("start", "TextureCraft", &mut open).min_width(380.0).show(ctx, |ui| {
@@ -405,11 +408,12 @@ fn start(app: &mut TextureCraftApp, ctx: &egui::Context) {
                 action = Some(Start::Menu("file.open"));
             }
         });
+        #[cfg(not(target_arch = "wasm32"))]
         if file_dialogs_available() {
             ui.add_space(8.0);
             ui.label(caption(tr("Recent projects")));
             if app.ui.recent.is_empty() {
-                ui.label(RichText::new(tr("No recent projects yet")).color(tk.text_dim));
+                ui.label(RichText::new(tr("No recent projects yet")).color(tokens.text_dim));
             }
             for path in &app.ui.recent {
                 let name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path);
@@ -433,15 +437,17 @@ fn start(app: &mut TextureCraftApp, ctx: &egui::Context) {
             });
         });
     });
-    if let Some(a) = action {
+
+    if let Some(action) = action {
         app.ui.windows.start = false;
-        match a {
+        match action {
             Start::Menu(id) => crate::menus::invoke(app, ctx, id),
             #[cfg(not(target_arch = "wasm32"))]
             Start::Recent(path) => open_path(app, &path),
-            _ => {}
+            Start::Close => {}
         }
     }
+
     if !open {
         app.ui.windows.start = false;
     }
