@@ -1127,4 +1127,9 @@ pub const TABLE: &[(&str, &str)] = &[
         "Saving uses the other cores and at most this share of the free RAM. At least one core always works.",
         "يستخدم الحفظ الأنوية الأخرى وحدًا أقصى بهذه النسبة من الذاكرة الحرة. يعمل نواة واحدة على الأقل دائمًا.",
     ),
+    ("Max project size on open", "الحد الأقصى لحجم المشروع عند الفتح"),
+    (
+        "Maximum decompressed project data. Increase this limit to open larger projects.",
+        "الحد الأقصى لبيانات المشروع بعد فك الضغط. ارفع هذا الحد لفتح مشاريع أكبر.",
+    ),
 ];

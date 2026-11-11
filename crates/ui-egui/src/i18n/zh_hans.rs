@@ -1086,4 +1086,6 @@ pub const TABLE: &[(&str, &str)] = &[
         "Saving uses the other cores and at most this share of the free RAM. At least one core always works.",
         "保存使用其余核心,并最多占用这一比例的可用内存。至少始终有一个核心工作。",
     ),
+    ("Max project size on open", "打开项目的大小上限"),
+    ("Maximum decompressed project data. Increase this limit to open larger projects.", "解压后项目数据的大小上限。提高此限制以打开更大的项目。"),
 ];

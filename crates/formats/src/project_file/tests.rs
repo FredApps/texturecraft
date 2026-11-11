@@ -272,6 +272,7 @@ fn serial_bytes(pf: &ProjectFile) -> Vec<u8> {
     zip.finish().unwrap().into_inner()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn parallel_bytes(pf: &ProjectFile, workers: usize, budget: u64) -> Vec<u8> {
     let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
     entries::parallel::write(&mut zip, entries(pf).unwrap(), workers, budget).unwrap();
@@ -536,6 +537,73 @@ fn a_late_failing_entry_after_good_ones_is_its_own_error() {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn assert_entry_streams_to_destination(method: CompressionMethod, budget: u64) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let path = std::env::temp_dir().join(format!("texturecraft-entry-streaming-{}-{method:?}.zip", std::process::id()));
+    let destination = std::fs::File::create(&path).unwrap();
+    let observed_destination = destination.try_clone().unwrap();
+    let reached_destination = AtomicBool::new(false);
+    let mut random = 12345u32;
+    let payload: Vec<u8> = (0..131_072)
+        .map(|_| {
+            random ^= random << 13;
+            random ^= random >> 17;
+            random ^= random << 5;
+            random as u8
+        })
+        .collect();
+    let compressed = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    let mut list: Vec<Entry<'_>> = (0..2)
+        .map(|index| Entry { name: format!("before{index}"), options: compressed, weight: 128, body: Box::new(|writer| writer.write_all(&[7; 128])) })
+        .collect();
+    list.push(Entry {
+        name: "target".into(),
+        options: SimpleFileOptions::default().compression_method(method),
+        weight: payload.len() as u64,
+        body: Box::new(|writer| {
+            let before_bytes = observed_destination.metadata()?.len();
+            writer.write_all(&payload)?;
+            writer.flush()?;
+            reached_destination.store(observed_destination.metadata()?.len() > before_bytes, Ordering::Relaxed);
+            Ok(())
+        }),
+    });
+    list.push(Entry { name: "after".into(), options: compressed, weight: 128, body: Box::new(|writer| writer.write_all(&[9; 128])) });
+    let mut writer = ZipWriter::new(destination);
+
+    let result = entries::parallel::write(&mut writer, list, 4, budget);
+    drop(writer.finish().unwrap());
+    drop(observed_destination);
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+
+    result.unwrap();
+    assert!(reached_destination.load(Ordering::Relaxed), "{method:?} was buffered instead of streamed");
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+    let names: Vec<_> = (0..archive.len()).map(|index| archive.by_index(index).unwrap().name().unwrap().into_owned()).collect();
+    assert_eq!(names, ["before0", "before1", "target", "after"]);
+    let mut actual = Vec::new();
+    archive.by_name("target").unwrap().read_to_end(&mut actual).unwrap();
+    assert_eq!(actual, payload);
+    let mut after = Vec::new();
+    archive.by_name("after").unwrap().read_to_end(&mut after).unwrap();
+    assert_eq!(after, [9; 128]);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn stored_entries_reach_the_destination_during_their_body() {
+    assert_entry_streams_to_destination(CompressionMethod::Stored, 1 << 20);
+}
+
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn over_budget_entries_reach_the_destination_during_their_body() {
+    assert_entry_streams_to_destination(CompressionMethod::Deflated, 4096);
+}
+
 #[test]
 fn recovery_skips_unsupported_baked_map_entries() {
     let expected = sample().pf;
@@ -596,4 +664,197 @@ fn recovery_does_not_accept_unrelated_json_errors() {
 
     let error = load_project_bytes(&bytes).unwrap_err();
     assert!(error.to_string().contains("duplicate field"), "{error}");
+}
+
+#[test]
+fn project_open_limit_counts_every_loaded_entry_kind() {
+    let paint = sample().paint;
+    let baked = [header(16, 16, 1, 0), vec![0; 16 * 16 * 4]].concat();
+    let entries = [
+        ("resources/test.bin".to_string(), vec![1; 1024]),
+        ("mesh.obj".to_string(), vec![2; 1024]),
+        ("highpoly/test.obj".to_string(), vec![3; 1024]),
+        ("cage/test.obj".to_string(), vec![4; 1024]),
+        ("thumbnail.png".to_string(), vec![5; 1024]),
+        (format!("pixels/layer_{}_baseColor.bin", paint.0), tile_bin(128, 4, &[(0, 0)])),
+        (format!("pixels/mask_{}.bin", paint.0), tile_bin(128, 2, &[(0, 0)])),
+        ("baked/0_ambientOcclusion.bin".to_string(), baked.clone()),
+        ("bake_paint/0_skew.bin".to_string(), baked),
+    ];
+
+    for (name, data) in entries {
+        let bytes = zip_with(&[(&name, data)]);
+        let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+        let total_bytes: u64 = (0..archive.len()).map(|index| archive.by_index(index).unwrap().size()).sum();
+
+        let accepted = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes)).unwrap();
+        let error = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes - 1)).unwrap_err();
+        let raised_limit = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes + 1)).unwrap();
+
+        assert!(matches!(error, FormatError::TooLarge(_)), "{name}: {error}");
+        assert!(error.to_string().contains(&format!("{} bytes", total_bytes - 1)), "{name}: {error}");
+        assert_same(&accepted, &raised_limit);
+    }
+}
+
+#[test]
+fn project_open_limit_is_shared_across_the_whole_archive() {
+    let project = sample().pf;
+    let bytes = serial_bytes(&project);
+    let mut archive = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+    let total_bytes: u64 = (0..archive.len()).map(|index| archive.by_index(index).unwrap().size()).sum();
+
+    let accepted = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes)).unwrap();
+    let error = load_with_budget(Cursor::new(&bytes), LoadBudget::new(total_bytes - 1)).unwrap_err();
+
+    assert_same(&project, &accepted);
+    assert!(matches!(error, FormatError::TooLarge(_)), "{error}");
+}
+
+#[test]
+fn entry_reads_stop_at_the_smaller_of_the_entry_and_project_limits() {
+    for (entry_limit, project_limit, expected_read) in [(8, 100, 9), (100, 8, 9)] {
+        let mut reader = Cursor::new(vec![1; 1000]);
+        let mut budget = LoadBudget::new(project_limit);
+
+        let error = read_all(&mut reader, entry_limit, &mut budget, "resource").unwrap_err();
+
+        assert!(matches!(error, FormatError::TooLarge(_)), "{error}");
+        assert_eq!(reader.position(), expected_read);
+    }
+}
+
+#[test]
+fn oversized_baked_data_is_rejected_before_reading_its_payload() {
+    let mut reader = Cursor::new(header(16, 16, 1, 0));
+    let mut budget = LoadBudget::new(BIN_HEADER_BYTES as u64 + 16 * 16 * 4 - 1);
+
+    let error = read_baked(&mut reader, BIN_HEADER_BYTES as u64 + 16 * 16 * 4, 1, &mut budget, "baked map").unwrap_err();
+
+    assert!(matches!(error, FormatError::TooLarge(_)), "the size guard must run before the truncated read: {error}");
+    assert_eq!(reader.position(), BIN_HEADER_BYTES as u64);
+}
+
+#[test]
+fn archive_preflight_counts_ignored_entries_and_allows_the_exact_limit() {
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    for name in ["project.json", "unknown/future-data"] {
+        writer.start_file(name, options).unwrap();
+        writer.write_all(&[0; 16]).unwrap();
+    }
+    let bytes = writer.finish().unwrap().into_inner();
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+
+    check_archive(&mut archive, 32).unwrap();
+    let error = check_archive(&mut archive, 31).unwrap_err();
+
+    assert!(matches!(error, FormatError::TooLarge(_)), "{error}");
+}
+
+#[test]
+fn overlapping_archive_entries_are_rejected_before_decompression() {
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    writer.start_file("resource", SimpleFileOptions::default()).unwrap();
+    writer.write_all(&[0; 16]).unwrap();
+    writer.shallow_copy_file("resource", "copy").unwrap();
+    let bytes = writer.finish().unwrap().into_inner();
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+
+    let error = check_archive(&mut archive, 32).unwrap_err();
+
+    assert!(error.to_string().contains("overlapping ZIP entries"), "{error}");
+}
+
+#[test]
+fn actual_decompression_is_bounded_even_when_the_declared_size_is_small() {
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    writer.start_file("resource", SimpleFileOptions::default().compression_method(CompressionMethod::Deflated)).unwrap();
+    writer.write_all(&vec![0; 1 << 20]).unwrap();
+    let mut bytes = writer.finish().unwrap().into_inner();
+    let directory = ZipArchive::new(Cursor::new(&bytes)).unwrap().central_directory_start() as usize;
+    // The central header stores the uncompressed size at byte 24
+    bytes.get_mut(directory + 24..directory + 28).unwrap().copy_from_slice(&1u32.to_le_bytes());
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).unwrap();
+    check_archive(&mut archive, 1024).unwrap();
+    let mut entry = archive.by_index(0).unwrap();
+    let mut budget = LoadBudget::new(1024);
+
+    let error = read_all(&mut entry, MAX_RESOURCE, &mut budget, "resource").unwrap_err();
+
+    assert!(
+        matches!(error, FormatError::TooLarge(_)) || error.to_string().contains("larger than its declared uncompressed size"),
+        "actual bytes must be bounded independently of ZIP sizes: {error}"
+    );
+}
+
+#[test]
+fn baked_dimensions_must_match_the_entry_before_reserving_payload_bytes() {
+    let mut reader = Cursor::new(header(1024, 1024, 3, 0));
+    let mut budget = LoadBudget::new(16 << 20);
+
+    let error = read_baked(&mut reader, BIN_HEADER_BYTES as u64, 3, &mut budget, "baked map").unwrap_err();
+
+    assert!(error.to_string().contains("24 bytes for a 1024×1024×3 map"), "{error}");
+    assert_eq!(budget.remaining(), (16 << 20) - BIN_HEADER_BYTES as u64);
+    assert_eq!(reader.position(), BIN_HEADER_BYTES as u64);
+}
+
+#[test]
+fn streamed_float_chunks_preserve_bits_across_the_chunk_boundary() {
+    let values: Vec<u32> = (0..BAKED_CHUNK + 3).map(|index| (index as u32).wrapping_mul(0x9e3779b9)).collect();
+    let bytes: Vec<u8> = values.iter().flat_map(|bits| bits.to_le_bytes()).collect();
+    let mut reader = Cursor::new(bytes);
+
+    let decoded = read_f32s(&mut reader, values.len(), "baked map").unwrap();
+
+    assert_eq!(decoded.into_iter().map(f32::to_bits).collect::<Vec<_>>(), values);
+    assert_eq!(reader.position(), (values.len() * 4) as u64);
+}
+
+#[test]
+fn archive_indexing_does_not_scan_large_payloads_and_rejects_large_metadata() {
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    writer.start_file("resource", SimpleFileOptions::default().compression_method(CompressionMethod::Stored)).unwrap();
+    writer.write_all(&vec![7; 1 << 20]).unwrap();
+    let bytes = writer.finish().unwrap().into_inner();
+    let metadata_only = Cell::new(true);
+
+    let mut archive = open_archive(Cursor::new(bytes), &metadata_only, 4096).unwrap();
+    let mut first_byte = [0; 1];
+    archive.by_index(0).unwrap().read_exact(&mut first_byte).unwrap();
+
+    assert_eq!(first_byte, [7]);
+    assert!(!metadata_only.get());
+
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    writer.start_file("a".repeat(5000), SimpleFileOptions::default()).unwrap();
+    writer.write_all(&[7]).unwrap();
+    let bytes = writer.finish().unwrap().into_inner();
+    let metadata_only = Cell::new(true);
+
+    assert!(open_archive(Cursor::new(bytes), &metadata_only, 4096).is_err());
+    assert!(metadata_only.get(), "failed indexing must not enable payload access");
+}
+
+#[test]
+fn zip64_entry_counts_remain_supported_and_bounded() {
+    for count in [65_536, MAX_ENTRIES + 1] {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        for index in 0..count {
+            writer.start_file(format!("e{index}"), SimpleFileOptions::default().compression_method(CompressionMethod::Stored)).unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+        let metadata_only = Cell::new(true);
+
+        let mut archive = open_archive(Cursor::new(bytes), &metadata_only, MAX_ZIP_METADATA_BYTES).unwrap();
+        let result = check_archive(&mut archive, 0);
+
+        assert_eq!(archive.len(), count);
+        if count <= MAX_ENTRIES {
+            result.unwrap();
+        } else {
+            assert!(matches!(result, Err(FormatError::TooLarge(_))), "{result:?}");
+        }
+    }
 }

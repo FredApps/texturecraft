@@ -1140,4 +1140,9 @@ pub const TABLE: &[(&str, &str)] = &[
         "Saving uses the other cores and at most this share of the free RAM. At least one core always works.",
         "저장은 나머지 코어와 여유 RAM의 이 비율까지만 사용합니다. 최소 한 개의 코어는 항상 작동합니다.",
     ),
+    ("Max project size on open", "열기 시 최대 프로젝트 크기"),
+    (
+        "Maximum decompressed project data. Increase this limit to open larger projects.",
+        "압축 해제된 프로젝트 데이터의 최대 크기입니다. 더 큰 프로젝트를 열려면 이 한도를 높이세요.",
+    ),
 ];

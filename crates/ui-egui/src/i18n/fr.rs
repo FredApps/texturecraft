@@ -1188,4 +1188,9 @@ pub const TABLE: &[(&str, &str)] = &[
         "Saving uses the other cores and at most this share of the free RAM. At least one core always works.",
         "L'enregistrement utilise les autres cœurs et au plus cette part de la RAM libre. Au moins un cœur travaille toujours.",
     ),
+    ("Max project size on open", "Taille max. à l’ouverture"),
+    (
+        "Maximum decompressed project data. Increase this limit to open larger projects.",
+        "Volume maximal des données décompressées du projet. Augmentez cette limite pour ouvrir des projets plus volumineux.",
+    ),
 ];

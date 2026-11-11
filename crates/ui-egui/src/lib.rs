@@ -204,6 +204,7 @@ impl TextureCraftApp {
             ui
         });
         let next_autosave = ui.prefs.autosave_minutes as f64 * 60.0;
+        ui.prefs.apply_resource_limits();
 
         let mut app = TextureCraftApp {
             camera_glide: None,
@@ -274,7 +275,9 @@ impl TextureCraftApp {
 
     /// Run an engine command, reporting errors as toasts. Returns the result on success.
     pub fn run(&mut self, id: &str, params: Value) -> Option<Value> {
-        // Going to a saved camera glides there; the control channel and CLI jump straight away.
+        self.ui.prefs.apply_resource_limits();
+
+        // Going to a saved camera glides there; the control channel and CLI jump straight away
         let glide_from = (id.starts_with("camera.select") || id.starts_with("camera.bookmark")).then_some(self.session.camera);
         match texturecraft_engine::execute(&mut self.session, id, &params) {
             Ok(v) => {
@@ -658,6 +661,7 @@ impl eframe::App for TextureCraftApp {
             self.styled = Some(style);
         }
         self.step_camera_glide(ctx);
+        self.ui.prefs.apply_resource_limits();
         control::poll(self, ctx);
         #[cfg(not(target_arch = "wasm32"))]
         self.run_file_dialog_answers();
@@ -680,10 +684,7 @@ impl eframe::App for TextureCraftApp {
             ctx.set_zoom_factor(scale);
         }
         #[cfg(not(target_arch = "wasm32"))]
-        {
-            texturecraft_engine::formats::set_save_resources(self.ui.prefs.reserved_cores as usize, self.ui.prefs.save_ram_percent);
-            self.autosave(now);
-        }
+        self.autosave(now);
         i18n::set_language(&self.ui.prefs.language);
         #[cfg(target_arch = "wasm32")]
         {

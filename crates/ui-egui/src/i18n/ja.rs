@@ -1155,4 +1155,9 @@ pub const TABLE: &[(&str, &str)] = &[
         "Saving uses the other cores and at most this share of the free RAM. At least one core always works.",
         "保存は残りのコアと、空きRAMのこの割合までを使います。少なくとも1コアは常に動作します。",
     ),
+    ("Max project size on open", "開くプロジェクトの最大サイズ"),
+    (
+        "Maximum decompressed project data. Increase this limit to open larger projects.",
+        "展開後のプロジェクトデータの上限です。大きなプロジェクトを開くには、この上限を引き上げてください。",
+    ),
 ];
