@@ -28,6 +28,40 @@ fn save(h: &mut Harness<'_, TextureCraftApp>, dir: &Path, name: &str) {
     eprintln!("wrote {}", path.display());
 }
 
+/// Capture the moving preview and settled render after submitting real GPU callbacks.
+#[test]
+#[ignore]
+fn rendering_mode_snapshots() {
+    let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else { return };
+
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let session = texturecraft_engine::sample_session(256, 64).unwrap();
+    let mut harness = Harness::builder()
+        .with_size(egui::vec2(1280.0, 800.0))
+        .with_pixels_per_point(1.0)
+        .wgpu()
+        .build_eframe(|context| TextureCraftApp::new(context, session));
+    harness.state_mut().ui.mode = Mode::Rendering;
+    harness.state_mut().ui.render.max_samples = 16;
+    eprintln!("Rendering-mode adapter: {}", harness.state().gpu.as_ref().unwrap().adapter);
+
+    // Submit each frame so the snapshots exercise the tracer callback, including size switches
+    for _ in 0..6 {
+        harness.state_mut().session.camera.yaw += 0.08;
+        harness.run_steps(1);
+        harness.render().unwrap();
+    }
+    let moving_path = output_dir.join("rendering-moving.png");
+    harness.render().unwrap().save(&moving_path).unwrap();
+    eprintln!("wrote {}", moving_path.display());
+
+    for _ in 0..45 {
+        harness.run_steps(1);
+        harness.render().unwrap();
+    }
+    save(&mut harness, &output_dir, "rendering-settled");
+}
+
 #[test]
 #[ignore]
 fn symmetry_snapshots() {
