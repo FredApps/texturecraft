@@ -2,6 +2,8 @@
 use std::fmt::Write as _;
 use std::path::Path;
 
+/// Generate Rust includes for the optional catalog checkout; required input must contain app catalogs.
+/// Paths are escaped as Rust strings so Windows separators and spaces remain valid.
 pub fn generate(dir: Option<&Path>, required: bool) -> Result<String, String> {
     let mut source = String::from("pub static CRAFT_I18N: &craft_i18n::Embedded = &[\n");
     let Some(dir) = dir else {
@@ -53,6 +55,8 @@ pub fn generate(dir: Option<&Path>, required: bool) -> Result<String, String> {
     Ok(source)
 }
 
+/// Write the embedding for both desktop and wasm, reporting optional failures as warnings.
+/// Required input errors stop Cargo instead of silently shipping an English-only release.
 pub fn embed() {
     println!("cargo::rerun-if-env-changed=CRAFT_I18N_DIR");
     println!("cargo::rerun-if-env-changed=CRAFT_I18N_REQUIRED");

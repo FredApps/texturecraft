@@ -18,6 +18,7 @@ static I18N: LazyLock<craft_i18n::I18n> = LazyLock::new(|| {
 
 static SHARED_LANGUAGES: OnceLock<[craft_i18n::Lang; COUNT]> = OnceLock::new();
 
+/// Resolve the fixed picker codes once; hot text lookups only load the cached language handle.
 fn shared_languages() -> &'static [craft_i18n::Lang; COUNT] {
     SHARED_LANGUAGES.get_or_init(|| LANGUAGES.each_ref().map(|l| I18N.from_code(l.code).unwrap_or(craft_i18n::Lang::EN)))
 }
