@@ -14,6 +14,11 @@ pub struct BakeMeshes {
 }
 
 impl BakeMeshes {
+    /// Every high poly appended into one mesh, as bakes see it
+    pub fn merged_high(&self) -> Option<&MergedHigh> {
+        self.merged.as_ref()
+    }
+
     pub(crate) fn rebuild(&mut self) {
         self.merged = (!self.high.is_empty()).then(|| {
             let (mut mesh, mut base_color, mut file_ids) = (Mesh::default(), Vec::new(), Vec::new());

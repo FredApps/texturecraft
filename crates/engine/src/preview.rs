@@ -1,14 +1,8 @@
-//! Shelf previews: built-in materials evaluated on a unit sphere seen from +Z, without a mesh or
-//! baked maps (generators that need mesh maps are approximated with world-space noise), and
-//! library filters. Cheap enough for lazily rendered thumbnails. Smart masks have their own baked
-//! preview ([`crate::mask_preview`]).
+//! Cheap shelf previews on a unit sphere: plain materials and library filters (smart ones use [`crate::orb_preview`])
 
 use rayon::prelude::*;
-use texturecraft_compose::pattern::{Coords, procedural, world_noise};
-use texturecraft_core::{
-    Channel, Effect, EffectKind, Fill, Filter, Generator, GeneratorKind, Layer, LayerKind, Mask, MaskBackground, Procedural, ProceduralKind, Project,
-    Projection, Source, TextureSet, blend1,
-};
+use texturecraft_compose::pattern::{Coords, procedural};
+use texturecraft_core::{Channel, Effect, EffectKind, Fill, Filter, Layer, LayerKind, Procedural, ProceduralKind, Project, Projection, Source, TextureSet};
 use texturecraft_geom::glam::{Vec2, Vec3};
 
 use crate::materials::{Builder, build};
@@ -50,54 +44,13 @@ fn source(s: &Source, proj: &Projection, c: &Coords) -> Option<[f32; 3]> {
     }
 }
 
-/// Approximate generator: mesh-map signals become world noise (a sphere has no edges or cavities).
-fn generator(g: &Generator, c: &Coords) -> f32 {
-    let dir = Vec3::from(g.direction).try_normalize().unwrap_or(Vec3::Y);
-    let wear = (world_noise(c.pos, 3.0, 91) - 0.5) * 2.2;
-    let cavity = (world_noise(c.pos, 3.0, 57) - 0.3).clamp(0.0, 1.0) + (1.0 - c.nrm.y) * 0.1;
-    let s = match g.kind {
-        GeneratorKind::Position => c.pos.dot(dir) * 0.5 + 0.5,
-        GeneratorKind::Direction => c.nrm.dot(dir) * 0.5 + 0.5,
-        GeneratorKind::EdgeWear => wear,
-        GeneratorKind::Curvature => 0.5 + wear * 0.5,
-        GeneratorKind::AmbientOcclusion => 1.0 - cavity,
-        _ => cavity,
-    };
-    // Same thresholding as the compositor.
-    let s = if g.noise_amount > 0.0 { s + (world_noise(c.pos, g.noise_scale, g.seed) - 0.5) * g.noise_amount } else { s };
-    let soft = g.softness.max(1e-3);
-    let t = ((s - (1.0 - g.level.clamp(0.0, 1.0) - soft)) / (2.0 * soft)).clamp(0.0, 1.0);
-    let v = t * t * (3.0 - 2.0 * t);
-    if g.invert { 1.0 - v } else { v }
-}
-
-fn mask(m: &Mask, c: &Coords) -> f32 {
-    if !m.enabled {
-        return 1.0;
-    }
-    let mut v = if m.background == MaskBackground::White { 1.0 } else { 0.0 };
-    for e in m.effects.iter().filter(|e| e.visible) {
-        let val = match &e.kind {
-            EffectKind::Fill { source: s, projection } => source(s, projection, c).map(|x| x[0]),
-            EffectKind::Generator(g) => Some(generator(g, c)),
-            EffectKind::Levels(l) => Some(l.apply(v)),
-            EffectKind::Filter(Filter::Invert) => Some(1.0 - v),
-            _ => None,
-        };
-        if let Some(val) = val {
-            let blended = if matches!(e.kind, EffectKind::Levels(_) | EffectKind::Filter(_)) { val } else { blend1(e.blend, v, val) };
-            v += (blended - v) * e.opacity.clamp(0.0, 1.0);
-        }
-    }
-    v.clamp(0.0, 1.0)
-}
-
 const CHANNELS: [Channel; 4] = [Channel::BaseColor, Channel::Metallic, Channel::Roughness, Channel::Height];
 
-/// Preview of built-in material `id` (None for an unknown id).
+/// Preview of plain material `id` (None for an unknown id or a smart material, whose masks need mesh maps)
 pub fn material(id: &str, size: usize) -> Option<Vec<Option<Sample>>> {
+    let plain = crate::materials::find(id).filter(|found| !found.smart)?;
     let mut project = Project::new("preview", "");
-    let layers = build(&mut Builder { p: &mut project, channels: CHANNELS.to_vec() }, id).ok()?;
+    let layers = build(&mut Builder { p: &mut project, channels: CHANNELS.to_vec() }, plain.id).ok()?;
 
     // Pixels evaluate independently and big previews take long on one core
     let normals: Vec<_> = sphere_normals(size).collect();
@@ -106,23 +59,24 @@ pub fn material(id: &str, size: usize) -> Option<Vec<Option<Sample>>> {
         .map(|normal| {
             let at = coords(normal?);
             let mut values = CHANNELS.map(Channel::default_value);
-            for layer in layers.iter().filter(|l| l.visible) {
+            for layer in layers.iter().filter(|layer| layer.visible) {
+                // Plain materials are unmasked fills
                 let LayerKind::Fill(fill) = &layer.kind else { continue };
 
-                let coverage = layer.mask.as_ref().map_or(1.0, |m| mask(m, &at));
                 for (value, channel) in values.iter_mut().zip(CHANNELS) {
-                    let layer_value = fill.sources.get(&channel).and_then(|s| source(s, &fill.projection, &at));
+                    let layer_value = fill.sources.get(&channel).and_then(|channel_source| source(channel_source, &fill.projection, &at));
                     if let (Some(blend), Some(layer_value)) = (layer.blend(channel), layer_value) {
-                        let weight = coverage * blend.opacity.clamp(0.0, 1.0);
-                        *value = [0, 1, 2].map(|k| value[k] + (layer_value[k] - value[k]) * weight);
+                        let weight = blend.opacity.clamp(0.0, 1.0);
+                        *value = [0, 1, 2].map(|component| value[component] + (layer_value[component] - value[component]) * weight);
                     }
                 }
             }
 
-            let [base, metal, rough, height] = values;
-            Some(Sample { base, metallic: metal[0], roughness: rough[0], height: height[0] })
+            let [base, metallic, roughness, height] = values;
+            Some(Sample { base, metallic: metallic[0], roughness: roughness[0], height: height[0] })
         })
         .collect();
+
     Some(samples)
 }
 
@@ -196,21 +150,40 @@ pub fn filter(id: &str, size: usize) -> Option<Vec<Option<Sample>>> {
 mod tests {
     use super::*;
 
+    /// Whether every value of `sample` is finite
+    fn finite(sample: &Sample) -> bool {
+        sample.base.into_iter().chain([sample.metallic, sample.roughness, sample.height]).all(f32::is_finite)
+    }
+
     #[test]
     fn previews_cover_the_sphere_with_finite_values() {
-        for m in crate::materials::MATERIALS {
-            let px = material(m.id, 16).unwrap_or_else(|| panic!("{}", m.id));
-            let center = px[8 * 16 + 8].unwrap_or_else(|| panic!("{}", m.id));
-            assert!(center.base.iter().chain([&center.metallic, &center.roughness, &center.height]).all(|v| v.is_finite()), "{}", m.id);
-            assert!(px[0].is_none(), "corners are outside the sphere");
+        let size = 16;
+        for built_in in crate::materials::MATERIALS {
+            let id = built_in.id;
+            if built_in.smart {
+                assert!(material(id, size).is_none(), "{id}: smart materials preview on the orb");
+                continue;
+            }
+
+            let mut project = Project::new("preview", "");
+            let layers = build(&mut Builder { p: &mut project, channels: CHANNELS.to_vec() }, id).unwrap();
+            assert!(layers.iter().all(|layer| layer.mask.is_none()), "{id}: the sphere preview shows no masks");
+
+            let pixels = material(id, size).unwrap_or_else(|| panic!("{id}"));
+            let center = pixels[size / 2 * size + size / 2].unwrap_or_else(|| panic!("{id}"));
+            assert!(finite(&center), "{id}");
+            assert!(pixels[0].is_none(), "corners are outside the sphere");
         }
-        assert!(material("nope", 8).is_none() && filter("nope", 8).is_none());
-        for f in crate::filter_lib::FILTERS {
-            let px = filter(f.id, 24).unwrap_or_else(|| panic!("{}", f.id));
-            let center = px[12 * 24 + 12].unwrap_or_else(|| panic!("{}", f.id));
-            assert!(center.base.iter().chain([&center.roughness, &center.height]).all(|v| v.is_finite()), "{}", f.id);
+        assert!(material("nope", size).is_none() && filter("nope", size).is_none());
+
+        let size = 24;
+        for library_filter in crate::filter_lib::FILTERS {
+            let id = library_filter.id;
+            let pixels = filter(id, size).unwrap_or_else(|| panic!("{id}"));
+            let center = pixels[size / 2 * size + size / 2].unwrap_or_else(|| panic!("{id}"));
+            assert!(finite(&center), "{id}");
         }
-        let (plain, warped) = (filter("levels", 24).unwrap(), filter("warp", 24).unwrap());
+        let (plain, warped) = (filter("levels", size).unwrap(), filter("warp", size).unwrap());
         assert!(plain != warped, "the warp shows in its preview");
     }
 }

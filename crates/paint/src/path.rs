@@ -9,35 +9,41 @@ const MAX_SEGMENT_SAMPLES: f32 = 1024.0;
 /// A Catmull-Rom spline through `points`, sampled about every `step` units, starting on the first point (closed curves end there too)
 pub fn spline(points: &[Vec2], closed: bool, step: f32) -> Vec<Vec2> {
     let mut out: Vec<Vec2> = points.first().copied().into_iter().collect();
-    out.extend(spline_segments(points, closed, step).into_iter().flatten());
+    for segment in segment_samples(points, closed, step) {
+        out.extend(segment);
+    }
     out
 }
 
 /// [`spline`]'s samples per segment: segment `s` holds those after point `s`, up to and including the next point
 pub fn spline_segments(points: &[Vec2], closed: bool, step: f32) -> Vec<Vec<Vec2>> {
+    segment_samples(points, closed, step).map(Iterator::collect).collect()
+}
+
+/// Stream samples so a flat curve does not allocate and retain every segment alongside its output
+fn segment_samples(points: &[Vec2], closed: bool, step: f32) -> impl Iterator<Item = impl Iterator<Item = Vec2>> + '_ {
     let n = points.len();
-    if n < 2 {
-        return Vec::new();
-    }
-    let at = |i: isize| {
+    let at = move |i: isize| {
         let i = if closed { i.rem_euclid(n as isize) } else { i.clamp(0, n as isize - 1) };
         points.get(i as usize).copied().unwrap_or_default()
     };
     let step = if step.is_finite() && step > 1e-6 { step } else { 1.0 };
-    let segments = if closed { n } else { n - 1 } as isize;
-    (0..segments)
-        .map(|s| {
-            let (p0, p1, p2, p3) = (at(s - 1), at(s), at(s + 1), at(s + 2));
-            let k = ((p2 - p1).length() / step).ceil().clamp(1.0, MAX_SEGMENT_SAMPLES) as usize;
-            (1..=k)
-                .map(|j| {
-                    let t = j as f32 / k as f32;
-                    let (t2, t3) = (t * t, t * t * t);
-                    0.5 * (2.0 * p1 + (p2 - p0) * t + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2 + (3.0 * p1 - p0 - 3.0 * p2 + p3) * t3)
-                })
-                .collect()
+    let segments = if n < 2 {
+        0
+    } else if closed {
+        n
+    } else {
+        n - 1
+    } as isize;
+    (0..segments).map(move |s| {
+        let (p0, p1, p2, p3) = (at(s - 1), at(s), at(s + 1), at(s + 2));
+        let k = ((p2 - p1).length() / step).ceil().clamp(1.0, MAX_SEGMENT_SAMPLES) as usize;
+        (1..=k).map(move |j| {
+            let t = j as f32 / k as f32;
+            let (t2, t3) = (t * t, t * t * t);
+            0.5 * (2.0 * p1 + (p2 - p0) * t + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2 + (3.0 * p1 - p0 - 3.0 * p2 + p3) * t3)
         })
-        .collect()
+    })
 }
 
 /// A closed polygon's coverage: 1 inside, 0 outside, a one-unit ramp across the edge.

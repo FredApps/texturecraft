@@ -201,7 +201,7 @@ const ORB_CUT: f32 = 0.8;
 /// [`preview_orb`] domed panels: where the valley sits, as a fraction of the face rim radius.
 const ORB_PANEL_VALLEY: f32 = 0.88;
 
-/// The smart mask preview shape: a sphere cut flat by a cube on six sides, on a thin round base.
+/// The preview orb of the smart mask and smart material previews: a sphere cut flat by a cube on six sides, on a thin round base
 /// Each feature gives one kind of mask something to show: sharp face rims (edges), a softly
 /// blended left face (soft edges), domed panels inside the front, left and top faces whose valleys
 /// hold dirt (cavities), a slot around the middle (cavity), the base (thin part, the seam where it

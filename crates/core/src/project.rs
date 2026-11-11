@@ -395,6 +395,11 @@ pub struct Project {
     /// it, so parts the file leaves unnamed get the same name (from it) as on import.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub mesh_file: String,
+    /// Where the mesh file was imported from (the project's "3D mesh path"). Reimport mesh reads
+    /// it again from there, so edits made to the file since are picked up. Empty when unknown
+    /// (built-in meshes, web imports, projects saved before it was kept).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mesh_path: String,
     pub normal_format: NormalFormat,
     pub texture_sets: Vec<TextureSet>,
     pub layers: BTreeMap<LayerId, Layer>,
@@ -412,6 +417,7 @@ impl Project {
             name: name.into(),
             mesh: mesh.into(),
             mesh_file: String::new(),
+            mesh_path: String::new(),
             normal_format: NormalFormat::OpenGl,
             texture_sets: Vec::new(),
             layers: BTreeMap::new(),

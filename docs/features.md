@@ -103,6 +103,8 @@ Everything TextureCraft does today, by area. What's still missing is in [`ROADMA
   edited): drop one from the Assets panel on a slot of the Texture Set Settings, or pick it from
   the slot's menu. A UV-tiled set takes one image per tile, named with its tile number
   (`ao.1001.png`, `ao.1002.png`…): drop or pick any one of them.
+- **Live bake preview:** while the app bakes, each mesh map shows on the model as soon as it is
+  finished; the bake bar follows the newest map, pins a finished one or shows the material.
 - **Export presets** for glTF PBR Metal Roughness, Unreal Engine (packed), Unity HDRP (mask map),
   Unity Standard, Blender (Principled BSDF), Godot 4 (ORM), OpenPBR (with the coat, fuzz,
   anisotropy, transmission and subsurface maps), separate maps, mesh maps and document channels, in

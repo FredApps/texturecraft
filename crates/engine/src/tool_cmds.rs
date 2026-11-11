@@ -7,7 +7,9 @@ use texturecraft_geom::glam::Vec2;
 use texturecraft_paint::{Alignment, BrushAlpha, alphas};
 
 use crate::commands::{CommandSpec, always, bad, boolp, channel_param, color_param, f32p, strp};
-use crate::session::{CloneFrom, CloneSource, FillMode, Tool};
+use crate::fill_hit_test::FillHitTest;
+use crate::fill_mode::FillMode;
+use crate::session::{CloneFrom, CloneSource, StackTarget, Tool};
 use crate::{Result, Session, cmd};
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -52,6 +54,15 @@ pub fn specs() -> Vec<CommandSpec> {
             material
         ),
         cmd!(
+            "tool.swapMaskValue",
+            "Invert mask value",
+            ["Tools"],
+            Some("X"),
+            "{} — mask value becomes 1 − value: switch the brush between adding to and removing from the mask",
+            paints_mask,
+            swap_mask_value
+        ),
+        cmd!(
             "tool.stencil",
             "Projection stencil",
             [],
@@ -69,7 +80,16 @@ pub fn specs() -> Vec<CommandSpec> {
             always,
             clone_source
         ),
-        cmd!("tool.fillMode", "Polygon fill mode", [], None, "{mode: triangle|uvIsland|mesh}", always, fill_mode),
+        cmd!("tool.fillMode", "Polygon fill mode", [], None, "{mode: triangle|polygon|uvIsland|mesh}", always, fill_mode),
+        cmd!(
+            "tool.fillSelection",
+            "Polygon fill selection",
+            [],
+            None,
+            "{hitTest?: intersection|containedCenter (a box selects polygons it touches, or whose center it holds), visibleOnly?: bool (3D view boxes select only what the camera sees)}",
+            always,
+            fill_selection
+        ),
         cmd!("tool.stroke", "Paint stroke", [], None, "{points: [[x,y],...] viewport pixels, viewport?: [w,h]} — paints with the current tool", always, stroke),
         cmd!(
             "tool.strokeUv",
@@ -80,16 +100,26 @@ pub fn specs() -> Vec<CommandSpec> {
             always,
             stroke_uv
         ),
-        cmd!("tool.click", "Tool click", [], None, "{x, y, viewport?: [w,h]} — polygon fill / color picker / single dab", always, click),
+        cmd!(
+            "tool.click",
+            "Tool click",
+            [],
+            None,
+            "{x, y, viewport?: [w,h]} — polygon fill / color picker / single dab; polygon fill also takes a box {x0, y0, x1, y1, viewport?}, a 2D view point {uv: [u,v]} or a 2D view box {uv0: [u,v], uv1: [u,v]}",
+            always,
+            click
+        ),
         cmd!("tool.state", "Tool state", [], None, "{}", always, |s, _| Ok(serde_json::to_value(&s.tool).unwrap_or(Value::Null))),
     ]
 }
 
-pub(crate) fn set_tool(s: &mut Session, t: Tool) -> Result<Value> {
-    s.cancel_stroke();
-    s.tool.tool = t;
-    s.revision = s.revision.wrapping_add(1);
-    Ok(json!({ "tool": t.id() }))
+pub(crate) fn set_tool(session: &mut Session, tool: Tool) -> Result<Value> {
+    session.cancel_stroke();
+    // A box fill under way keeps what it filled as one undo step
+    session.end_polygon_fill_box();
+    session.tool.tool = tool;
+    session.revision = session.revision.wrapping_add(1);
+    Ok(json!({ "tool": tool.id() }))
 }
 
 fn select(s: &mut Session, p: &Value) -> Result<Value> {
@@ -252,6 +282,30 @@ fn material(s: &mut Session, p: &Value) -> Result<Value> {
     }))
 }
 
+/// Whether strokes paint the selected layer's mask: the mask itself or one of its effects
+fn paints_mask(session: &Session) -> std::result::Result<(), String> {
+    session.selected_layer().ok_or("no layer selected")?;
+
+    let project = &session.doc.project;
+    let targets_mask = match session.target {
+        StackTarget::Content => false,
+        StackTarget::Mask => true,
+        StackTarget::Effect(effect_id) => project
+            .effect(effect_id)
+            .and_then(|(owner, _)| project.layers.get(&owner))
+            .is_some_and(|owner_layer| !owner_layer.content_effects.iter().any(|effect| effect.id == effect_id)),
+    };
+
+    if targets_mask { Ok(()) } else { Err("select a mask to paint on".into()) }
+}
+
+fn swap_mask_value(session: &mut Session, _: &Value) -> Result<Value> {
+    session.tool.mask_value = 1.0 - session.tool.mask_value;
+    session.revision = session.revision.wrapping_add(1);
+
+    Ok(json!({ "maskValue": session.tool.mask_value }))
+}
+
 fn stencil(s: &mut Session, p: &Value) -> Result<Value> {
     if boolp(p, "clear") == Some(true) {
         s.tool.stencil = None;
@@ -319,13 +373,29 @@ fn clone_source(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(serde_json::to_value(s.tool.clone_source).unwrap_or(Value::Null))
 }
 
-fn fill_mode(s: &mut Session, p: &Value) -> Result<Value> {
-    s.tool.fill_mode = match strp(p, "mode").unwrap_or("triangle") {
+fn fill_mode(session: &mut Session, params: &Value) -> Result<Value> {
+    session.tool.fill_mode = match strp(params, "mode").unwrap_or("triangle") {
         "triangle" => FillMode::Triangle,
+        "polygon" => FillMode::Polygon,
         "uvIsland" | "island" => FillMode::UvIsland,
         "mesh" => FillMode::Mesh,
         other => return Err(bad("tool.fillMode", format!("unknown fill mode `{other}`"))),
     };
+
+    Ok(Value::Null)
+}
+
+fn fill_selection(session: &mut Session, params: &Value) -> Result<Value> {
+    match strp(params, "hitTest") {
+        None => {}
+        Some("intersection") => session.tool.fill_hit_test = FillHitTest::Intersection,
+        Some("containedCenter") => session.tool.fill_hit_test = FillHitTest::ContainedCenter,
+        Some(other) => return Err(bad("tool.fillSelection", format!("unknown hit-test `{other}` (intersection or containedCenter)"))),
+    }
+    if let Some(visible_only) = boolp(params, "visibleOnly") {
+        session.tool.fill_visible_only = visible_only;
+    }
+
     Ok(Value::Null)
 }
 
@@ -369,20 +439,46 @@ fn stroke(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "stamps": stamps }))
 }
 
-fn click(s: &mut Session, p: &Value) -> Result<Value> {
-    let (Some(x), Some(y)) = (f32p(p, "x"), f32p(p, "y")) else { return Err(bad("tool.click", "`x` and `y` are required")) };
-    let vp = viewport_of(s, p);
-    let out = match s.tool.tool {
-        Tool::PolygonFill => json!({ "triangles": s.polygon_fill(Vec2::new(x, y), vp)? }),
+fn click(session: &mut Session, params: &Value) -> Result<Value> {
+    if session.tool.tool == Tool::PolygonFill
+        && let Some(triangles) = polygon_fill_click(session, params)?
+    {
+        session.update();
+        return Ok(json!({ "triangles": triangles }));
+    }
+
+    let (Some(x), Some(y)) = (f32p(params, "x"), f32p(params, "y")) else { return Err(bad("tool.click", "`x` and `y` are required")) };
+
+    let point = Vec2::new(x, y);
+    let viewport = viewport_of(session, params);
+    let out = match session.tool.tool {
+        Tool::PolygonFill => json!({ "triangles": session.polygon_fill(point, viewport)? }),
         Tool::ColorPicker => {
-            let v = s.color_pick(Vec2::new(x, y), vp)?;
-            json!(v.iter().map(|(c, v)| (c.id().to_string(), json!(v))).collect::<serde_json::Map<_, _>>())
+            let picked = session.color_pick(point, viewport)?;
+            json!(picked.iter().map(|(channel, value)| (channel.id().to_string(), json!(value))).collect::<serde_json::Map<_, _>>())
         }
-        Tool::GeometryMask => crate::instance_cmds::toggle_part_at(s, Vec2::new(x, y), vp)?,
-        _ => json!({ "stamps": s.stroke_points(&[Vec2::new(x, y)], vp)? }),
+        Tool::GeometryMask => crate::instance_cmds::toggle_part_at(session, point, viewport)?,
+        _ => json!({ "stamps": session.stroke_points(&[point], viewport)? }),
     };
-    s.update();
+    session.update();
     Ok(out)
+}
+
+/// The polygon fill forms of `tool.click` besides a plain `{x, y}` point: None for that point
+fn polygon_fill_click(session: &mut Session, params: &Value) -> Result<Option<usize>> {
+    let screen_box = (f32p(params, "x0"), f32p(params, "y0"), f32p(params, "x1"), f32p(params, "y1"));
+    let given = |keys: &[&str]| keys.iter().any(|key| params.get(*key).is_some());
+    let filled = match (pair(params, "uv0"), pair(params, "uv1"), pair(params, "uv"), screen_box) {
+        (Some(corner), Some(opposite), ..) => session.polygon_fill_box_uv(corner.into(), opposite.into())?,
+        _ if given(&["uv0", "uv1"]) => return Err(bad("tool.click", "a UV box needs `uv0` and `uv1` as [u, v]")),
+        (_, _, Some(uv), _) => session.polygon_fill_uv(uv.into())?,
+        _ if given(&["uv"]) => return Err(bad("tool.click", "a 2D view point needs `uv` as [u, v]")),
+        (.., (Some(x0), Some(y0), Some(x1), Some(y1))) => session.polygon_fill_box(Vec2::new(x0, y0), Vec2::new(x1, y1), viewport_of(session, params))?,
+        _ if given(&["x0", "y0", "x1", "y1"]) => return Err(bad("tool.click", "a screen box needs numbers `x0`, `y0`, `x1` and `y1`")),
+        _ => return Ok(None),
+    };
+
+    Ok(Some(filled))
 }
 
 fn stroke_uv(s: &mut Session, p: &Value) -> Result<Value> {

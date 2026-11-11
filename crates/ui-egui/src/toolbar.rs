@@ -281,19 +281,7 @@ fn tool_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui, tokens: &Tokens) 
                 path_controls(app, ui);
             }
         }
-        Tool::PolygonFill => {
-            use texturecraft_engine::FillMode;
-
-            for (fill_mode, icon, tooltip) in [
-                (FillMode::Triangle, ic::POLYGON, tr("Triangle fill")),
-                (FillMode::UvIsland, ic::SHAPES, tr("UV island fill")),
-                (FillMode::Mesh, ic::CUBE, tr("Mesh fill")),
-            ] {
-                if icon_button(ui, icon, tooltip, app.session.tool.fill_mode == fill_mode, button_size).clicked() {
-                    app.session.tool.fill_mode = fill_mode;
-                }
-            }
-        }
+        Tool::PolygonFill => fill_mode_buttons(app, ui),
         Tool::ColorPicker => {
             ui.label(RichText::new(tr("Click the mesh to pick its material into the brush")).color(tokens.text_dim));
         }
@@ -317,6 +305,23 @@ fn mode_buttons(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
     }
 }
 
+/// Polygon fill's fill modes (top bar and properties)
+pub fn fill_mode_buttons(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
+    use texturecraft_engine::FillMode;
+
+    let button_size = ui.spacing().interact_size.y;
+    for (fill_mode, icon, tooltip) in [
+        (FillMode::Triangle, ic::TRIANGLE, tr("Triangle fill")),
+        (FillMode::Polygon, ic::PARALLELOGRAM, tr("Polygon fill")),
+        (FillMode::Mesh, ic::CUBE, tr("Mesh fill")),
+        (FillMode::UvIsland, ic::CHECKERBOARD, tr("UV island fill")),
+    ] {
+        if icon_button(ui, icon, tooltip, app.session.tool.fill_mode == fill_mode, button_size).clicked() {
+            app.session.tool.fill_mode = fill_mode;
+        }
+    }
+}
+
 /// Path tool options and actions (top bar and properties)
 pub fn path_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
     let button_size = ui.spacing().interact_size.y;
@@ -324,17 +329,16 @@ pub fn path_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui) {
     let (closed, fill) = (path.closed, path.fill);
     let selected = path.selected.is_some_and(|i| i < path.points.len());
     if icon_button(ui, ic::POLYGON, tr("Closed path"), closed, button_size).clicked() {
-        app.session.path_checkpoint();
-        app.session.tool.path.closed = !closed;
+        app.session.set_path_closed(!closed);
     }
+
     let fill_tip = if closed { tr("Fill the closed path (lasso)") } else { tr("Fill the path (close it first)") };
     if icon_button(ui, ic::PAINT_BUCKET, fill_tip, fill, button_size).clicked() {
-        app.session.path_checkpoint();
-        app.session.tool.path.fill = !fill;
+        app.session.set_path_fill(!fill);
     }
+
     if ui.add_enabled_ui(selected, |ui| icon_button(ui, ic::BACKSPACE, tr("Remove point"), false, button_size)).inner.clicked() {
-        app.session.path_checkpoint();
-        app.session.tool.path.remove_selected();
+        app.session.remove_selected_path_point();
     }
 }
 

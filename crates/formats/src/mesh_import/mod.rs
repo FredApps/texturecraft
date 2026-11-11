@@ -379,6 +379,7 @@ fn geometry(raw: RawMesh) -> Result<(Mesh, Vec<String>, Option<Vec<Vec2>>)> {
     let RawMesh { positions, normals, uvs, colors, groups, warnings, diagonals, .. } = raw;
     check_vertices(positions.len())?;
     check_triangles(0, groups.iter().map(|(_, _, g)| g.len() / 3).sum())?;
+
     let mut mesh = Mesh { positions, ..Mesh::default() };
     let mut groups: Vec<(usize, String, Vec<u32>)> = groups
         .into_iter()
@@ -398,22 +399,27 @@ fn geometry(raw: RawMesh) -> Result<(Mesh, Vec<String>, Option<Vec<Vec2>>)> {
         mesh.indices.extend_from_slice(tris.get(..count as usize).unwrap_or_default());
         mesh.submeshes.push(SubMesh { name, material, start, count });
     }
+
     if mesh.indices.is_empty() {
         return Err(FormatError::Invalid("the file contains no triangles".into()));
     }
+
     if !diagonals.is_empty() {
         let diagonal = |a: u32, b: u32| diagonals.contains(&(a.min(b), a.max(b)));
-        mesh.diagonals = mesh.indices.chunks_exact(3).map(|t| (0..3).map(|i| u8::from(diagonal(t[i], t[(i + 1) % 3])) << i).sum()).collect();
+        mesh.diagonals = mesh.indices.as_chunks::<3>().0.iter().map(|t| (0..3).map(|i| u8::from(diagonal(t[i], t[(i + 1) % 3])) << i).sum()).collect();
     }
     if let Some(bad) = mesh.indices.iter().find(|i| **i as usize >= mesh.positions.len()) {
         return Err(FormatError::Invalid(format!("vertex index {bad} out of range ({} vertices)", mesh.positions.len())));
     }
+
     if mesh.positions.iter().any(|p| !p.is_finite()) {
         return Err(FormatError::Invalid("the mesh has non-finite vertex positions".into()));
     }
+
     if all_triangles_degenerate(&mesh) {
         return Err(FormatError::Invalid("every triangle of the mesh is degenerate (zero area)".into()));
     }
+
     mesh.normals = match normals {
         Some(n) if n.len() == mesh.positions.len() => n.into_iter().map(|v| v.try_normalize().unwrap_or(Vec3::Y)).collect(),
         _ => smooth_normals(&mesh),
@@ -421,6 +427,7 @@ fn geometry(raw: RawMesh) -> Result<(Mesh, Vec<String>, Option<Vec<Vec2>>)> {
     if let Some(c) = colors.filter(|c| c.len() == mesh.positions.len()) {
         mesh.colors = c.into_iter().map(|v| if v.is_finite() { v.clamp(Vec4::ZERO, Vec4::ONE) } else { Vec4::ONE }).collect();
     }
+
     Ok((mesh, warnings, uvs))
 }
 
@@ -482,18 +489,19 @@ fn orbit_cameras(raw: &[RawCamera], mesh: &Mesh) -> Vec<texturecraft_core::Camer
 
 /// Area-weighted smooth normals over welded positions (UV seams do not split shading).
 fn smooth_normals(mesh: &Mesh) -> Vec<Vec3> {
-    let weld = weld_ids(&mesh.positions);
-    let mut acc = vec![Vec3::ZERO; mesh.positions.len()];
-    for t in mesh.indices.chunks_exact(3) {
+    let welded_vertices = weld_ids(&mesh.positions);
+    let mut normals = vec![Vec3::ZERO; mesh.positions.len()];
+    for triangle in mesh.indices.as_chunks::<3>().0 {
         let p = |i: u32| mesh.positions.get(i as usize).copied().unwrap_or_default();
-        let face = (p(t[1]) - p(t[0])).cross(p(t[2]) - p(t[0]));
-        for v in t {
-            if let Some(a) = weld.get(*v as usize).and_then(|w| acc.get_mut(*w as usize)) {
+        let face = (p(triangle[1]) - p(triangle[0])).cross(p(triangle[2]) - p(triangle[0]));
+        for v in triangle {
+            if let Some(a) = welded_vertices.get(*v as usize).and_then(|w| normals.get_mut(*w as usize)) {
                 *a += face;
             }
         }
     }
-    weld.iter().map(|w| acc.get(*w as usize).and_then(|n| n.try_normalize()).unwrap_or(Vec3::Y)).collect()
+
+    welded_vertices.iter().map(|w| normals.get(*w as usize).and_then(|n| n.try_normalize()).unwrap_or(Vec3::Y)).collect()
 }
 
 /// Inspects `mesh` and generates its UV report (overlaps, out-of-range UVs, warnings).
