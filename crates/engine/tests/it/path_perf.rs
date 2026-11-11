@@ -3,8 +3,8 @@
 use std::time::{Duration, Instant};
 
 use serde_json::json;
-use texturecraft_engine::geom::{glam::Vec2, primitives};
-use texturecraft_engine::{Session, execute};
+use texturecraft_engine::execute;
+use texturecraft_engine::geom::glam::Vec2;
 
 fn median_ms(samples: &mut [Duration]) -> f64 {
     samples.sort_unstable();
@@ -72,6 +72,9 @@ fn resident_kib() -> usize {
 #[test]
 #[ignore = "release memory soak: 1,000 edits across 100 canceled previews"]
 fn path_preview_memory_soak() {
+    use texturecraft_engine::Session;
+    use texturecraft_engine::geom::primitives;
+
     let mut session = Session::new_project("Path soak", primitives::sphere(1.0, 48, 24), "builtin:sphere", None, 512).unwrap();
     session.viewport = Vec2::splat(400.0);
     session.update();
