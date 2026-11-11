@@ -98,6 +98,27 @@ fn a_closed_path_fill_mirrors_around_the_moved_plane() {
     assert!(!red_at(&session, Vec3::new(-inside.x, inside.y, 0.0)), "nothing across the mesh center");
 }
 
+#[test]
+fn a_closed_path_fill_reaches_a_curved_copy_across_a_moved_plane() {
+    let mut session = session(primitives::sphere(1.0, 48, 24));
+
+    // Occlusion must still protect the rear surface when normal-based culling is disabled
+    execute(&mut session, "tool.brush", &json!({"symmetryX": true, "symmetryOffset": [0.1, 0.0, 0.0], "backfaceCulling": false})).unwrap();
+    let inside = surface(&session, 185.0, 200.0);
+    let mirrored_x = 0.2 - inside.x;
+    let copy = Vec3::new(mirrored_x, inside.y, (1.0 - mirrored_x * mirrored_x - inside.y * inside.y).sqrt());
+
+    let square = json!([[175, 190], [195, 190], [195, 210], [175, 210]]);
+    execute(&mut session, "tool.path", &json!({"points": square, "closed": true, "fill": true, "commit": true})).unwrap();
+
+    assert!(red_at(&session, inside), "the filled lasso");
+    assert!(red_at(&session, copy), "its copy where the sphere curves away across x = 0.1");
+
+    session.camera.yaw = std::f32::consts::PI;
+    assert!(!red_at(&session, Vec3::new(copy.x, copy.y, -copy.z)), "the hidden back of the copy stays clean");
+    assert!(!red_at(&session, Vec3::new(inside.x, inside.y, -inside.z)), "the hidden back of the source stays clean");
+}
+
 /// How much redder than green a texel must be to count as painted (faded edges included)
 const PAINTED_TINT: f32 = 0.05;
 

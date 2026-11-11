@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use texturecraft_core::{Channel, Effect, EffectKind, LayerId, Mask, MaskBackground, PathShape};
-use texturecraft_geom::glam::{Vec2, Vec3};
+use texturecraft_geom::glam::{Mat3, Vec2, Vec3};
 use texturecraft_geom::{OrbitCamera, surface_at};
 use texturecraft_paint::{BrushSettings, Lasso, fill_coverage, spline};
 
@@ -26,6 +26,8 @@ pub const MAX_PATH_POINTS: usize = 4096;
 const STEP_PX: f32 = 2.0;
 const STEP_UV: f32 = 0.001;
 const MIN_PROJECTIVE_W: f32 = 1e-6;
+// Match the minimum world-space scale used by brush stamps
+const MIN_BRUSH_SCALE: f32 = 1e-4;
 // Allow ray hits to differ slightly from transformed texel positions
 const RAY_HIT_RELATIVE_TOLERANCE: f32 = 0.001;
 
@@ -455,57 +457,72 @@ impl Session {
     /// Fill the inside of `polygon` (viewport pixels over the visible surface, or texture coordinates); returns the touched tiles
     fn lasso_fill(&mut self, polygon: Vec<Vec2>, uv: bool, viewport: Vec2) -> Result<usize> {
         let texture_set = self.ts();
-        let (gbuf, mut canvas) = self.fill_canvas(texture_set)?;
-        let width = gbuf.width.max(1);
+        let (uv_buffer, mut canvas) = self.fill_canvas(texture_set)?;
+        let width = uv_buffer.width.max(1);
 
         if uv {
-            let lasso = Lasso::new(polygon.iter().map(|point| *point * Vec2::new(width as f32, gbuf.height as f32)).collect());
-            fill_coverage(&mut canvas, &gbuf, |texel, _| lasso.coverage(Vec2::new((texel as u32 % width) as f32 + 0.5, (texel as u32 / width) as f32 + 0.5)));
+            let lasso = Lasso::new(polygon.iter().map(|point| *point * Vec2::new(width as f32, uv_buffer.height as f32)).collect());
+            fill_coverage(&mut canvas, &uv_buffer, |texel, _| {
+                lasso.coverage(Vec2::new((texel as u32 % width) as f32 + 0.5, (texel as u32 / width) as f32 + 0.5))
+            });
         } else {
             let lasso = Lasso::new(polygon);
-            let view_proj = self.camera.view_proj(viewport.x.max(1.0) / viewport.y.max(1.0));
-            let inverse_view_proj = view_proj.inverse();
-            let (backface_culling, mesh, bvh) = (self.tool.brush.backface_culling, &self.mesh, &self.bvh);
+            let view_projection = self.camera.view_proj(viewport.x.max(1.0) / viewport.y.max(1.0));
+            let inverse_view_projection = view_projection.inverse();
+            let (mesh, bvh) = (&self.mesh, &self.bvh);
+            let brush = self.tool.brush.sanitized();
 
             // A visible source inside the lasso can paint each symmetry copy
             let (bounds_min, bounds_max) = mesh.bounds();
-            let symmetry = self.tool.brush.sanitized().symmetry;
+            let symmetry = brush.symmetry;
             let symmetry_origin = symmetry.origin((bounds_min + bounds_max) * 0.5);
             let inverses: Vec<_> = symmetry.transforms().iter().map(|transform| transform.inverse()).collect();
 
-            fill_coverage(&mut canvas, &gbuf, |texel, _| {
-                let Some(surface) = gbuf.surface(mesh, texel) else { return 0.0 };
+            // Copies can leave the source surface, within the same depth allowed for brush stamps
+            let copy_depth = brush.size * (bounds_max - bounds_min).length().max(MIN_BRUSH_SCALE) * brush.depth;
+            let eye = self.camera.eye();
+            let camera_distance = self.camera.distance.max(MIN_BRUSH_SCALE);
+
+            fill_coverage(&mut canvas, &uv_buffer, |texel, _| {
+                let Some(surface) = uv_buffer.surface(mesh, texel) else { return 0.0 };
                 let mut best = 0.0f32;
 
                 for inverse in &inverses {
                     let position = symmetry_origin + *inverse * (surface.pos - symmetry_origin);
-                    let clip = view_proj * position.extend(1.0);
+                    let clip = view_projection * position.extend(1.0);
                     if clip.w <= MIN_PROJECTIVE_W {
                         continue;
                     }
 
-                    let ndc = Vec2::new(clip.x, clip.y) / clip.w;
-                    let coverage = lasso.coverage(to_pixels(ndc, viewport));
+                    let normalized_screen = Vec2::new(clip.x, clip.y) / clip.w;
+                    let coverage = lasso.coverage(to_pixels(normalized_screen, viewport));
                     if coverage <= best {
                         continue;
                     }
 
                     // Use the source surface normal; a copy may face away from the camera
-                    let near_clip = inverse_view_proj * ndc.extend(0.0).extend(1.0);
+                    let near_clip = inverse_view_projection * normalized_screen.extend(0.0).extend(1.0);
                     let origin = near_clip.truncate() / near_clip.w;
                     let to_surface = position - origin;
                     let distance = to_surface.length();
                     let Some(direction) = to_surface.try_normalize() else { continue };
-                    let Some(hit) = bvh
-                        .closest(origin, direction, distance * (1.0 + RAY_HIT_RELATIVE_TOLERANCE))
-                        .filter(|hit| hit.t >= distance * (1.0 - RAY_HIT_RELATIVE_TOLERANCE))
-                    else {
-                        continue;
+                    let Some(hit) = bvh.closest(origin, direction, distance * (1.0 + RAY_HIT_RELATIVE_TOLERANCE)) else { continue };
+
+                    // Keep identity copies exact and reject occluders beyond the bounded displacement
+                    let off_surface = if *inverse == Mat3::IDENTITY {
+                        0.0
+                    } else if brush.screen_space {
+                        copy_depth * (origin + direction * hit.t).distance(eye) / camera_distance
+                    } else {
+                        copy_depth
                     };
+                    if hit.t < distance * (1.0 - RAY_HIT_RELATIVE_TOLERANCE) - off_surface {
+                        continue;
+                    }
 
                     let Some(source) = surface_at(mesh, hit.tri, hit.u, hit.v) else { continue };
 
-                    if backface_culling && source.nrm.dot(direction) >= 0.0 {
+                    if brush.backface_culling && source.nrm.dot(direction) >= 0.0 {
                         continue;
                     }
 
