@@ -28,6 +28,7 @@ fn save(h: &mut Harness<'_, TextureCraftApp>, dir: &Path, name: &str) {
     eprintln!("wrote {}", path.display());
 }
 
+/// Capture the moving preview and settled render after submitting real GPU callbacks.
 #[test]
 #[ignore]
 fn rendering_mode_snapshots() {

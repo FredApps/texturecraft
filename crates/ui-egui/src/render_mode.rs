@@ -14,6 +14,7 @@ use std::sync::{Mutex, PoisonError};
 
 use eframe::egui_wgpu::{self, CallbackResources, CallbackTrait, ScreenDescriptor};
 use egui::{Color32, ColorImage, Rect, RichText, TextureHandle, TextureOptions, Ui, vec2};
+use texturecraft_engine::compose::ImageRes;
 use texturecraft_engine::geom::{Bvh, Mesh, OrbitCamera};
 use texturecraft_render::displace::trace_geometry;
 use texturecraft_render::gpu_trace::GpuTracer;
@@ -248,9 +249,8 @@ pub struct RenderView {
     env: Mutex<Option<(EnvKey, Arc<EnvImage>)>>,
 }
 
-/// What a traced environment is built from: the display's environment name and the identity of
-/// its imported image (0: none).
-type EnvKey = (String, usize);
+/// The display's environment name and its retained imported image (None: built-in).
+type EnvKey = (String, Option<Arc<ImageRes>>);
 
 /// Viewport resolution of a CPU render (the web renders at half size: it has one thread).
 fn render_size(rect: Rect) -> (u32, u32) {
@@ -287,12 +287,19 @@ fn trace_scene(app: &TextureCraftApp) -> TraceScene {
     };
     drop(cached);
 
-    let env_key: EnvKey = (display.environment.clone(), env_image.map_or(0, |image| Arc::as_ptr(image) as usize));
     let mut env_cached = app.render.env.lock().unwrap_or_else(PoisonError::into_inner);
+    let same_image = |source: &Option<Arc<ImageRes>>| match (source, env_image) {
+        (Some(cached), Some(current)) => Arc::ptr_eq(cached, current),
+        (None, None) => true,
+        _ => false,
+    };
     let env = match env_cached.as_ref() {
-        Some((cached_key, environment)) if *cached_key == env_key => environment.clone(),
+        Some(((name, source), environment)) if *name == display.environment && same_image(source) => environment.clone(),
         _ => {
             let environment = Arc::new(TraceScene::display_env(display, env_image.map(|image| image.as_ref())));
+
+            // Retaining the source prevents a later image from reusing its cached identity
+            let env_key = (display.environment.clone(), env_image.cloned());
             *env_cached = Some((env_key, environment.clone()));
             environment
         }
@@ -711,6 +718,7 @@ impl TraceCallback {
 }
 
 impl CallbackTrait for TraceCallback {
+    /// Submit tracing work and report its samples or failure to the next UI frame.
     fn prepare(
         &self,
         device: &wgpu::Device,

@@ -507,19 +507,25 @@ impl GpuTracer {
         Ok(true)
     }
 
-    /// Start over at `width × height` (the accumulation buffers are cleared or reallocated).
+    /// Start over at `width × height`, keeping the active render intact if allocation fails.
     pub fn reset(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, width: u32, height: u32) -> Result<(), String> {
         let (width, height) = (width.clamp(1, 8192), height.clamp(1, 8192));
-        self.samples = 0;
+        let bytes = u64::from(width) * u64::from(height) * 16;
+        let limits = device.limits();
+
+        // Reject unsupported sizes before invalidating the displayed render
+        if bytes > limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) {
+            return Err(format!("a {width}×{height} render exceeds this GPU's buffer limit"));
+        }
+
         if let Some(accumulation) = self.acc.as_ref().filter(|accumulation| (accumulation.width, accumulation.height) == (width, height)) {
             for buffer in &accumulation.acc {
                 encoder.clear_buffer(buffer, 0, None);
             }
 
+            self.samples = 0;
             return Ok(());
         }
-
-        self.bind = None;
 
         // Reused buffers must not retain samples from the previous view
         if let Some(spare) = self.spare_acc.take_if(|accumulation| (accumulation.width, accumulation.height) == (width, height)) {
@@ -528,15 +534,13 @@ impl GpuTracer {
             }
 
             self.spare_acc = self.acc.replace(spare);
+            self.bind = None;
+            self.samples = 0;
             return Ok(());
         }
 
-        self.spare_acc = self.acc.take();
-        let bytes = u64::from(width) * u64::from(height) * 16;
-        let limits = device.limits();
-        if bytes > limits.max_storage_buffer_binding_size.min(limits.max_buffer_size) {
-            return Err(format!("a {width}×{height} render exceeds this GPU's buffer limit"));
-        }
+        // Retire the obsolete spare before allocating, but keep the active render until success
+        self.spare_acc = None;
 
         let create_buffer = |label| {
             device.create_buffer(&wgpu::BufferDescriptor {
@@ -546,12 +550,15 @@ impl GpuTracer {
                 mapped_at_creation: false,
             })
         };
-        self.acc = Some(scoped(device, "GPU path tracing: accumulation buffers", || Accum {
+        let accumulation = scoped(device, "GPU path tracing: accumulation buffers", || Accum {
             width,
             height,
             acc: ["tc_acc_hit", "tc_acc_albedo", "tc_acc_normal", "tc_acc_env"].map(create_buffer),
             illum: ["tc_illum_a", "tc_illum_b"].map(create_buffer),
-        })?);
+        })?;
+        self.spare_acc = self.acc.replace(accumulation);
+        self.bind = None;
+        self.samples = 0;
         #[cfg(test)]
         {
             self.acc_allocations += 1;
@@ -831,6 +838,7 @@ mod tests {
         read_buffer(h, &t.acc.as_ref().unwrap().acc[0])
     }
 
+    /// Read a completed buffer to check its contents across resets and reuse.
     fn read_buffer(headless: &Headless, buffer: &wgpu::Buffer) -> Vec<[f32; 4]> {
         let bytes = buffer.size();
         let staging = headless.device.create_buffer(&wgpu::BufferDescriptor {
@@ -848,6 +856,7 @@ mod tests {
         bytemuck::cast_slice(&staging.slice(..).get_mapped_range().unwrap()).to_vec()
     }
 
+    /// Two cached sizes reuse cleared buffers, and leaving Rendering mode releases both.
     #[test]
     fn switching_between_two_sizes_reuses_the_accumulation_buffers() {
         let Some((headless, mut tracer)) = gpu() else { return };
@@ -878,6 +887,33 @@ mod tests {
 
         tracer.release();
         assert!(tracer.acc.is_none() && tracer.spare_acc.is_none(), "leaving Rendering mode frees both sizes");
+    }
+
+    /// Rejecting an oversized render preserves the image and lets tracing continue.
+    #[test]
+    fn failed_reset_retains_the_active_render() {
+        let Some((mut headless, mut tracer)) = gpu() else { return };
+        let scene = sphere_scene(&mut headless, crate::ibl::environment("Studio Soft", 32), &WHITE);
+        let camera = camera();
+        let settings = TraceSettings::default();
+        let display = TraceDisplay::from_display(&Default::default());
+        tracer.render(&headless.device, &headless.queue, &headless.renderer, &scene, &camera, &settings, &display, [32, 24], 2).unwrap();
+        let before = accumulation(&headless, &tracer);
+
+        let mut encoder = headless.device.create_command_encoder(&Default::default());
+        let error = tracer.reset(&headless.device, &mut encoder, 8192, 8192).unwrap_err();
+
+        assert!(error.contains("exceeds this GPU's buffer limit"));
+        assert!(tracer.acc.is_some(), "a rejected resize must keep the active buffers");
+        assert!(tracer.bind.is_some(), "a rejected resize must keep the active bindings");
+        assert_eq!(tracer.samples(), 2, "a rejected resize must keep the accumulated samples");
+        assert_eq!(accumulation(&headless, &tracer), before);
+        assert!(tracer.pass(&headless.device, &headless.queue, &mut encoder, &camera, &settings, 1));
+        let output = GpuTracer::output_texture(&headless.device, 32, 24);
+        assert!(tracer.resolve(&headless.device, &headless.queue, &mut encoder, &display, &output.create_view(&Default::default())));
+        headless.queue.submit([encoder.finish()]);
+        assert!(crate::readback::Readback::blocking(&headless.device, &headless.queue, &output).is_some());
+        assert_eq!(tracer.samples(), 3);
     }
 
     const WHITE: [(Channel, [f32; 3]); 3] = [(Channel::BaseColor, [1.0; 3]), (Channel::Metallic, [0.0; 3]), (Channel::Roughness, [0.5; 3])];

@@ -9,6 +9,7 @@ use super::{
 use texturecraft_engine::Session;
 use texturecraft_engine::geom::primitives;
 
+/// A small, fully composed sphere avoids unrelated texture-loading transitions.
 fn session() -> Session {
     let mut session = Session::new_project("t", primitives::sphere(1.0, 16, 8), "builtin:sphere", None, 128).unwrap();
     session.update();
@@ -16,6 +17,7 @@ fn session() -> Session {
     session
 }
 
+/// Bump-strength edits invalidate GPU scene data even without displaced geometry.
 #[test]
 fn height_strength_changes_restart_the_gpu_scene_without_displacement() {
     let mut session = session();
@@ -28,19 +30,67 @@ fn height_strength_changes_restart_the_gpu_scene_without_displacement() {
     assert_ne!(gpu_scene_key(&session), before, "the GPU shader must receive the new bump strength");
 }
 
+/// Keeping an imported image alive prevents its cached identity from being reused for another image.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn environment_cache_retains_source_identity_until_replaced() {
+    use std::sync::Arc;
+    use texturecraft_engine::compose::ImageRes;
+
+    // The harness draws once; parallel translation tests must not change its language mid-frame
+    let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut app = egui_kittest::Harness::builder().build_eframe(|context| crate::TextureCraftApp::new(context, session())).into_state();
+    app.session.doc.project.display.environment = "resource:environment".into();
+    let source = Arc::new(ImageRes { width: 2, height: 1, rgba: vec![[1.0, 0.0, 0.0, 1.0]; 2], srgb: false });
+    let original_source = Arc::downgrade(&source);
+    app.session.images.insert("environment".into(), source);
+    let first = super::trace_scene(&app).env;
+    assert!(Arc::ptr_eq(&first, &super::trace_scene(&app).env), "unchanged images reuse the decoded environment");
+
+    let replacement = Arc::new(ImageRes { width: 2, height: 1, rgba: vec![[0.0, 1.0, 0.0, 1.0]; 2], srgb: false });
+    app.session.images.insert("environment".into(), replacement.clone());
+
+    assert!(original_source.upgrade().is_some(), "the cache must retain its source so its address cannot be reused");
+    let second = super::trace_scene(&app).env;
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert_ne!(first.data, second.data, "replacing the image changes the lighting");
+    assert!(Arc::ptr_eq(&second, &super::trace_scene(&app).env));
+    assert!(original_source.upgrade().is_none(), "replacing the cache releases the previous source");
+
+    app.session.images.insert("renamed".into(), replacement);
+    app.session.doc.project.display.environment = "resource:renamed".into();
+    assert!(!Arc::ptr_eq(&second, &super::trace_scene(&app).env), "the environment name is also part of the key");
+}
+
+/// Create one harness device, skipping unavailable or non-compute backends.
 #[cfg(not(target_arch = "wasm32"))]
 fn gpu_app() -> Option<crate::TextureCraftApp> {
-    match texturecraft_render::headless::Headless::new() {
-        Ok(headless) if super::GpuTracer::supported(&headless.device) => {}
-        _ => {
-            eprintln!("skipping: no compute-capable GPU adapter");
+    use eframe::egui_wgpu::{RenderState, RendererOptions, WgpuConfiguration};
+    use egui_kittest::wgpu::{WgpuTestRenderer, default_wgpu_setup};
+
+    let setup = default_wgpu_setup();
+    let instance = pollster::block_on(setup.new_instance());
+    let configuration = WgpuConfiguration { wgpu_setup: setup, ..Default::default() };
+    let render_state = match pollster::block_on(RenderState::create(&configuration, &instance, None, RendererOptions::PREDICTABLE)) {
+        Ok(render_state) => render_state,
+        Err(error) => {
+            eprintln!("skipping: could not create the harness GPU device: {error}");
             return None;
         }
+    };
+
+    let adapter = render_state.adapter.get_info();
+    if !super::GpuTracer::supported(&render_state.device) {
+        eprintln!("skipping: harness adapter {} ({:?}) cannot run the GPU tracer", adapter.name, adapter.backend);
+        return None;
     }
 
+    eprintln!("GPU lifecycle test adapter: {} ({:?})", adapter.name, adapter.backend);
+    // The harness draws once; parallel translation tests must not change its language mid-frame
+    let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut app = egui_kittest::Harness::builder()
         .with_size(egui::vec2(800.0, 600.0))
-        .wgpu()
+        .renderer(WgpuTestRenderer::from_render_state(render_state))
         .build_eframe(|context| crate::TextureCraftApp::new(context, session()))
         .into_state();
     app.session.update();
@@ -51,6 +101,7 @@ fn gpu_app() -> Option<crate::TextureCraftApp> {
     Some(app)
 }
 
+/// Build a GPU rendering frame at a controlled time without executing its callback.
 #[cfg(not(target_arch = "wasm32"))]
 fn draw_gpu(app: &mut crate::TextureCraftApp, context: &egui::Context, time: f64) -> egui::FullOutput {
     context.run_ui(egui::RawInput { time: Some(time), ..Default::default() }, |ui| {
@@ -58,6 +109,7 @@ fn draw_gpu(app: &mut crate::TextureCraftApp, context: &egui::Context, time: f64
     })
 }
 
+/// A first completed callback must survive a slow frame's switch to full resolution.
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn settling_after_the_first_gpu_frame_keeps_its_image() {
@@ -80,6 +132,7 @@ fn settling_after_the_first_gpu_frame_keeps_its_image() {
     assert_eq!(view.held, Some(previous_texture));
 }
 
+/// A finished low-sample render must wake again to release its retained preview.
 #[cfg(not(target_arch = "wasm32"))]
 #[test]
 fn a_low_sample_limit_schedules_the_held_image_timeout() {
@@ -159,6 +212,7 @@ fn a_moving_camera_traces_smaller_and_a_still_one_at_full_size() {
     assert_eq!(traced_size((20, 400), true), (16, 200));
 }
 
+/// Camera changes and unfinished uploads keep the preview small until activity settles.
 #[test]
 fn motion_starts_on_a_camera_change_and_settles_after_a_moment() {
     let mut motion = Motion::default();
@@ -176,6 +230,7 @@ fn motion_starts_on_a_camera_change_and_settles_after_a_moment() {
     assert!(!motion.moving(&camera, 5.0 + MOTION_SETTLE_S * 1.5, false));
 }
 
+/// Either sufficient samples or the deadline replaces the retained preview.
 #[test]
 fn the_soft_image_stays_until_the_full_size_render_has_samples_or_time_runs_out() {
     assert!(holds_previous(0, 0.0));
@@ -184,6 +239,7 @@ fn the_soft_image_stays_until_the_full_size_render_has_samples_or_time_runs_out(
     assert!(!holds_previous(0, SETTLE_HOLD_MAX_S), "a slow GPU: don't hold it forever");
 }
 
+/// Sampling grows gradually, holds through jitter and cuts promptly on overload.
 #[test]
 fn samples_per_frame_grow_slowly_hold_in_between_and_drop_fast() {
     let (floor, free) = (1.0 / 144.0, SPP_GROW_PAUSE_FRAMES);
@@ -251,6 +307,7 @@ fn a_few_very_quick_frames_do_not_collapse_the_samples_per_frame() {
     assert!(spp >= 4, "12 ms frames after 3 ms ones are fine: {spp}");
 }
 
+/// Invalid timings are ignored and old timings expire within the bounded window.
 #[test]
 fn the_frame_floor_is_the_quickest_recent_frame_within_range() {
     let mut floor = FrameFloor::default();
@@ -267,6 +324,7 @@ fn the_frame_floor_is_the_quickest_recent_frame_within_range() {
     assert_eq!(floor.push(0.2), FLOOR_RANGE_S.1, "only recent frames count, and at most 1/30 s");
 }
 
+/// Resolution changes preserve approximate tracing work within the sample limits.
 #[test]
 fn samples_per_frame_follow_the_pixel_count_when_the_size_changes() {
     assert_eq!(rescale_spp(12, (500, 400), (1000, 800)), 3, "four times the pixels: a quarter of the samples");
@@ -275,6 +333,7 @@ fn samples_per_frame_follow_the_pixel_count_when_the_size_changes() {
     assert_eq!(rescale_spp(16, (100, 100), (10, 10)), MAX_SPP, "never above the cap");
 }
 
+/// Loading throttles texture synchronization without delaying the first or settled update.
 #[test]
 fn loading_textures_are_taken_in_at_a_limited_rate() {
     assert!(take_in_textures(false, 1.0, 1.0), "not loading: every frame");
@@ -283,6 +342,7 @@ fn loading_textures_are_taken_in_at_a_limited_rate() {
     assert!(take_in_textures(true, 0.0, f64::MIN), "the first frame always");
 }
 
+/// The placeholder appears only before the first image has been traced.
 #[test]
 fn nothing_traced_yet_shows_the_placeholder() {
     assert!(!show_image(false, 0));
