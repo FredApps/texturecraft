@@ -119,6 +119,51 @@ fn a_closed_path_fill_reaches_a_curved_copy_across_a_moved_plane() {
     assert!(!red_at(&session, Vec3::new(inside.x, inside.y, -inside.z)), "the hidden back of the source stays clean");
 }
 
+#[test]
+fn a_closed_path_fill_reaches_a_copy_in_front_of_the_source_surface() {
+    for ortho in [false, true] {
+        for screen_space in [false, true] {
+            let mut session = session(primitives::sphere(1.0, 48, 24));
+            session.camera.ortho = ortho;
+            execute(&mut session, "tool.brush", &json!({"size": 10, "screenSpace": screen_space, "symmetryX": true, "symmetryOffset": [0.1, 0.0, 0.0]}))
+                .unwrap();
+            let inside = surface(&session, 235.0, 200.0);
+            let mirrored_x = 0.2 - inside.x;
+            let copy = Vec3::new(mirrored_x, inside.y, (1.0 - mirrored_x * mirrored_x - inside.y * inside.y).sqrt());
+            assert!(copy.z > inside.z + 0.01, "the copy must be nearer the camera than its source");
+
+            let square = json!([[225, 190], [245, 190], [245, 210], [225, 210]]);
+            execute(&mut session, "tool.path", &json!({"points": square, "closed": true, "fill": true, "commit": true})).unwrap();
+
+            assert!(red_at(&session, inside), "the filled lasso");
+            assert!(red_at(&session, copy), "the ray must reach the source: ortho={ortho}, screen_space={screen_space}");
+        }
+    }
+}
+
+#[test]
+fn screen_space_fill_copy_depth_is_limited_at_the_source_hit() {
+    // The source hit allows about 0.071 world units; the search bound allows about 0.122
+    for (displacement, painted) in [(-0.074, false), (0.068, true), (0.1, false)] {
+        let mut session = session(wall());
+        session.camera.ortho = true;
+        session.camera.distance = 1.0;
+        execute(
+            &mut session,
+            "tool.brush",
+            &json!({"size": 10, "screenSpace": true, "symmetryRadial": 2, "symmetryAxis": "y", "symmetryOffset": [0.0, 0.0, displacement * 0.5]}),
+        )
+        .unwrap();
+        let inside = surface(&session, 265.0, 200.0);
+
+        let square = json!([[250, 180], [280, 180], [280, 220], [250, 220]]);
+        execute(&mut session, "tool.path", &json!({"points": square, "closed": true, "fill": true, "commit": true})).unwrap();
+
+        assert!(red_at(&session, inside), "the filled lasso");
+        assert_eq!(red_at(&session, Vec3::new(-inside.x, inside.y, 0.0)), painted, "source displacement {displacement}");
+    }
+}
+
 /// How much redder than green a texel must be to count as painted (faded edges included)
 const PAINTED_TINT: f32 = 0.05;
 

@@ -483,6 +483,10 @@ impl Session {
             let eye = self.camera.eye();
             let camera_distance = self.camera.distance.max(MIN_BRUSH_SCALE);
 
+            // Bound the search using the farthest bounding-box corner; acceptance still uses the actual hit
+            let max_copy_depth =
+                if brush.screen_space { copy_depth * (bounds_min - eye).abs().max((bounds_max - eye).abs()).length() / camera_distance } else { copy_depth };
+
             fill_coverage(&mut canvas, &uv_buffer, |texel, _| {
                 let Some(surface) = uv_buffer.surface(mesh, texel) else { return 0.0 };
                 let mut best = 0.0f32;
@@ -506,17 +510,20 @@ impl Session {
                     let to_surface = position - origin;
                     let distance = to_surface.length();
                     let Some(direction) = to_surface.try_normalize() else { continue };
-                    let Some(hit) = bvh.closest(origin, direction, distance * (1.0 + RAY_HIT_RELATIVE_TOLERANCE)) else { continue };
+                    let is_copy = *inverse != Mat3::IDENTITY;
+                    let max_distance = distance * (1.0 + RAY_HIT_RELATIVE_TOLERANCE);
+                    let search_depth = if is_copy { max_copy_depth } else { 0.0 };
+                    let Some(hit) = bvh.closest(origin, direction, max_distance + search_depth) else { continue };
 
                     // Keep identity copies exact and reject occluders beyond the bounded displacement
-                    let off_surface = if *inverse == Mat3::IDENTITY {
+                    let off_surface = if !is_copy {
                         0.0
                     } else if brush.screen_space {
                         copy_depth * (origin + direction * hit.t).distance(eye) / camera_distance
                     } else {
                         copy_depth
                     };
-                    if hit.t < distance * (1.0 - RAY_HIT_RELATIVE_TOLERANCE) - off_surface {
+                    if hit.t < distance * (1.0 - RAY_HIT_RELATIVE_TOLERANCE) - off_surface || hit.t > max_distance + off_surface {
                         continue;
                     }
 
