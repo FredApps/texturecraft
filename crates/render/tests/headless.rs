@@ -1,8 +1,9 @@
 use texturecraft_compose::{DisplayKind, ImageRes};
+use texturecraft_geom::glam::Vec3;
 use texturecraft_geom::{OrbitCamera, primitives};
 use texturecraft_render::headless::Headless;
 use texturecraft_render::renderer::TAA_SAMPLES;
-use texturecraft_render::{Frame, Shade, ViewKind};
+use texturecraft_render::{BakeVisualization, Frame, Shade, ViewKind};
 
 /// The UI's key light (`viewport::shade`).
 const LIGHT: [f32; 4] = [0.5, 0.8, 0.4, 2.5];
@@ -42,14 +43,18 @@ impl Img {
     }
 }
 
+/// The id `setup` uploads the material ball under
+const MESH_ID: u64 = 1;
+
 /// A headless renderer with the material ball framed in a 480×360 view (None without a GPU).
 fn setup() -> Option<(Headless, Frame)> {
     let Ok(mut h) = Headless::new() else {
         eprintln!("skipping: no GPU adapter");
         return None;
     };
+    eprintln!("headless adapter: {:?}", h.device.adapter_info());
     let mesh = primitives::material_ball();
-    h.renderer.set_mesh(&h.device, &h.queue, &mesh, 1);
+    h.renderer.set_mesh(&h.device, &h.queue, &mesh, MESH_ID);
     h.renderer.set_texture_sets(&h.device, &h.queue, &[((256, 256), 0), ((256, 256), 1)], 2);
     let mut cam = OrbitCamera { yaw: 0.6, pitch: 0.25, ..OrbitCamera::default() };
     let (lo, hi) = mesh.bounds();
@@ -219,6 +224,122 @@ fn wireframe_3d_overlays_the_mesh() {
     let b = render(&mut h, &shaded(&frame, |s| s.wireframe_3d = true), "wire3d_on");
     assert_ne!(a.mean(200, 100, 280, 180), b.mean(200, 100, 280, 180), "edges draw over the ball");
     assert_eq!(a.at(5, 5), b.at(5, 5), "the background stays clean");
+}
+
+#[test]
+fn bake_visualization_draws_the_high_poly_and_the_cage() {
+    // A high poly inside the material ball, a cage around it, and how far a color must lead the others to count as that color
+    const HIGH_POLY_RADIUS_PER_SIZE: f32 = 0.3;
+    const CAGE_SCALE: f32 = 2.5;
+    const HIGH_POLY_ID: u64 = 7;
+    const CAGE_TOPOLOGY: u64 = 1;
+    const CAGE_EDGES: [[u32; 2]; 2] = [[0, 1], [1, 2]];
+    const COLOR_LEAD: i32 = 30;
+
+    let Some((mut h, frame)) = setup() else { return };
+    let ball = primitives::material_ball();
+    let (low_min, low_max) = ball.bounds();
+    let ball_center = (low_min + low_max) * 0.5;
+    let mut high = primitives::sphere((low_max - low_min).max_element() * HIGH_POLY_RADIUS_PER_SIZE, 32, 16);
+    for position in &mut high.positions {
+        *position += ball_center;
+    }
+    h.renderer.set_bake_high(&h.device, &h.queue, Some(&high), HIGH_POLY_ID).unwrap();
+    let corners: Vec<Vec3> = high.indices.iter().map(|index| (high.positions[*index as usize] - ball_center) * CAGE_SCALE + ball_center).collect();
+    h.renderer.set_bake_cage(&h.device, &h.queue, 0, Some((&corners, &CAGE_EDGES)), CAGE_TOPOLOGY);
+    let bake = BakeVisualization { high_poly: false, cage: false, uv_seams: false, low_poly: true, only_set: None };
+    let center = (frame.size[0] / 2, frame.size[1] / 2);
+
+    let only = |h: &mut Headless, parts: BakeVisualization, name: &str| render(h, &shaded(&frame, |s| s.bake = Some(parts)), name);
+    let low_only = only(&mut h, bake, "bake_low_only");
+    let hidden = only(&mut h, BakeVisualization { low_poly: false, ..bake }, "bake_low_hidden");
+    let high_poly = only(&mut h, BakeVisualization { low_poly: false, high_poly: true, ..bake }, "bake_high_poly");
+    let caged = only(&mut h, BakeVisualization { cage: true, ..bake }, "bake_cage");
+    assert_same(&low_only, &render(&mut h, &frame, "bake_off"), "every part off draws only the low poly");
+    let background = render(&mut h, &Frame { visible: vec![false, false], ..frame.clone() }, "bake_background");
+    assert_same(&hidden, &background, "without the low poly only the background is left");
+    let [red, green, blue] = high_poly.at(center.0, center.1).map(i32::from);
+    assert!(blue > red + COLOR_LEAD && blue > green, "the high poly inside the low poly draws blue: {:?}", [red, green, blue]);
+    let ([low_red, low_green, low_blue], [caged_red, caged_green, caged_blue]) = (low_only.at(center.0, center.1), caged.at(center.0, center.1));
+    assert!(
+        caged_blue < low_blue && caged_red >= caged_blue && caged_green >= caged_blue,
+        "the cage tints the ball tan: {:?} → {:?}",
+        [low_red, low_green, low_blue],
+        [caged_red, caged_green, caged_blue]
+    );
+
+    // Vertices the bake's rays miss turn red
+    h.renderer.set_bake_high_missed(&h.queue, HIGH_POLY_ID, &vec![1.0; high.positions.len()]);
+    let missed = only(&mut h, BakeVisualization { low_poly: false, high_poly: true, ..bake }, "bake_high_missed");
+    let [red, green, blue] = missed.at(center.0, center.1).map(i32::from);
+    assert!(red > blue + COLOR_LEAD && red > green + COLOR_LEAD, "missed vertices draw red: {:?}", [red, green, blue]);
+
+    // Show for selected texture set only: the other set's low poly and the cage of set 0 drop out
+    let first_set = only(&mut h, BakeVisualization { cage: true, only_set: Some(0), ..bake }, "bake_only_first_set");
+    let second_set = only(&mut h, BakeVisualization { cage: true, only_set: Some(1), ..bake }, "bake_only_second_set");
+    assert_ne!(first_set.px, caged.px, "the second set's low poly is left out");
+    assert_ne!(second_set.px, caged.px, "the first set's low poly and cage are left out");
+    assert_ne!(first_set.px, second_set.px);
+
+    // UV seams draw over the low poly
+    h.renderer.set_uv_seams(&h.device, &h.queue, MESH_ID, &ball.uv_seam_edges());
+    let seams = only(&mut h, BakeVisualization { uv_seams: true, ..bake }, "bake_uv_seams");
+    assert_ne!(seams.px, low_only.px, "the seams show");
+
+    // A new distance with the same topology only moves the corners
+    let grown: Vec<Vec3> = corners.iter().map(|corner| (*corner - ball_center) * 2.0 + ball_center).collect();
+    h.renderer.set_bake_cage(&h.device, &h.queue, 0, Some((&grown, &CAGE_EDGES)), CAGE_TOPOLOGY);
+    let bigger = only(&mut h, BakeVisualization { cage: true, ..bake }, "bake_cage_grown");
+    assert_ne!(caged.px, bigger.px, "the cage grew");
+}
+
+#[test]
+fn oversized_bake_high_poly_leaves_the_view_renderable() {
+    let Some((mut headless, frame)) = setup() else { return };
+
+    let high = primitives::sphere(0.5, 16, 8);
+    headless.renderer.set_bake_high(&headless.device, &headless.queue, Some(&high), 1).unwrap();
+    let limit = headless.device.limits().max_buffer_size;
+    // The viewport vertex contains position, normal, tangent and UV: twelve f32 values
+    let vertex_count = limit as usize / (12 * std::mem::size_of::<f32>()) + 1;
+    let oversized = texturecraft_geom::Mesh { positions: vec![Vec3::ZERO; vertex_count], ..Default::default() };
+    let error = headless.renderer.set_bake_high(&headless.device, &headless.queue, Some(&oversized), 2).unwrap_err();
+    assert!(error.contains("GPU buffer limit"), "{error}");
+
+    headless.renderer.set_bake_high_missed(&headless.queue, 2, &[]);
+    let bake = BakeVisualization { high_poly: true, cage: false, uv_seams: false, low_poly: false, only_set: None };
+    let cleared = render(&mut headless, &shaded(&frame, |shade| shade.bake = Some(bake)), "bake_oversized_cleared");
+    let background = render(&mut headless, &Frame { visible: vec![false, false], ..frame.clone() }, "bake_oversized_background");
+    assert_same(&cleared, &background, "an oversized replacement must not leave the previous high poly visible");
+    headless.renderer.set_bake_high(&headless.device, &headless.queue, Some(&high), 3).unwrap();
+    let recovered = render(&mut headless, &shaded(&frame, |shade| shade.bake = Some(bake)), "bake_oversized_recovered");
+    assert_ne!(recovered.px, background.px, "a later valid high poly still draws");
+}
+
+#[test]
+fn bake_low_poly_visibility_also_filters_its_wireframe() {
+    let Some((mut headless, frame)) = setup() else { return };
+
+    let bake = BakeVisualization { high_poly: false, cage: false, uv_seams: false, low_poly: false, only_set: None };
+    let hidden = shaded(&frame, |shade| {
+        shade.bake = Some(bake);
+        shade.wireframe_3d = true;
+        shade.highlight = Some(texturecraft_render::SetHighlight { set: 0, color: [1.0, 0.5, 0.0] });
+    });
+    let background = render(&mut headless, &Frame { visible: vec![false, false], ..frame.clone() }, "bake_wire_background");
+    let hidden_wire = render(&mut headless, &hidden, "bake_wire_hidden");
+    assert_same(&hidden_wire, &background, "hiding the project mesh also hides its wireframe and highlight");
+
+    for texture_set in [0, 1] {
+        let selected = shaded(&hidden, |shade| {
+            shade.bake = Some(BakeVisualization { low_poly: true, only_set: Some(texture_set), ..bake });
+            shade.highlight = Some(texturecraft_render::SetHighlight { set: 1 - texture_set, color: [1.0, 0.5, 0.0] });
+        });
+        let expected = Frame { visible: vec![texture_set == 0, texture_set == 1], ..selected.clone() };
+        let actual = render(&mut headless, &selected, &format!("bake_wire_selected_{texture_set}"));
+        let expected = render(&mut headless, &expected, &format!("bake_wire_expected_{texture_set}"));
+        assert_same(&actual, &expected, "the wireframe and highlight respect the selected texture set");
+    }
 }
 
 #[test]

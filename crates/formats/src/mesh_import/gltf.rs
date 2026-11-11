@@ -96,33 +96,36 @@ struct Attrs {
     color_seen: bool,
 }
 
-fn add_primitive(raw: &mut RawMesh, attrs: &mut Attrs, prim: &gltf::Primitive, m: Mat4, buffers: &[gltf::buffer::Data], part: &str) -> Result<()> {
-    if prim.mode() != Mode::Triangles {
-        raw.warnings.push(format!("skipped a primitive drawn as {:?} (only triangles are supported)", prim.mode()));
+fn add_primitive(raw: &mut RawMesh, attrs: &mut Attrs, primitive: &gltf::Primitive, transform: Mat4, buffers: &[gltf::buffer::Data], part: &str) -> Result<()> {
+    if primitive.mode() != Mode::Triangles {
+        raw.warnings.push(format!("skipped a primitive drawn as {:?} (only triangles are supported)", primitive.mode()));
         return Ok(());
     }
-    let Some(pacc) = prim.get(&Semantic::Positions) else {
+
+    let Some(position_accessor) = primitive.get(&Semantic::Positions) else {
         raw.warnings.push("skipped a primitive without positions".into());
         return Ok(());
     };
-    check_accessor(&pacc, buffers, Dimensions::Vec3, &[DataType::F32], "position")?;
-    let nacc = prim.get(&Semantic::Normals);
-    if let Some(a) = &nacc {
+
+    check_accessor(&position_accessor, buffers, Dimensions::Vec3, &[DataType::F32], "position")?;
+    let normal_accessor = primitive.get(&Semantic::Normals);
+    if let Some(a) = &normal_accessor {
         check_accessor(a, buffers, Dimensions::Vec3, &[DataType::F32], "normal")?;
     }
-    let tacc = prim.get(&Semantic::TexCoords(0));
-    if let Some(a) = &tacc {
+    let texcoord_accessor = primitive.get(&Semantic::TexCoords(0));
+    if let Some(a) = &texcoord_accessor {
         check_accessor(a, buffers, Dimensions::Vec2, &[DataType::F32, DataType::U8, DataType::U16], "texcoord")?;
     }
-    let cacc = prim.get(&Semantic::Colors(0));
-    if let Some(a) = &cacc {
+    let color_accessor = primitive.get(&Semantic::Colors(0));
+    if let Some(a) = &color_accessor {
         let dims = if a.dimensions() == Dimensions::Vec3 { Dimensions::Vec3 } else { Dimensions::Vec4 };
         check_accessor(a, buffers, dims, &[DataType::F32, DataType::U8, DataType::U16], "color")?;
     }
-    if let Some(a) = prim.indices() {
+    if let Some(a) = primitive.indices() {
         check_accessor(&a, buffers, Dimensions::Scalar, &[DataType::U8, DataType::U16, DataType::U32], "index")?;
     }
-    let reader = prim.reader(|b| buffers.get(b.index()).map(|d| &d.0[..]));
+
+    let reader = primitive.reader(|b| buffers.get(b.index()).map(|d| &d.0[..]));
     let positions: Vec<Vec3> = reader.read_positions().ok_or_else(|| malformed(KIND, "unreadable positions"))?.map(Vec3::from).collect();
     let n = positions.len();
     check_vertices(raw.positions.len().saturating_add(n))?;
@@ -134,64 +137,67 @@ fn add_primitive(raw: &mut RawMesh, attrs: &mut Attrs, prim: &gltf::Primitive, m
     if let Some(bad) = indices.iter().find(|i| **i as usize >= n) {
         return Err(malformed(KIND, format!("index {bad} out of range ({n} vertices)")));
     }
+
     check_triangles(raw.triangle_count(), indices.len() / 3)?;
-    let normals: Option<Vec<Vec3>> = nacc.and_then(|_| reader.read_normals()).map(|it| it.map(Vec3::from).collect());
-    let texcoords: Option<Vec<Vec2>> = tacc.and_then(|_| reader.read_tex_coords(0)).map(|t| t.into_f32().map(Vec2::from).collect());
+    let normals: Option<Vec<Vec3>> = normal_accessor.and_then(|_| reader.read_normals()).map(|it| it.map(Vec3::from).collect());
+    let texcoords: Option<Vec<Vec2>> = texcoord_accessor.and_then(|_| reader.read_tex_coords(0)).map(|t| t.into_f32().map(Vec2::from).collect());
     let colors: Option<Vec<Vec4>> =
-        cacc.and_then(|_| reader.read_colors(0)).map(|c| c.into_rgba_f32().map(Vec4::from).collect()).filter(|c: &Vec<Vec4>| c.len() == n);
+        color_accessor.and_then(|_| reader.read_colors(0)).map(|c| c.into_rgba_f32().map(Vec4::from).collect()).filter(|c: &Vec<Vec4>| c.len() == n);
     attrs.color_seen |= colors.is_some();
     let color_of = |i: usize| colors.as_ref().and_then(|c| c.get(i)).copied().unwrap_or(Vec4::ONE);
 
-    let m3 = Mat3::from_mat4(m);
-    let nm = m3.inverse().transpose();
-    let flip = m3.determinant() < 0.0;
-    let world: Vec<Vec3> = positions.iter().map(|p| m.transform_point3(*p)).collect();
-    let name = match prim.material().index() {
+    let linear_transform = Mat3::from_mat4(transform);
+    let normal_transform = linear_transform.inverse().transpose();
+    let flip = linear_transform.determinant() < 0.0;
+    let world: Vec<Vec3> = positions.iter().map(|p| transform.transform_point3(*p)).collect();
+    let name = match primitive.material().index() {
         None => "Default".to_string(),
-        Some(i) => prim.material().name().map(str::to_string).unwrap_or_else(|| format!("Material_{i}")),
+        Some(i) => primitive.material().name().map(str::to_string).unwrap_or_else(|| format!("Material_{i}")),
     };
     if !raw.base_colors.iter().any(|c| c.material == name) {
-        base_color(raw, &prim.material(), &name, buffers);
+        base_color(raw, &primitive.material(), &name, buffers);
     }
     let base = raw.positions.len() as u32;
-    let tex_ok = texcoords.as_ref().is_some_and(|t| t.len() == n);
-    if tex_ok {
+    let has_texcoords = texcoords.as_ref().is_some_and(|t| t.len() == n);
+    if has_texcoords {
         attrs.uv_seen.0 = true
     } else {
         attrs.uv_seen.1 = true
     }
+
     let uv_of = |i: usize| texcoords.as_ref().and_then(|t| t.get(i)).copied().unwrap_or_default();
     let raw_normals = raw.normals.get_or_insert_with(Vec::new);
     match normals.filter(|v| v.len() == n) {
         Some(nrm) => {
             raw.positions.extend_from_slice(&world);
-            raw_normals.extend(nrm.iter().map(|v| (nm * *v).try_normalize().unwrap_or(Vec3::Y)));
+            raw_normals.extend(nrm.iter().map(|v| (normal_transform * *v).try_normalize().unwrap_or(Vec3::Y)));
             attrs.uvs.extend((0..n).map(uv_of));
             attrs.colors.extend((0..n).map(color_of));
             let group = raw.group(&name, part);
-            for t in indices.chunks_exact(3) {
+            for t in indices.as_chunks::<3>().0 {
                 let (a, b, c) = (t[0] + base, t[1] + base, t[2] + base);
                 group.extend_from_slice(&if flip { [a, c, b] } else { [a, b, c] });
             }
         }
         None => {
-            // glTF: flat normals when none are given, so every triangle gets its own corners.
-            let mut tris = Vec::with_capacity(indices.len());
-            for t in indices.chunks_exact(3) {
+            // glTF: flat normals when none are given, so every triangle gets its own corners
+            let mut triangles = Vec::with_capacity(indices.len());
+            for t in indices.as_chunks::<3>().0 {
                 let order = if flip { [t[0], t[2], t[1]] } else { [t[0], t[1], t[2]] };
                 let p = order.map(|i| world.get(i as usize).copied().unwrap_or_default());
                 let face = (p[1] - p[0]).cross(p[2] - p[0]).try_normalize().unwrap_or(Vec3::Y);
                 for (k, i) in order.iter().enumerate() {
-                    tris.push(raw.positions.len() as u32);
+                    triangles.push(raw.positions.len() as u32);
                     raw.positions.push(p[k]);
                     raw_normals.push(face);
                     attrs.uvs.push(uv_of(*i as usize));
                     attrs.colors.push(color_of(*i as usize));
                 }
             }
-            raw.group(&name, part).extend_from_slice(&tris);
+            raw.group(&name, part).extend_from_slice(&triangles);
         }
     }
+
     Ok(())
 }
 

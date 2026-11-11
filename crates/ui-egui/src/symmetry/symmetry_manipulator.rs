@@ -67,6 +67,7 @@ impl SymmetryManipulator {
         if points_per_unit <= MIN_SCREEN_SCALE {
             return None;
         }
+
         let world_per_point = 1.0 / points_per_unit;
         let scale = app.ui.symmetry.manipulator_size / DEFAULT_MANIPULATOR_SIZE;
         let length = rect.height() * ARROW_LENGTH * scale * world_per_point;
@@ -107,6 +108,7 @@ impl SymmetryManipulator {
         let mut all = [false; 3];
         self.arrows.iter().for_each(|arrow| all[arrow.axis] = true);
         let grab_radius = GRAB_RADIUS * self.scale.max(1.0);
+
         // The center moves along all movable axes, which a screen drag can only do for two of them
         let center_grabs = all.iter().filter(|axis| **axis).count() <= 2 && point.distance(self.center) <= grab_radius;
         if center_grabs || self.square.is_some_and(|square| inside(&square, point)) {
@@ -130,11 +132,11 @@ impl SymmetryManipulator {
             }
             [first, second] => {
                 // Solve moved = a * first_axis + b * second_axis on screen
-                let (u, v) = (self.screen_per_unit[*first], self.screen_per_unit[*second]);
-                let determinant = u.x * v.y - u.y * v.x;
+                let (first_axis, second_axis) = (self.screen_per_unit[*first], self.screen_per_unit[*second]);
+                let determinant = first_axis.x * second_axis.y - first_axis.y * second_axis.x;
                 if determinant.abs() > MIN_SCREEN_SCALE {
-                    delta[*first] = (moved.x * v.y - moved.y * v.x) / determinant;
-                    delta[*second] = (u.x * moved.y - u.y * moved.x) / determinant;
+                    delta[*first] = (moved.x * second_axis.y - moved.y * second_axis.x) / determinant;
+                    delta[*second] = (first_axis.x * moved.y - first_axis.y * moved.x) / determinant;
                 }
             }
             _ => {}
@@ -154,18 +156,18 @@ fn movable_pair(movable: &[bool; 3]) -> Option<(usize, usize)> {
 
 fn distance_to_segment(point: Pos2, from: Pos2, to: Pos2) -> f32 {
     let along = to - from;
-    let t = ((point - from).dot(along) / along.length_sq().max(f32::EPSILON)).clamp(0.0, 1.0);
-    point.distance(from + along * t)
+    let fraction = ((point - from).dot(along) / along.length_sq().max(f32::EPSILON)).clamp(0.0, 1.0);
+    point.distance(from + along * fraction)
 }
 
 /// Whether `point` is inside the convex quad `corners`
 fn inside(corners: &[Pos2; 4], point: Pos2) -> bool {
-    let side = |i: usize| {
-        let (a, b) = (corners[i], corners[(i + 1) % 4]);
-        (b - a).x * (point - a).y - (b - a).y * (point - a).x
+    let side = |index: usize| {
+        let (start, end) = (corners[index], corners[(index + 1) % 4]);
+        (end - start).x * (point - start).y - (end - start).y * (point - start).x
     };
     let sides = [side(0), side(1), side(2), side(3)];
-    sides.iter().all(|s| *s >= 0.0) || sides.iter().all(|s| *s <= 0.0)
+    sides.iter().all(|side| *side >= 0.0) || sides.iter().all(|side| *side <= 0.0)
 }
 
 #[cfg(test)]

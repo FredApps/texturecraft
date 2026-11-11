@@ -30,11 +30,15 @@ use texturecraft_geom::glam::{Mat4, Vec3};
 use texturecraft_geom::{Mesh, OrbitCamera};
 use texturecraft_texel::TILE;
 
+use crate::bake_visualization::BakeVisualization;
+use crate::cage_gpu::CageGpu;
 use crate::gpu_trace::{Checked, checked};
+use crate::high_poly_gpu::HighPolyGpu;
 use crate::ibl;
 use crate::overlay_quad::OverlayQuad;
 use crate::set_highlight::SetHighlight;
 use crate::subdivide::{self, Vertex};
+use crate::uv_seam_gpu::UvSeamGpu;
 
 pub const MSAA: u32 = 4;
 pub const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -174,6 +178,8 @@ pub struct Shade {
     /// Move the surface by the height channel (3D view): a dense copy of the mesh, displaced in
     /// the vertex shader at the height-to-normal strength.
     pub displacement: bool,
+    /// Bake mode's high poly, cage and UV seams over the 3D view
+    pub bake: Option<BakeVisualization>,
 }
 
 /// The viewport's subsurface scattering approximation: the diffuse lighting wraps around the
@@ -260,6 +266,7 @@ impl Default for Shade {
             sss_blur: None,
             refraction: false,
             displacement: false,
+            bake: None,
         }
     }
 }
@@ -537,6 +544,11 @@ pub struct Renderer {
     overlay_pipeline: wgpu::RenderPipeline,
     /// The highlighted set's mesh edges, wider and in the highlight color
     highlight_pipeline: wgpu::RenderPipeline,
+    /// Bake mode: the high poly, the cage's faces and wireframe, the low poly's UV seams
+    bake_high_pipeline: wgpu::RenderPipeline,
+    cage_pipeline: wgpu::RenderPipeline,
+    cage_wire_pipeline: wgpu::RenderPipeline,
+    uv_seam_pipeline: wgpu::RenderPipeline,
     bg_pipeline: wgpu::RenderPipeline,
     blit_pipeline: wgpu::RenderPipeline,
     post_pipeline: wgpu::RenderPipeline,
@@ -570,6 +582,10 @@ pub struct Renderer {
     /// accumulation.
     content_rev: u64,
     mesh: Option<MeshGpu>,
+    bake_high: Option<HighPolyGpu>,
+    /// Each texture set's cage, by set index
+    cages: Vec<Option<CageGpu>>,
+    uv_seams: Option<UvSeamGpu>,
     sets: Vec<SetGpu>,
     /// Viewport texture resolution: display textures at 1/2^shift of each set's size (at least
     /// as reduced as the device's texture limit needs).
@@ -815,20 +831,31 @@ fn halton(mut i: u32, base: u32) -> f32 {
 
 const CLEAR: wgpu::LoadOp<wgpu::Color> = wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT);
 
+/// Depth bias of the shadow map, per unit of surface slope: keeps lit surfaces from shadowing themselves
+const SHADOW_SLOPE_BIAS: f32 = 1.5;
+
+/// Anisotropic filtering of the texture sets' sampler
+const MAX_ANISOTROPY: u16 = 8;
+
+/// Size of the environment texture before the first environment loads
+const PLACEHOLDER_ENV_SIZE: [u32; 2] = [512, 256];
+
 impl Renderer {
     /// `target_format`: the format of the pass [`Renderer::blit`] draws into.
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, target_format: wgpu::TextureFormat) -> Renderer {
         let shader = |label: &str, source: &str| {
             device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some(label), source: wgpu::ShaderSource::Wgsl(source.into()) })
         };
-        let module = shader("tc_mesh", concat!(include_str!("shaders/displace.wgsl"), include_str!("shaders/mesh.wgsl")));
+        let module =
+            shader("tc_mesh", concat!(include_str!("shaders/displace.wgsl"), include_str!("shaders/mesh.wgsl"), "\n", include_str!("shaders/bake_view.wgsl")));
         let util_module = shader("tc_util", include_str!("shaders/util.wgsl"));
         let post_module = shader("tc_post", concat!(include_str!("shaders/util.wgsl"), include_str!("shaders/post.wgsl"), include_str!("shaders/fx.wgsl")));
         let shadow_module = shader("tc_shadow", concat!(include_str!("shaders/displace.wgsl"), include_str!("shaders/shadow.wgsl")));
-        let bgl = |label: &str, entries: &[wgpu::BindGroupLayoutEntry]| {
+
+        let bind_group_layout = |label: &str, entries: &[wgpu::BindGroupLayoutEntry]| {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: Some(label), entries })
         };
-        let globals_bgl = bgl(
+        let globals_bind_group_layout = bind_group_layout(
             "tc_globals",
             &[
                 uniform_entry(0),
@@ -845,44 +872,47 @@ impl Renderer {
                 fragment_entry(4, wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison)),
             ],
         );
-        // The display textures, the aux texture, the sampler.
+        // The display textures, the aux texture, the sampler
         let textures = DisplayKind::ALL.len() as u32 + 1;
-        // Displacement reads the height (and the sampler) in the vertex shader.
-        let height = DisplayKind::ALL.iter().position(|k| *k == DisplayKind::Height).unwrap_or(0) as u32;
+        // Displacement reads the height (and the sampler) in the vertex shader
+        let height = DisplayKind::ALL.iter().position(|kind| *kind == DisplayKind::Height).unwrap_or(0) as u32;
         let set_entries: Vec<_> = (0..textures)
             .map(tex_entry)
             .chain(std::iter::once(sampler_entry(textures)))
-            .map(|mut e| {
-                if e.binding == height || e.binding == textures {
-                    e.visibility |= wgpu::ShaderStages::VERTEX;
+            .map(|mut entry| {
+                if entry.binding == height || entry.binding == textures {
+                    entry.visibility |= wgpu::ShaderStages::VERTEX;
                 }
-                e
+                entry
             })
             .collect();
-        let set_bgl = bgl("tc_set", &set_entries);
-        let refr_bgl = bgl("tc_refr", &[tex_entry(0)]);
-        let blit_bgl = bgl("tc_blit", &[tex_entry(0), sampler_entry(1), uniform_entry(2)]);
-        let mip_bgl = bgl("tc_mip", &[tex_entry(0), sampler_entry(1)]);
-        let fx_bgl = bgl("tc_fx", &[tex_entry(0), sampler_entry(1), uniform_entry(3), tex_entry(4), tex_entry(5), tex_entry(6)]);
-        let shadow_bgl = bgl("tc_shadow", &[uniform_entry(0)]);
-        let pl = |label: &str, groups: &[Option<&wgpu::BindGroupLayout>]| {
+        let set_bind_group_layout = bind_group_layout("tc_set", &set_entries);
+        let refraction_bind_group_layout = bind_group_layout("tc_refr", &[tex_entry(0)]);
+        let blit_bind_group_layout = bind_group_layout("tc_blit", &[tex_entry(0), sampler_entry(1), uniform_entry(2)]);
+        let mip_bind_group_layout = bind_group_layout("tc_mip", &[tex_entry(0), sampler_entry(1)]);
+        let effect_bind_group_layout =
+            bind_group_layout("tc_fx", &[tex_entry(0), sampler_entry(1), uniform_entry(3), tex_entry(4), tex_entry(5), tex_entry(6)]);
+        let shadow_bind_group_layout = bind_group_layout("tc_shadow", &[uniform_entry(0)]);
+
+        let pipeline_layout = |label: &str, groups: &[Option<&wgpu::BindGroupLayout>]| {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some(label), bind_group_layouts: groups, immediate_size: 0 })
         };
-        let layout = pl("tc_uv", &[Some(&globals_bgl), Some(&set_bgl)]);
-        let mesh_layout = pl("tc_mesh", &[Some(&globals_bgl), Some(&set_bgl), Some(&refr_bgl)]);
-        let bg_layout = pl("tc_bg", &[Some(&globals_bgl)]);
-        let blit_layout = pl("tc_blit", &[Some(&blit_bgl)]);
-        let fx_layout = pl("tc_fx", &[Some(&fx_bgl)]);
-        let shadow_layout = pl("tc_shadow", &[Some(&shadow_bgl), Some(&set_bgl)]);
-        let vb = [Some(wgpu::VertexBufferLayout {
+        let layout = pipeline_layout("tc_uv", &[Some(&globals_bind_group_layout), Some(&set_bind_group_layout)]);
+        let mesh_layout = pipeline_layout("tc_mesh", &[Some(&globals_bind_group_layout), Some(&set_bind_group_layout), Some(&refraction_bind_group_layout)]);
+        let background_layout = pipeline_layout("tc_bg", &[Some(&globals_bind_group_layout)]);
+        let blit_layout = pipeline_layout("tc_blit", &[Some(&blit_bind_group_layout)]);
+        let effect_layout = pipeline_layout("tc_fx", &[Some(&effect_bind_group_layout)]);
+        let shadow_layout = pipeline_layout("tc_shadow", &[Some(&shadow_bind_group_layout), Some(&set_bind_group_layout)]);
+
+        let vertex_layout = [Some(wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex>() as u64,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x2],
         })];
-        // shortcut: the RGBA8 fallback clips highlights above 1 and bands in the darks; encode
-        // (e.g. RGBM) if WebGL2 without float color buffers turns out to matter.
+
+        // shortcut: the RGBA8 fallback clips highlights above 1 and bands in the darks; encode (e.g. RGBM) if WebGL2 without float color buffers turns out to matter
         let hdr_format = if hdr_renderable(device) { HDR_FORMAT } else { COLOR_FORMAT };
-        let hdr = |fs, blend| Some((fs, hdr_format, blend));
+        let hdr_target = |fragment_entry_point, blend| Some((fragment_entry_point, hdr_format, blend));
         let always = || Some(depth_state(false, wgpu::CompareFunction::Always));
         let mesh_pipeline = pipeline(
             device,
@@ -890,8 +920,8 @@ impl Renderer {
             &mesh_layout,
             &module,
             "vs_mesh",
-            &vb,
-            hdr("fs_mesh", None),
+            &vertex_layout,
+            hdr_target("fs_mesh", None),
             MSAA,
             Some(depth_state(true, wgpu::CompareFunction::Less)),
         );
@@ -901,32 +931,105 @@ impl Renderer {
             &mesh_layout,
             &module,
             "vs_mesh",
-            &vb,
-            hdr("fs_opaque", None),
+            &vertex_layout,
+            hdr_target("fs_opaque", None),
             MSAA,
             Some(depth_state(true, wgpu::CompareFunction::Less)),
         );
-        let uv_pipeline = pipeline(device, "tc_uv", &layout, &module, "vs_uv", &vb, hdr("fs_uv", None), MSAA, always());
+        let uv_pipeline = pipeline(device, "tc_uv", &layout, &module, "vs_uv", &vertex_layout, hdr_target("fs_uv", None), MSAA, always());
         let blend = Some(wgpu::BlendState::ALPHA_BLENDING);
-        let wire_pipeline = pipeline(device, "tc_wire", &layout, &module, "vs_uv", &vb, hdr("fs_wire", blend), MSAA, always());
+        let wire_pipeline = pipeline(device, "tc_wire", &layout, &module, "vs_uv", &vertex_layout, hdr_target("fs_wire", blend), MSAA, always());
         let wire3d_depth = Some(depth_state(false, wgpu::CompareFunction::LessEqual));
-        let wire3d_pipeline = pipeline(device, "tc_wire3d", &layout, &module, "vs_wire3d", &vb, hdr("fs_wire3d", blend), MSAA, wire3d_depth.clone());
-        let overlay_pipeline = pipeline(device, "tc_overlay", &bg_layout, &module, "vs_overlay", &vb, hdr("fs_overlay", blend), MSAA, wire3d_depth.clone());
-        let highlight_pipeline =
-            pipeline(device, "tc_highlight", &layout, &module, "vs_wire_highlight", &vb, hdr("fs_wire_highlight", blend), MSAA, wire3d_depth);
-        let bg_pipeline = pipeline(device, "tc_bg", &bg_layout, &module, "vs_bg", &[], hdr("fs_bg", None), MSAA, always());
+        let wire3d_pipeline =
+            pipeline(device, "tc_wire3d", &layout, &module, "vs_wire3d", &vertex_layout, hdr_target("fs_wire3d", blend), MSAA, wire3d_depth.clone());
+        let highlight_pipeline = pipeline(
+            device,
+            "tc_highlight",
+            &layout,
+            &module,
+            "vs_wire_highlight",
+            &vertex_layout,
+            hdr_target("fs_wire_highlight", blend),
+            MSAA,
+            wire3d_depth.clone(),
+        );
+
+        let [mesh_vertex_layout] = vertex_layout.clone();
+        let high_layout = [
+            mesh_vertex_layout,
+            Some(wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<f32>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &wgpu::vertex_attr_array![4 => Float32],
+            }),
+        ];
+        let bake_high_pipeline = pipeline(
+            device,
+            "tc_bake_high",
+            &background_layout,
+            &module,
+            "vs_bake_high",
+            &high_layout,
+            hdr_target("fs_bake_high", None),
+            MSAA,
+            Some(depth_state(true, wgpu::CompareFunction::Less)),
+        );
+        let corner_layout = [Some(wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<[f32; 3]>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3],
+        })];
+        let cage_pipeline = pipeline(
+            device,
+            "tc_cage",
+            &background_layout,
+            &module,
+            "vs_bake_cage",
+            &corner_layout,
+            hdr_target("fs_bake_cage", blend),
+            MSAA,
+            wire3d_depth.clone(),
+        );
+        let cage_wire_pipeline = pipeline(
+            device,
+            "tc_cage_wire",
+            &background_layout,
+            &module,
+            "vs_bake_cage_wire",
+            &corner_layout,
+            hdr_target("fs_wire_bake_cage", blend),
+            MSAA,
+            wire3d_depth.clone(),
+        );
+        let uv_seam_pipeline =
+            pipeline(device, "tc_uv_seam", &layout, &module, "vs_wire3d", &vertex_layout, hdr_target("fs_wire_uv_seam", blend), MSAA, wire3d_depth.clone());
+        let bg_pipeline = pipeline(device, "tc_bg", &background_layout, &module, "vs_bg", &[], hdr_target("fs_bg", None), MSAA, always());
+        let overlay_pipeline =
+            pipeline(device, "tc_overlay", &background_layout, &module, "vs_overlay", &vertex_layout, hdr_target("fs_overlay", blend), MSAA, wire3d_depth);
         let blit_pipeline = pipeline(device, "tc_blit", &blit_layout, &util_module, "vs_blit", &[], Some(("fs_blit", target_format, None)), 1, None);
-        let post_pipeline = pipeline(device, "tc_post", &fx_layout, &post_module, "vs_full", &[], Some(("fs_post", COLOR_FORMAT, None)), 1, None);
-        let bloom_pipelines = [("fs_bloom_pre", None), ("fs_bloom_down", None), ("fs_bloom_up", Some(ADDITIVE))]
-            .map(|(fs, blend)| pipeline(device, "tc_bloom", &fx_layout, &post_module, "vs_full", &[], hdr(fs, blend), 1, None));
-        let gbuf_pipeline =
-            pipeline(device, "tc_gbuf", &mesh_layout, &module, "vs_mesh", &vb, hdr("fs_gbuf", None), 1, Some(depth_state(true, wgpu::CompareFunction::Less)));
-        let sss_pipelines = ["fs_sss_h", "fs_sss_v"].map(|fs| pipeline(device, "tc_sss", &fx_layout, &post_module, "vs_full", &[], hdr(fs, None), 1, None));
-        let dof_pipeline = pipeline(device, "tc_dof", &fx_layout, &post_module, "vs_full", &[], hdr("fs_dof", None), 1, None);
+        let post_pipeline = pipeline(device, "tc_post", &effect_layout, &post_module, "vs_full", &[], Some(("fs_post", COLOR_FORMAT, None)), 1, None);
+        let bloom_pipelines = [("fs_bloom_pre", None), ("fs_bloom_down", None), ("fs_bloom_up", Some(ADDITIVE))].map(|(fragment_entry_point, blend)| {
+            pipeline(device, "tc_bloom", &effect_layout, &post_module, "vs_full", &[], hdr_target(fragment_entry_point, blend), 1, None)
+        });
+        let gbuffer_pipeline = pipeline(
+            device,
+            "tc_gbuf",
+            &mesh_layout,
+            &module,
+            "vs_mesh",
+            &vertex_layout,
+            hdr_target("fs_gbuf", None),
+            1,
+            Some(depth_state(true, wgpu::CompareFunction::Less)),
+        );
+        let sss_pipelines = ["fs_sss_h", "fs_sss_v"].map(|fragment_entry_point| {
+            pipeline(device, "tc_sss", &effect_layout, &post_module, "vs_full", &[], hdr_target(fragment_entry_point, None), 1, None)
+        });
+        let dof_pipeline = pipeline(device, "tc_dof", &effect_layout, &post_module, "vs_full", &[], hdr_target("fs_dof", None), 1, None);
         let dof_target = Some(wgpu::ColorTargetState { format: hdr_format, blend: None, write_mask: wgpu::ColorWrites::ALL });
         let dof_gather_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("tc_dof_gather"),
-            layout: Some(&fx_layout),
+            layout: Some(&effect_layout),
             vertex: wgpu::VertexState { module: &post_module, entry_point: Some("vs_full"), buffers: &[], compilation_options: Default::default() },
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
@@ -940,20 +1043,23 @@ impl Renderer {
             multiview_mask: None,
             cache: None,
         });
+
         let shadow_depth = wgpu::DepthStencilState {
-            bias: wgpu::DepthBiasState { constant: 0, slope_scale: 1.5, clamp: 0.0 },
+            bias: wgpu::DepthBiasState { constant: 0, slope_scale: SHADOW_SLOPE_BIAS, clamp: 0.0 },
             ..depth_state(true, wgpu::CompareFunction::Less)
         };
-        let shadow_pipeline = pipeline(device, "tc_shadow", &shadow_layout, &shadow_module, "vs_shadow", &vb, None, 1, Some(shadow_depth));
-        // accum = hdr * k + accum * (1 - k) with k = 1 / (sample + 1): a running average.
+        let shadow_pipeline = pipeline(device, "tc_shadow", &shadow_layout, &shadow_module, "vs_shadow", &vertex_layout, None, 1, Some(shadow_depth));
+
+        // accum = hdr_target * k + accum * (1 - k) with k = 1 / (sample + 1): a running average
         let average = wgpu::BlendComponent {
             src_factor: wgpu::BlendFactor::Constant,
             dst_factor: wgpu::BlendFactor::OneMinusConstant,
             operation: wgpu::BlendOperation::Add,
         };
-        let accum_layout = pl("tc_accum", &[Some(&mip_bgl)]);
+        let accum_layout = pipeline_layout("tc_accum", &[Some(&mip_bind_group_layout)]);
         let accum_blend = Some(wgpu::BlendState { color: average, alpha: average });
-        let accum_pipeline = pipeline(device, "tc_accum", &accum_layout, &util_module, "vs_full", &[], hdr("fs_copy", accum_blend), 1, None);
+        let accum_pipeline = pipeline(device, "tc_accum", &accum_layout, &util_module, "vs_full", &[], hdr_target("fs_copy", accum_blend), 1, None);
+
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("tc_tex"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -961,7 +1067,7 @@ impl Renderer {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
-            anisotropy_clamp: 8,
+            anisotropy_clamp: MAX_ANISOTROPY,
             ..Default::default()
         });
         let env_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -980,7 +1086,8 @@ impl Renderer {
             compare: Some(wgpu::CompareFunction::LessEqual),
             ..Default::default()
         });
-        let shadow_buf = device.create_buffer(&wgpu::BufferDescriptor {
+
+        let shadow_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tc_shadow"),
             size: std::mem::size_of::<[[f32; 4]; 5]>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
@@ -994,28 +1101,30 @@ impl Renderer {
             vp: Mat4::IDENTITY,
             bg: device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("tc_shadow"),
-                layout: &shadow_bgl,
-                entries: &[wgpu::BindGroupEntry { binding: 0, resource: shadow_buf.as_entire_binding() }],
+                layout: &shadow_bind_group_layout,
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: shadow_buffer.as_entire_binding() }],
             }),
-            buf: shadow_buf,
+            buf: shadow_buffer,
         };
+
         let black = Tex::new(device, "tc_black", 1, 1, COLOR_FORMAT, 1).view;
-        let refr_black = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        let refraction_black = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("tc_refr_black"),
-            layout: &refr_bgl,
+            layout: &refraction_bind_group_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&black) }],
         });
-        let env = Tex::new(device, "tc_env", 512, 256, wgpu::TextureFormat::Rgba16Float, ENV_LEVELS);
-        let mut r = Renderer {
+        let env = Tex::new(device, "tc_env", PLACEHOLDER_ENV_SIZE[0], PLACEHOLDER_ENV_SIZE[1], wgpu::TextureFormat::Rgba16Float, ENV_LEVELS);
+
+        let mut renderer = Renderer {
             target_format,
             hdr_format,
-            globals_bgl,
-            set_bgl,
-            blit_bgl,
-            mip_bgl,
-            fx_bgl,
-            refr_bgl,
-            refr_black,
+            globals_bgl: globals_bind_group_layout,
+            set_bgl: set_bind_group_layout,
+            blit_bgl: blit_bind_group_layout,
+            mip_bgl: mip_bind_group_layout,
+            fx_bgl: effect_bind_group_layout,
+            refr_bgl: refraction_bind_group_layout,
+            refr_black: refraction_black,
             mesh_pipeline,
             opaque_pipeline,
             uv_pipeline,
@@ -1023,11 +1132,15 @@ impl Renderer {
             wire3d_pipeline,
             overlay_pipeline,
             highlight_pipeline,
+            bake_high_pipeline,
+            cage_pipeline,
+            cage_wire_pipeline,
+            uv_seam_pipeline,
             bg_pipeline,
             blit_pipeline,
             post_pipeline,
             bloom_pipelines,
-            gbuf_pipeline,
+            gbuf_pipeline: gbuffer_pipeline,
             sss_pipelines,
             dof_gather_pipeline,
             dof_pipeline,
@@ -1047,13 +1160,16 @@ impl Renderer {
             sh: [[0.0; 4]; 9],
             content_rev: 0,
             mesh: None,
+            bake_high: None,
+            cages: Vec::new(),
+            uv_seams: None,
             sets: Vec::new(),
             display_shift: 0,
             material_sets: Vec::new(),
             views: HashMap::new(),
         };
-        r.set_environment(device, queue, "Studio Soft", None);
-        r
+        renderer.set_environment(device, queue, "Studio Soft", None);
+        renderer
     }
 
     pub fn environment_name(&self) -> &str {
@@ -1130,6 +1246,94 @@ impl Renderer {
         let coarse = (subdivide::level_for(triangles) > 0).then(|| (verts, mesh.indices.clone()));
         let geo = Geometry { vb, ib, draws, triangles };
         self.mesh = Some(MeshGpu { id, geo, coarse, dense: None, world_per_uv, lines, line_draws, center, radius });
+        self.content_rev += 1;
+    }
+
+    /// Upload the high poly when `id` changes; remove it on `None` or when its buffers exceed the device limit
+    pub fn set_bake_high(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mesh: Option<&Mesh>, id: u64) -> Result<(), String> {
+        if self.bake_high.as_ref().map(|high| high.id) == mesh.map(|_| id) {
+            return Ok(());
+        }
+
+        self.bake_high = None;
+        self.content_rev += 1;
+        let Some(mesh) = mesh else { return Ok(()) };
+
+        // Imported high polys can outgrow a viewport buffer even when the CPU baker accepts them
+        let limit = device.limits().max_buffer_size;
+        let buffers = [
+            (mesh.positions.len(), std::mem::size_of::<Vertex>()),
+            (mesh.indices.len(), std::mem::size_of::<u32>()),
+            (mesh.positions.len(), std::mem::size_of::<f32>()),
+        ];
+        if mesh.indices.len() > u32::MAX as usize || buffers.iter().any(|&(count, stride)| count.checked_mul(stride).is_none_or(|bytes| bytes as u64 > limit)) {
+            return Err(format!("High-poly visualization exceeds the GPU buffer limit ({limit} bytes). Use a smaller preview mesh or hide the high poly."));
+        }
+
+        self.bake_high = Some(HighPolyGpu {
+            id,
+            vertices: upload_buffer(device, queue, "tc_bake_high_vb", bytemuck::cast_slice(&subdivide::vertices(mesh)), wgpu::BufferUsages::VERTEX),
+            vertex_count: mesh.positions.len(),
+            indices: upload_buffer(device, queue, "tc_bake_high_ib", bytemuck::cast_slice(&mesh.indices), wgpu::BufferUsages::INDEX),
+            index_count: mesh.indices.len() as u32,
+            missed: upload_buffer(device, queue, "tc_bake_high_missed", bytemuck::cast_slice(&vec![0f32; mesh.positions.len()]), wgpu::BufferUsages::VERTEX),
+        });
+        Ok(())
+    }
+
+    /// Which vertices of high poly `id` the bake's rays miss (1) or reach (0); ignored for another mesh or vertex count
+    pub fn set_bake_high_missed(&mut self, queue: &wgpu::Queue, id: u64, missed: &[f32]) {
+        let Some(high) = self.bake_high.as_ref().filter(|high| high.id == id && high.vertex_count == missed.len()) else { return };
+
+        queue.write_buffer(&high.missed, 0, bytemuck::cast_slice(missed));
+        self.content_rev += 1;
+    }
+
+    /// Texture set `texture_set`'s cage: `corners` three per triangle and `edges` as corner pairs; `None` removes it. The same `topology` as before only rewrites the corners
+    pub fn set_bake_cage(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture_set: usize, cage: Option<(&[Vec3], &[[u32; 2]])>, topology: u64) {
+        if self.cages.len() <= texture_set {
+            self.cages.resize_with(texture_set + 1, || None);
+        }
+        let Some(slot) = self.cages.get_mut(texture_set) else { return };
+
+        match (cage, slot.as_mut()) {
+            (None, _) => *slot = None,
+            (Some((corners, _)), Some(gpu)) if gpu.topology == topology && gpu.corner_count as usize == corners.len() => {
+                queue.write_buffer(&gpu.corners, 0, bytemuck::cast_slice(corners));
+            }
+            (Some((corners, edges)), _) => {
+                *slot = Some(CageGpu {
+                    topology,
+                    corners: upload_buffer(device, queue, "tc_cage_vb", bytemuck::cast_slice(corners), wgpu::BufferUsages::VERTEX),
+                    corner_count: corners.len() as u32,
+                    edges: upload_buffer(device, queue, "tc_cage_ib", bytemuck::cast_slice(edges), wgpu::BufferUsages::INDEX),
+                    edge_index_count: (edges.len() * 2) as u32,
+                });
+            }
+        }
+        self.content_rev += 1;
+    }
+
+    /// Forget the cages of texture sets from `count` on (sets that were removed)
+    pub fn truncate_bake_cages(&mut self, count: usize) {
+        if self.cages.len() > count {
+            self.cages.truncate(count);
+            self.content_rev += 1;
+        }
+    }
+
+    /// The low poly's UV seams as vertex pairs per material ([`Mesh::uv_seam_edges`]) for mesh `mesh_id`
+    pub fn set_uv_seams(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mesh_id: u64, seams: &[Vec<(u32, u32)>]) {
+        let mut line_indices: Vec<u32> = Vec::new();
+        let mut line_draws = Vec::new();
+        for (material, edges) in seams.iter().enumerate() {
+            let start = line_indices.len() as u32;
+            line_indices.extend(edges.iter().flat_map(|&(from, to)| [from, to]));
+            line_draws.push((start, line_indices.len() as u32 - start, material));
+        }
+
+        let lines = upload_buffer(device, queue, "tc_uv_seams", bytemuck::cast_slice(&line_indices), wgpu::BufferUsages::INDEX);
+        self.uv_seams = Some(UvSeamGpu { mesh_id, lines, line_draws });
         self.content_rev += 1;
     }
 
@@ -1901,30 +2105,30 @@ impl Renderer {
         self.draw_scene(encoder, v, resolve, globals_bg, frame, pipe, wire, highlight, refr);
     }
 
-    /// One scene pass: background, then the mesh with `pipe`, the wireframe with `wire` and one set's highlighted edges with `highlight`
+    /// One scene pass: background, then the mesh with `mesh_pipeline`, the wireframe with `wire` and one set's highlighted edges with `highlight`
     #[allow(clippy::too_many_arguments)]
     fn draw_scene(
         &self,
         encoder: &mut wgpu::CommandEncoder,
-        v: &ViewTargets,
+        targets: &ViewTargets,
         resolve: &wgpu::TextureView,
-        globals_bg: &wgpu::BindGroup,
+        globals_bind_group: &wgpu::BindGroup,
         frame: &Frame,
-        pipe: &wgpu::RenderPipeline,
+        mesh_pipeline: &wgpu::RenderPipeline,
         wire: Option<&wgpu::RenderPipeline>,
         highlight: Option<(&wgpu::RenderPipeline, usize)>,
-        refr: &wgpu::BindGroup,
+        refraction_source: &wgpu::BindGroup,
     ) {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("tc_view"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &v.msaa,
+                view: &targets.msaa,
                 resolve_target: Some(resolve),
                 depth_slice: None,
                 ops: wgpu::Operations { load: CLEAR, store: wgpu::StoreOp::Discard },
             })],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &v.depth,
+                view: &targets.depth,
                 depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
                 stencil_ops: None,
             }),
@@ -1932,41 +2136,95 @@ impl Renderer {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_bind_group(0, globals_bg, &[]);
+        pass.set_bind_group(0, globals_bind_group, &[]);
         pass.set_pipeline(&self.bg_pipeline);
         pass.draw(0..3, 0..1);
-        let Some(m) = &self.mesh else { return };
-        let uv_ts = match frame.kind {
+        let Some(mesh) = &self.mesh else { return };
+
+        let uv_set = match frame.kind {
             ViewKind::Scene => None,
             ViewKind::Uv { ts, .. } => Some(ts),
         };
-        pass.set_bind_group(2, refr, &[]);
-        let geo = self.geometry(m, frame);
+        pass.set_bind_group(2, refraction_source, &[]);
+        let geometry = self.geometry(mesh, frame);
+        let bake = frame.shade.bake.filter(|_| uv_set.is_none());
+        let low_poly_shown = bake.is_none_or(|bake| bake.low_poly);
+        let low_poly_set = bake.and_then(|bake| bake.only_set).or(uv_set);
+        let (highlight, highlight_set) = highlight.filter(|(_, set)| low_poly_shown && low_poly_set.is_none_or(|only| only == *set)).unzip();
+
         // The wireframe and the highlight draw the mesh's own edges (displaced in the vertex shader too)
-        let (highlight, highlight_set) = highlight.unzip();
         let passes = [
-            (Some(pipe), &geo.vb, &geo.ib, &geo.draws, uv_ts, 1),
-            (wire, &m.geo.vb, &m.lines, &m.line_draws, uv_ts, 1),
-            (highlight, &m.geo.vb, &m.lines, &m.line_draws, highlight_set, HIGHLIGHT_SHIFTS),
+            (low_poly_shown.then_some(mesh_pipeline), &geometry.vb, &geometry.ib, &geometry.draws, low_poly_set, 1),
+            (wire.filter(|_| low_poly_shown), &mesh.geo.vb, &mesh.lines, &mesh.line_draws, low_poly_set, 1),
+            (highlight, &mesh.geo.vb, &mesh.lines, &mesh.line_draws, highlight_set, HIGHLIGHT_SHIFTS),
         ];
-        for (pipe, vb, ib, ranges, only, instances) in passes {
-            let Some(pipe) = pipe else { continue };
-            pass.set_pipeline(pipe);
-            pass.set_vertex_buffer(0, vb.slice(..));
-            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-            for (range, set) in self.drawable(ranges, &frame.visible, only) {
+        for (pipeline, vertices, indices, ranges, only_set, instances) in passes {
+            let Some(pipeline) = pipeline else { continue };
+
+            pass.set_pipeline(pipeline);
+            pass.set_vertex_buffer(0, vertices.slice(..));
+            pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+            for (range, set) in self.drawable(ranges, &frame.visible, only_set) {
                 pass.set_bind_group(1, &set.bind_group, &[]);
                 pass.draw_indexed(range, 0, 0..instances);
             }
         }
 
+        if let Some(bake) = bake {
+            self.draw_bake(&mut pass, mesh, frame, bake);
+        }
+
         // Overlay quads last, so the mesh's depth hides what is behind it
-        if uv_ts.is_none()
-            && let Some(overlay) = v.overlay.as_ref().filter(|_| v.overlay_vertices > 0)
+        if uv_set.is_none()
+            && let Some(overlay) = targets.overlay.as_ref().filter(|_| targets.overlay_vertices > 0)
         {
             pass.set_pipeline(&self.overlay_pipeline);
             pass.set_vertex_buffer(0, overlay.slice(..));
-            pass.draw(0..v.overlay_vertices, 0..1);
+            pass.draw(0..targets.overlay_vertices, 0..1);
+        }
+    }
+
+    /// Bake mode's high poly, UV seams and cages over the low poly `low_poly`
+    fn draw_bake(&self, pass: &mut wgpu::RenderPass<'_>, low_poly: &MeshGpu, frame: &Frame, bake: BakeVisualization) {
+        if bake.high_poly
+            && let Some(high) = &self.bake_high
+        {
+            pass.set_pipeline(&self.bake_high_pipeline);
+            pass.set_vertex_buffer(0, high.vertices.slice(..));
+            pass.set_vertex_buffer(1, high.missed.slice(..));
+            pass.set_index_buffer(high.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..high.index_count, 0, 0..1);
+        }
+
+        if bake.uv_seams
+            && let Some(seams) = self.uv_seams.as_ref().filter(|seams| seams.mesh_id == low_poly.id)
+        {
+            pass.set_pipeline(&self.uv_seam_pipeline);
+            pass.set_vertex_buffer(0, low_poly.geo.vb.slice(..));
+            pass.set_index_buffer(seams.lines.slice(..), wgpu::IndexFormat::Uint32);
+            for (range, set) in self.drawable(&seams.line_draws, &frame.visible, bake.only_set) {
+                pass.set_bind_group(1, &set.bind_group, &[]);
+                pass.draw_indexed(range, 0, 0..1);
+            }
+        }
+
+        if !bake.cage {
+            return;
+        }
+
+        let shown = |texture_set: usize| bake.only_set.is_none_or(|only| only == texture_set) && frame.visible.get(texture_set).copied().unwrap_or(true);
+        let cages = || self.cages.iter().enumerate().filter(move |(texture_set, _)| shown(*texture_set)).filter_map(|(_, cage)| cage.as_ref());
+        // The translucent faces first, then the wireframe over them
+        pass.set_pipeline(&self.cage_pipeline);
+        for cage in cages() {
+            pass.set_vertex_buffer(0, cage.corners.slice(..));
+            pass.draw(0..cage.corner_count, 0..1);
+        }
+        pass.set_pipeline(&self.cage_wire_pipeline);
+        for cage in cages() {
+            pass.set_vertex_buffer(0, cage.corners.slice(..));
+            pass.set_index_buffer(cage.edges.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..cage.edge_index_count, 0, 0..1);
         }
     }
 
@@ -2030,6 +2288,23 @@ const QUAD_TRIANGLES: [usize; 6] = [0, 1, 2, 0, 2, 3];
 
 /// Write `quads` into the view's overlay buffer, colors divided by the exposure only (undoing ACES makes saturated colors overshoot)
 fn upload_overlay(device: &wgpu::Device, queue: &wgpu::Queue, view: &mut ViewTargets, quads: &[OverlayQuad], exposure_ev: Option<f32>) {
+    view.overlay_vertices = 0;
+    let Some(vertex_count) = quads.len().checked_mul(QUAD_TRIANGLES.len()).and_then(|count| u32::try_from(count).ok()) else {
+        log::warn!("Symmetry overlay has too many vertices; hide the intersection or use a simpler mesh");
+        return;
+    };
+
+    // A valid imported mesh can produce more intersection vertices than the GPU accepts
+    let byte_count = u64::from(vertex_count) * std::mem::size_of::<Vertex>() as u64;
+    if byte_count > device.limits().max_buffer_size {
+        log::warn!("Symmetry overlay exceeds the GPU buffer limit; hide the intersection or use a simpler mesh");
+        return;
+    }
+
+    if vertex_count == 0 {
+        return;
+    }
+
     let vertices: Vec<Vertex> = quads
         .iter()
         .flat_map(|quad| {
@@ -2038,11 +2313,6 @@ fn upload_overlay(device: &wgpu::Device, queue: &wgpu::Queue, view: &mut ViewTar
             QUAD_TRIANGLES.map(|corner| vertex(quad.corners[corner]))
         })
         .collect();
-    view.overlay_vertices = u32::try_from(vertices.len()).unwrap_or(0);
-    if vertices.is_empty() {
-        return;
-    }
-
     let bytes: &[u8] = bytemuck::cast_slice(&vertices);
     if view.overlay.as_ref().is_none_or(|buffer| buffer.size() < bytes.len() as u64) {
         view.overlay = Some(device.create_buffer(&wgpu::BufferDescriptor {
@@ -2054,6 +2324,7 @@ fn upload_overlay(device: &wgpu::Device, queue: &wgpu::Queue, view: &mut ViewTar
     }
     if let Some(buffer) = &view.overlay {
         queue.write_buffer(buffer, 0, bytes);
+        view.overlay_vertices = vertex_count;
     }
 }
 
@@ -2077,6 +2348,23 @@ fn highlight_shift(size: [u32; 2]) -> [f32; 4] {
 mod tests {
     use super::*;
     use crate::headless::Headless;
+
+    #[test]
+    fn oversized_overlays_leave_the_view_usable() {
+        let Ok(mut headless) = Headless::new() else { return };
+        let limit = headless.device.limits().max_buffer_size as usize;
+        let count = limit / (QUAD_TRIANGLES.len() * std::mem::size_of::<Vertex>()) + 1;
+        let quad = OverlayQuad { corners: [Vec3::ZERO; 4], color: [1.0, 0.0, 0.0], opacity: 0.5 };
+        let quads = vec![quad; count];
+        let view = headless.renderer.targets(&headless.device, 1, [32, 32], false, false, false).unwrap();
+        upload_overlay(&headless.device, &headless.queue, view, &[quad], None);
+
+        upload_overlay(&headless.device, &headless.queue, view, &quads, None);
+
+        assert_eq!(view.overlay_vertices, 0, "skip overlays beyond the device limit");
+        upload_overlay(&headless.device, &headless.queue, view, &[quad], None);
+        assert_eq!(view.overlay_vertices, 6, "the next frame can draw its overlay");
+    }
 
     /// A headless renderer with one 256² texture set, and the base color slot's full-size
     /// texture handed over as WebGPU would: allocated, with its verdict still to come.

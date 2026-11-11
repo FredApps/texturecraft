@@ -1,6 +1,6 @@
 //! Shelf and brush preview caches
 //! Small synchronous renders are limited per frame
-//! Smart masks and hover previews use [`PreviewWorker`]
+//! Smart masks, smart materials and hover previews use [`PreviewWorker`]
 
 use std::collections::{HashMap, VecDeque};
 
@@ -16,7 +16,7 @@ use crate::preview_worker::PreviewWorker;
 use crate::shelf_preview::ShelfPreview;
 use crate::worker_preview::WorkerPreview;
 
-/// Shelf thumbnails rendered per frame at most (the rest follow on the next frames)
+/// UI-thread renders per frame at most; a web worker request uses the whole budget
 const PER_FRAME: usize = 2;
 /// Shelf sphere and smart mask thumbnail size in pixels
 const SPHERE_PX: usize = 72;
@@ -37,7 +37,7 @@ pub struct Thumbs {
     images: HashMap<String, TextureHandle>,
     /// (frame, thumbnails rendered in it)
     budget: (u64, usize),
-    /// Renders the smart mask thumbnails and the big previews
+    /// Renders the orb thumbnails and the big previews
     worker: PreviewWorker,
     /// Worker-rendered previews by [`worker_key`]
     rendered: HashMap<String, WorkerPreview>,
@@ -82,25 +82,34 @@ impl Thumbs {
     /// Render within the frame budget; deferred thumbnails request a repaint
     fn shelf(&mut self, ctx: &egui::Context, preview: ShelfPreview, size_px: usize) -> Option<TextureHandle> {
         let key = preview.key();
-        if let Some(t) = self.shelf.get(&key) {
-            return Some(t.clone());
+        if let Some(texture) = self.shelf.get(&key) {
+            return Some(texture.clone());
         }
 
+        if !self.spend_budget(ctx, 1) {
+            return None;
+        }
+
+        // An unknown asset shows as an empty thumbnail
+        let image = preview.image(size_px).unwrap_or_else(|| ColorImage::filled([size_px, size_px], Color32::TRANSPARENT));
+        let texture = ctx.load_texture(format!("thumb_{key}"), image, TextureOptions::LINEAR);
+        self.shelf.insert(key, texture.clone());
+        Some(texture)
+    }
+
+    /// Spend `renders` of this frame's UI-thread budget; when it is spent, request a repaint
+    fn spend_budget(&mut self, ctx: &egui::Context, renders: usize) -> bool {
         let frame = ctx.cumulative_pass_nr();
         if self.budget.0 != frame {
             self.budget = (frame, 0);
         }
-        if self.budget.1 >= PER_FRAME {
+        if self.budget.1 + renders > PER_FRAME {
             ctx.request_repaint();
-            return None;
+            return false;
         }
-        self.budget.1 += 1;
 
-        // An unknown asset shows as an empty thumbnail
-        let image = preview.image(size_px).unwrap_or_else(|| ColorImage::filled([size_px, size_px], Color32::TRANSPARENT));
-        let t = ctx.load_texture(format!("thumb_{key}"), image, TextureOptions::LINEAR);
-        self.shelf.insert(key, t.clone());
-        Some(t)
+        self.budget.1 += renders;
+        true
     }
 
     /// Request once per asset and size; return None while pending or after failure
@@ -109,11 +118,17 @@ impl Thumbs {
         self.receive(ctx);
 
         let key = worker_key(&preview, size_px);
-        if !self.rendered.contains_key(&key) {
+        if !self.rendered.contains_key(&key) && self.may_request(ctx) {
             let queued = self.worker.request(ctx, PreviewRequest { key: key.clone(), preview, size_px, hover });
             self.rendered.insert(key.clone(), if queued { WorkerPreview::Rendering } else { WorkerPreview::Failed });
         }
+
         self.ready(&key)
+    }
+
+    /// Native workers take every request; the web renders inline, so it takes one per frame
+    fn may_request(&mut self, ctx: &egui::Context) -> bool {
+        !cfg!(target_arch = "wasm32") || self.spend_budget(ctx, PER_FRAME)
     }
 
     /// The worker-rendered preview under `key` if it arrived
@@ -169,9 +184,12 @@ impl Thumbs {
         self.ready(&worker_key(preview, size_px))
     }
 
-    /// Sphere thumbnail of built-in material `id`
+    /// Material thumbnail: smart materials come from the worker's orb, plain ones are spheres
     pub fn material(&mut self, ctx: &egui::Context, id: &'static str) -> Option<TextureHandle> {
-        self.shelf(ctx, ShelfPreview::Material(id), SPHERE_PX)
+        match ShelfPreview::material(id) {
+            preview @ ShelfPreview::SmartMaterial(_) => self.worker_rendered(ctx, preview, SPHERE_PX, false),
+            preview => self.shelf(ctx, preview, SPHERE_PX),
+        }
     }
 
     /// Smart mask thumbnail; None until the worker returns it

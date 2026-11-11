@@ -105,6 +105,42 @@ fn polygon_fill_and_color_picker() {
     assert!((r["roughness"][0].as_f64().unwrap() - 0.9).abs() < 0.01, "{r}");
 }
 
+#[test]
+fn polygon_fill_boxes_survive_hostile_params() {
+    let hostile = [
+        json!({"x0": 1e30, "y0": -1e30, "x1": f64::MAX, "y1": 0, "viewport": [1e9, 1e9]}),
+        json!({"x0": 0, "y0": 0, "x1": 0, "y1": 0, "viewport": [16, 16]}),
+        json!({"uv0": [1e30, -1e30], "uv1": [0, 0]}),
+        json!({"uv0": [0.5], "uv1": "x", "uv": [f64::MIN, 2]}),
+        json!({"hitTest": "nope", "visibleOnly": "yes", "mode": 7}),
+    ];
+    for visible_only in [true, false] {
+        for hit_test in ["intersection", "containedCenter"] {
+            let mut session = session();
+            execute(&mut session, "tool.polygonFill", &Value::Null).unwrap();
+            execute(&mut session, "tool.fillSelection", &json!({"hitTest": hit_test, "visibleOnly": visible_only})).unwrap();
+            for params in &hostile {
+                let _ = execute(&mut session, "tool.click", params);
+                let _ = execute(&mut session, "tool.fillSelection", params);
+                session.update();
+            }
+        }
+    }
+}
+
+/// A small project still gets the production bake defaults; only panic_hunt overrides them.
+#[test]
+fn new_project_keeps_full_resolution_bake_defaults() {
+    let s = session();
+    assert!(!s.doc.project.texture_sets.is_empty());
+    for texture_set in &s.doc.project.texture_sets {
+        assert_eq!(texture_set.resolution, 256);
+        assert_eq!(texture_set.bake, texturecraft_engine::core::BakeSettings::default());
+        assert_eq!(texture_set.bake.common.output_size(), (2048, 2048));
+        assert_eq!(texture_set.bake.maps.ao.parameters.rays.rays, 64);
+    }
+}
+
 /// Every command must return Ok or Err — never panic — for hostile params.
 #[test]
 fn panic_hunt() {
@@ -122,6 +158,11 @@ fn panic_hunt() {
         }
         for p in &hostile {
             let mut s = session();
+            // Match the 256px fixture: otherwise empty/irrelevant bake.run params perform
+            // repeated 2048px default bakes. Keep every input, ray count and fresh session.
+            for texture_set in &mut s.doc.project.texture_sets {
+                texture_set.bake.common.resolution = texturecraft_engine::core::BakeResolution::R256;
+            }
             let _ = execute(&mut s, spec.id, p);
             s.update();
         }
@@ -379,4 +420,29 @@ fn background_resizes_match_the_command_and_keep_later_edits() {
     assert_eq!((b.doc.project.texture_sets[0].resolution, painted(&b)), (512, before));
     b.update();
     assert_eq!(b.caches[0].size, (512, 512));
+}
+
+#[test]
+fn curvature_generators_take_a_mode_and_detail_sizes() {
+    let mut state = session();
+    execute(&mut state, "layer.add.fill", &json!({})).unwrap();
+    execute(&mut state, "mask.add.black", &Value::Null).unwrap();
+    let added = execute(&mut state, "effect.add.generator", &json!({"generator": "curvature", "mode": "cavities"})).unwrap();
+    let effect = added["effect"].clone();
+
+    execute(&mut state, "effect.set", &json!({"effect": effect, "sizes": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.5]})).unwrap();
+    let inspect = execute(&mut state, "project.inspect", &Value::Null).unwrap().to_string();
+    assert!(inspect.contains(r#""mode":"Cavities""#) && inspect.contains(r#""sizes":[0.0,0.0,0.0,1.0,0.0,0.0,0.5]"#), "{inspect}");
+
+    let too_few = execute(&mut state, "effect.set", &json!({"effect": effect, "sizes": [1.0, 0.5]}));
+    assert!(too_few.is_err(), "sizes takes one weight per detail size");
+    let not_numbers = execute(&mut state, "effect.set", &json!({"effect": effect, "sizes": [1.0, "a", 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}));
+    assert!(not_numbers.is_err(), "a size that isn't a number is rejected, not skipped");
+    let unknown = execute(&mut state, "effect.set", &json!({"effect": effect, "mode": "ridges"}));
+    assert!(unknown.is_err(), "unknown modes are rejected");
+    let wrong_type = execute(&mut state, "effect.set", &json!({"effect": effect, "mode": 1, "level": 0.1}));
+    assert!(wrong_type.is_err(), "a mode must be a string and an invalid edit must be rejected");
+    let dirt = execute(&mut state, "effect.add.generator", &json!({"generator": "dirt", "mode": "edges"}));
+    assert!(dirt.is_err(), "only curvature generators have a mode");
+    assert_eq!(execute(&mut state, "project.inspect", &Value::Null).unwrap().to_string(), inspect, "failed commands leave the project unchanged");
 }

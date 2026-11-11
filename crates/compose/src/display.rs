@@ -93,20 +93,21 @@ fn u8_of(v: u16) -> u8 {
     (v >> 8) as u8
 }
 
-/// Tile bytes (`TILE × TILE`, row-major) for `kind` from the composite, or None when the tile is
-/// absent in every source (the GPU texture keeps its cleared default).
-pub fn tile_bytes(comp: &Composite, baked: &BakedMaps, kind: DisplayKind, tx: u32, ty: u32) -> Vec<u8> {
-    let bpt = kind.bytes_per_texel();
-    let mut out = vec![0u8; TILE_AREA * bpt];
-    let lut = srgb_lut();
-    let get = |c: Channel| comp.channels.get(&c).and_then(|img| img.tile(tx, ty));
-    let res = comp.resolution;
+/// Tile bytes (`TILE × TILE`, row-major) for `kind`, using channel defaults for absent source tiles.
+pub fn tile_bytes(composite: &Composite, baked: &BakedMaps, kind: DisplayKind, tx: u32, ty: u32) -> Vec<u8> {
+    let bytes_per_texel = kind.bytes_per_texel();
+    let mut out = vec![0u8; TILE_AREA * bytes_per_texel];
+    let srgb = srgb_lut();
+    let get = |c: Channel| composite.channels.get(&c).and_then(|img| img.tile(tx, ty));
+    let resolution = composite.resolution;
     let default16 = |c: Channel| texturecraft_texel::to_u16(c.default_value()[0]);
-    // A scalar channel's texel `i` as 8 bits (its default where the set lacks it).
+
+    // A scalar channel's texel `i` as 8 bits (its default where the set lacks it)
     let scalar8 = |c: Channel| {
         let (t, d) = (get(c), default16(c));
         move |i: usize| u8_of(t.and_then(|t| t.get(i).copied()).unwrap_or(d))
     };
+
     match kind {
         DisplayKind::BaseColor | DisplayKind::Emissive | DisplayKind::Sheen => {
             let (c, alpha) = match kind {
@@ -117,81 +118,87 @@ pub fn tile_bytes(comp: &Composite, baked: &BakedMaps, kind: DisplayKind, tx: u3
             let (src, alpha) = (get(c), scalar8(alpha));
             let d = c.default_value().map(|v| (texturecraft_texel::linear_to_srgb(v) * 255.0 + 0.5) as u8);
             for i in 0..TILE_AREA {
-                let px = &mut out[i * 4..i * 4 + 4];
+                let pixel = &mut out[i * 4..i * 4 + 4];
                 match src {
                     Some(s) => {
                         for k in 0..3 {
-                            px[k] = lut[(s.get(i * 3 + k).copied().unwrap_or(0) >> 4) as usize];
+                            pixel[k] = srgb[(s.get(i * 3 + k).copied().unwrap_or(0) >> 4) as usize];
                         }
                     }
-                    None => px[..3].copy_from_slice(&d),
+                    None => pixel[..3].copy_from_slice(&d),
                 }
-                px[3] = alpha(i);
+                pixel[3] = alpha(i);
             }
         }
         DisplayKind::Lobes => {
             let lanes = [Channel::CoatWeight, Channel::CoatRoughness, Channel::AnisotropyLevel, Channel::AnisotropyAngle].map(scalar8);
-            for (i, px) in out.chunks_exact_mut(4).enumerate() {
-                for (d, lane) in px.iter_mut().zip(&lanes) {
+            for (i, pixel) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                for (d, lane) in pixel.iter_mut().zip(&lanes) {
                     *d = lane(i);
                 }
             }
         }
         DisplayKind::Extra => {
             let (n, transmission) = (get(Channel::CoatNormal), scalar8(Channel::Transmission));
-            // Signed 8-bit around 128 so the flat normal packs exactly.
-            let snorm = |v: u16| (128.0 + 127.0 * (v as f32 / 65535.0 * 2.0 - 1.0)).round().clamp(0.0, 255.0) as u8;
-            // A TILE never straddles two atlas blocks.
-            let scale = (-32.0 * comp.block_scales.at(tx * TILE, ty * TILE).log2()).round().clamp(0.0, 255.0) as u8;
-            for (i, px) in out.chunks_exact_mut(4).enumerate() {
-                for (k, d) in px.iter_mut().take(2).enumerate() {
-                    *d = n.and_then(|t| t.get(i * 3 + k)).map_or(128, |v| snorm(*v));
+
+            // Signed 8-bit around 128 so the flat normal packs exactly
+            let pack_signed_normal = |v: u16| (128.0 + 127.0 * (v as f32 / 65535.0 * 2.0 - 1.0)).round().clamp(0.0, 255.0) as u8;
+
+            // A TILE never straddles two atlas blocks
+            let scale = (-32.0 * composite.block_scales.at(tx * TILE, ty * TILE).log2()).round().clamp(0.0, 255.0) as u8;
+            for (i, pixel) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                for (k, d) in pixel.iter_mut().take(2).enumerate() {
+                    *d = n.and_then(|t| t.get(i * 3 + k)).map_or(128, |v| pack_signed_normal(*v));
                 }
-                px[2] = transmission(i);
-                px[3] = scale;
+                pixel[2] = transmission(i);
+                pixel[3] = scale;
             }
         }
         DisplayKind::Orm => {
             let (ao, m, s) = (get(Channel::AmbientOcclusion), get(Channel::Metallic), get(Channel::SpecularLevel));
-            // Specular/glossiness sets: the viewport shades roughness = 1 − glossiness.
-            let gloss = comp.channels.contains_key(&Channel::Glossiness);
+
+            // Specular/glossiness sets: the viewport shades roughness = 1 − glossiness
+            let gloss = composite.channels.contains_key(&Channel::Glossiness);
             let (r, r_default) =
                 if gloss { (get(Channel::Glossiness), default16(Channel::Glossiness)) } else { (get(Channel::Roughness), default16(Channel::Roughness)) };
             for i in 0..TILE_AREA {
                 let (x, y) = (tx * TILE + (i as u32 % TILE), ty * TILE + (i as u32 / TILE));
-                let baked_ao = baked.sample_working(BakedMap::AmbientOcclusion, x, y, (res, comp.height), &comp.block_scales).map_or(1.0, |value| value[0]);
+                let baked_ao = baked
+                    .sample_working(BakedMap::AmbientOcclusion, x, y, (resolution, composite.height), &composite.block_scales)
+                    .map_or(1.0, |value| value[0]);
                 let ch_ao = ao.and_then(|a| a.get(i)).map(|v| *v as f32 / 65535.0).unwrap_or(1.0);
-                let px = &mut out[i * 4..i * 4 + 4];
-                px[0] = ((baked_ao * ch_ao).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                let pixel = &mut out[i * 4..i * 4 + 4];
+                pixel[0] = ((baked_ao * ch_ao).clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                 let v = r.and_then(|t| t.get(i).copied()).unwrap_or(r_default);
-                px[1] = u8_of(if gloss { 65535 - v } else { v });
-                px[2] = u8_of(m.and_then(|t| t.get(i).copied()).unwrap_or(0));
-                px[3] = u8_of(s.and_then(|t| t.get(i).copied()).unwrap_or(default16(Channel::SpecularLevel)));
+                pixel[1] = u8_of(if gloss { 65535 - v } else { v });
+                pixel[2] = u8_of(m.and_then(|t| t.get(i).copied()).unwrap_or(0));
+                pixel[3] = u8_of(s.and_then(|t| t.get(i).copied()).unwrap_or(default16(Channel::SpecularLevel)));
             }
         }
         DisplayKind::Normal => {
-            let (n, sheen_rough) = (get(Channel::Normal), scalar8(Channel::SheenRoughness));
+            let (n, sheen_roughness) = (get(Channel::Normal), scalar8(Channel::SheenRoughness));
             for i in 0..TILE_AREA {
-                let px = &mut out[i * 4..i * 4 + 4];
-                // The baked normal is the base the painted normal details sit on (as in export).
+                let pixel = &mut out[i * 4..i * 4 + 4];
+
+                // The baked normal is the base the painted normal details sit on (as in export)
                 let (x, y) = (tx * TILE + (i as u32 % TILE), ty * TILE + (i as u32 / TILE));
-                let base = baked.sample_working(BakedMap::Normal, x, y, (res, comp.height), &comp.block_scales);
+                let base = baked.sample_working(BakedMap::Normal, x, y, (resolution, composite.height), &composite.block_scales);
                 match (n, base) {
                     (Some(t), None) => {
-                        for (k, d) in px.iter_mut().take(3).enumerate() {
+                        for (k, d) in pixel.iter_mut().take(3).enumerate() {
                             *d = u8_of(t.get(i * 3 + k).copied().unwrap_or(0));
                         }
                     }
                     (detail, Some(base)) => {
                         let detail = detail.map_or([0.5, 0.5, 1.0], |t| [0, 1, 2].map(|k| t.get(i * 3 + k).map_or(0.0, |v| *v as f32 / 65535.0)));
                         let v = texturecraft_core::blend::rnm(base, detail);
-                        for (d, v) in px.iter_mut().zip(v) {
+                        for (d, v) in pixel.iter_mut().zip(v) {
                             *d = (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                         }
                     }
-                    (None, None) => px[..3].copy_from_slice(&[128, 128, 255]),
+                    (None, None) => pixel[..3].copy_from_slice(&[128, 128, 255]),
                 }
-                px[3] = sheen_rough(i);
+                pixel[3] = sheen_roughness(i);
             }
         }
         DisplayKind::Height => {
@@ -206,6 +213,7 @@ pub fn tile_bytes(comp: &Composite, baked: &BakedMaps, kind: DisplayKind, tx: u3
             }
         }
     }
+
     out
 }
 

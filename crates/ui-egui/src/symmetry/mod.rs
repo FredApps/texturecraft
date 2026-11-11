@@ -39,6 +39,7 @@ fn current_axis(symmetry: &Symmetry) -> usize {
     if symmetry.radial > 1 {
         return symmetry.axis_index();
     }
+
     [symmetry.x, symmetry.y, symmetry.z].iter().position(|on| *on).unwrap_or(symmetry.axis_index())
 }
 
@@ -49,6 +50,7 @@ pub(crate) fn movable_axes(symmetry: &Symmetry) -> [bool; 3] {
         let axis = symmetry.axis_index();
         return [0, 1, 2].map(|other| other != axis);
     }
+
     [symmetry.x, symmetry.y, symmetry.z]
 }
 
@@ -79,11 +81,34 @@ fn toggle(symmetry: &mut Symmetry) {
     }
 }
 
+/// Apply changed symmetry settings through the same command used by scripts and agents
+fn apply(app: &mut TextureCraftApp, symmetry: Symmetry) {
+    if symmetry == app.session.tool.brush.symmetry {
+        return;
+    }
+
+    app.run(
+        "tool.brush",
+        serde_json::json!({
+            "symmetryOn": symmetry.enabled,
+            "symmetryX": symmetry.x,
+            "symmetryY": symmetry.y,
+            "symmetryZ": symmetry.z,
+            "symmetryRadial": symmetry.radial,
+            "symmetryAxis": (["x", "y", "z"][symmetry.axis_index()]),
+            "symmetryOffset": symmetry.offset,
+            "symmetryAngleSpan": symmetry.angle_span,
+        }),
+    );
+}
+
 /// The Symmetry toggle and the settings button with its popup
 pub(crate) fn toolbar_controls(app: &mut TextureCraftApp, ui: &mut Ui) {
     let button_size = ui.spacing().interact_size.y;
     if icon_button(ui, ic::FLIP_HORIZONTAL, tr("Symmetry"), app.session.tool.brush.symmetry.any(), button_size).clicked() {
-        toggle(&mut app.session.tool.brush.symmetry);
+        let mut symmetry = app.session.tool.brush.symmetry;
+        toggle(&mut symmetry);
+        apply(app, symmetry);
     }
 
     // No tooltip on the settings button; the label still names it for screen readers
@@ -94,7 +119,7 @@ pub(crate) fn toolbar_controls(app: &mut TextureCraftApp, ui: &mut Ui) {
         open = !open;
     }
 
-    // Open state kept here, not in egui's popup memory: that holds one popup, so the Type dropdown or the color picker inside would close this one
+    // egui's single popup slot is needed by the Type dropdown and color picker inside this popup
     let shown = egui::Popup::from_response(&response)
         .id(popup_id)
         .open_bool(&mut open)
@@ -110,5 +135,6 @@ pub(crate) fn toolbar_controls(app: &mut TextureCraftApp, ui: &mut Ui) {
     {
         open = false;
     }
+
     ui.data_mut(|data| data.insert_temp(popup_id, open));
 }

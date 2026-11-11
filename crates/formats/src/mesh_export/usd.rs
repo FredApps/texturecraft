@@ -166,60 +166,64 @@ fn identifier(s: &str, taken: &mut Vec<String>) -> String {
 /// The export scene: `/<name>` with the `Mesh` and `Materials`. `files[m]` are the texture
 /// file names (by slot) of material `m`.
 fn scene(mesh: &Mesh, name: &str, files: &[Vec<(usize, String)>]) -> Result<UsdLayer> {
-    let n = mesh.positions.len();
-    if n == 0 || mesh.indices.len() < 3 {
+    let vertex_count = mesh.positions.len();
+    if vertex_count == 0 || mesh.indices.len() < 3 {
         return Err(FormatError::Invalid("the mesh is empty".into()));
     }
+
     let ints =
         |v: &[u32]| v.iter().map(|&i| i32::try_from(i).map_err(|_| FormatError::TooLarge("vertex index beyond 2^31".into()))).collect::<Result<Vec<i32>>>();
     let mut taken = Vec::new();
     let root_name = identifier(name, &mut taken);
     let mut root = UsdPrim::new(&root_name, "Xform");
-    let mut geo = UsdPrim::new(&identifier(&format!("{name}_mesh"), &mut taken), "Mesh");
-    let mat_names: Vec<String> = mesh.materials.iter().map(|m| identifier(m, &mut taken)).collect();
-    let mat_path = |m: usize| mat_names.get(m).map(|id| format!("/{root_name}/Materials/{id}"));
+    let mut geometry = UsdPrim::new(&identifier(&format!("{name}_mesh"), &mut taken), "Mesh");
+    let material_names: Vec<String> = mesh.materials.iter().map(|m| identifier(m, &mut taken)).collect();
+    let material_path = |m: usize| material_names.get(m).map(|id| format!("/{root_name}/Materials/{id}"));
     let (lo, hi) = mesh.bounds();
-    // Faces in submesh order; subsets index them.
-    let mut tris: Vec<u32> = Vec::with_capacity(mesh.indices.len());
+
+    // Faces in submesh order; subsets index them
+    let mut indices: Vec<u32> = Vec::with_capacity(mesh.indices.len());
     let mut faces_of: Vec<Vec<i32>> = vec![Vec::new(); mesh.materials.len()];
-    for sm in parts(mesh, name) {
-        let range = mesh.indices.get(sm.start as usize..(sm.start as usize).saturating_add(sm.count as usize)).unwrap_or_default();
-        for t in range.chunks_exact(3) {
-            if let Some(f) = faces_of.get_mut(sm.material) {
-                f.push(i32::try_from(tris.len() / 3).map_err(|_| FormatError::TooLarge("triangle count".into()))?);
+    for part in parts(mesh, name) {
+        let range = mesh.indices.get(part.start as usize..(part.start as usize).saturating_add(part.count as usize)).unwrap_or_default();
+        for t in range.as_chunks::<3>().0 {
+            if let Some(f) = faces_of.get_mut(part.material) {
+                f.push(i32::try_from(indices.len() / 3).map_err(|_| FormatError::TooLarge("triangle count".into()))?);
             }
-            tris.extend_from_slice(t);
+            indices.extend_from_slice(t);
         }
     }
+
     let vertex = |mut a: UsdAttr| {
         a.interpolation = Some("vertex");
         a
     };
-    geo.attrs = vec![
+    geometry.attrs = vec![
         UsdAttr::new("extent", "float3[]", Some(UsdValue::Vec3fs(vec![lo.to_array(), hi.to_array()]))),
-        UsdAttr::new("faceVertexCounts", "int[]", Some(UsdValue::Ints(vec![3; tris.len() / 3]))),
-        UsdAttr::new("faceVertexIndices", "int[]", Some(UsdValue::Ints(ints(&tris)?))),
+        UsdAttr::new("faceVertexCounts", "int[]", Some(UsdValue::Ints(vec![3; indices.len() / 3]))),
+        UsdAttr::new("faceVertexIndices", "int[]", Some(UsdValue::Ints(ints(&indices)?))),
         UsdAttr::new("points", "point3f[]", Some(UsdValue::Vec3fs(mesh.positions.iter().map(|p| p.to_array()).collect()))),
         UsdAttr::new("subdivisionScheme", "token", Some(UsdValue::Token("none".into()))).uniform(),
     ];
-    if mesh.normals.len() == n {
-        geo.attrs.push(vertex(UsdAttr::new("normals", "normal3f[]", Some(UsdValue::Vec3fs(mesh.normals.iter().map(|v| v.to_array()).collect())))));
+    if mesh.normals.len() == vertex_count {
+        geometry.attrs.push(vertex(UsdAttr::new("normals", "normal3f[]", Some(UsdValue::Vec3fs(mesh.normals.iter().map(|v| v.to_array()).collect())))));
     }
-    if mesh.uvs.len() == n {
-        // USD's st origin is bottom-left.
+    if mesh.uvs.len() == vertex_count {
+        // USD's st origin is bottom-left
         let st = mesh.uvs.iter().map(|t| [t.x, 1.0 - t.y]).collect();
-        geo.attrs.push(vertex(UsdAttr::new("primvars:st", "texCoord2f[]", Some(UsdValue::Vec2fs(st)))));
+        geometry.attrs.push(vertex(UsdAttr::new("primvars:st", "texCoord2f[]", Some(UsdValue::Vec2fs(st)))));
     }
+
     let used: Vec<usize> = (0..mesh.materials.len()).filter(|m| faces_of.get(*m).is_some_and(|f| !f.is_empty())).collect();
     match used.as_slice() {
         [] => {}
         [m] => {
-            geo.binding_api = true;
-            geo.attrs.extend(mat_path(*m).map(|p| UsdAttr::rel("material:binding", p)));
+            geometry.binding_api = true;
+            geometry.attrs.extend(material_path(*m).map(|p| UsdAttr::rel("material:binding", p)));
         }
         _ => {
             for &m in &used {
-                let (Some(id), Some(path)) = (mat_names.get(m), mat_path(m)) else { continue };
+                let (Some(id), Some(path)) = (material_names.get(m), material_path(m)) else { continue };
                 let mut subset = UsdPrim::new(id, "GeomSubset");
                 subset.binding_api = true;
                 subset.attrs = vec![
@@ -228,18 +232,20 @@ fn scene(mesh: &Mesh, name: &str, files: &[Vec<(usize, String)>]) -> Result<UsdL
                     UsdAttr::new("indices", "int[]", Some(UsdValue::Ints(faces_of.get(m).cloned().unwrap_or_default()))),
                     UsdAttr::rel("material:binding", path),
                 ];
-                geo.children.push(subset);
+                geometry.children.push(subset);
             }
         }
     }
-    root.children.push(geo);
+
+    root.children.push(geometry);
     let mut materials = UsdPrim::new("Materials", "Scope");
-    for (m, id) in mat_names.iter().enumerate() {
+    for (m, id) in material_names.iter().enumerate() {
         materials.children.push(material(&format!("/{root_name}/Materials/{id}"), id, files.get(m).map_or(&[][..], Vec::as_slice)));
     }
     if !materials.children.is_empty() {
         root.children.push(materials);
     }
+
     Ok(UsdLayer { root })
 }
 

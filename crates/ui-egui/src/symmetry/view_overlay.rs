@@ -112,14 +112,12 @@ pub(crate) fn scene_overlay(app: &TextureCraftApp, ui: &Ui, rect: Rect) -> Vec<O
 }
 
 /// Whether `point` is on the mesh's surface where the camera sees it: in the air (a copy that missed the mesh) or hidden behind the mesh, it is not
-fn on_visible_surface(app: &TextureCraftApp, rect: Rect, point: Vec3) -> bool {
+fn on_visible_surface(app: &TextureCraftApp, rect: Rect, point: Vec3, tolerance: f32) -> bool {
     let camera = &app.session.camera;
     let aspect = rect.width() / rect.height().max(1.0);
     let Some(ndc) = camera.project(point, aspect) else { return false };
 
     let ray = camera.ray(ndc.truncate(), aspect);
-    let (lo, hi) = app.session.mesh.bounds();
-    let tolerance = (hi - lo).length() * VISIBILITY_TOLERANCE;
     let distance = (point - ray.origin).dot(ray.dir);
     app.session.bvh.closest(ray.origin, ray.dir, f32::MAX).is_some_and(|hit| (hit.t - distance).abs() <= tolerance)
 }
@@ -134,6 +132,12 @@ pub(crate) fn overlay(app: &TextureCraftApp, ui: &Ui, rect: Rect, cursor: Option
     let display = app.ui.symmetry;
     let (lo, hi) = app.session.mesh.bounds();
     let origin = symmetry.origin((lo + hi) * 0.5);
+
+    // Bounds scan the mesh's vertices; every cursor copy shares these measurements
+    let diagonal = (hi - lo).length();
+    let tolerance = diagonal * VISIBILITY_TOLERANCE;
+    let brush_radius = app.session.tool.brush.size * diagonal;
+
     let painter = ui.painter_at(rect);
     let line = Stroke::new(INTERSECTION_WIDTH, color(display.color, u8::MAX));
     let project = |point: Vec3| crate::viewport::project(app, rect, point);
@@ -141,11 +145,11 @@ pub(crate) fn overlay(app: &TextureCraftApp, ui: &Ui, rect: Rect, cursor: Option
     // The planes' lines are drawn in the scene (see scene_overlay); where the radial axis enters the mesh, from either end, is drawn here
     if display.show_intersection && symmetry.radial_mode() {
         let axis = symmetry.radial_axis();
-        let reach = (hi - lo).length();
+        let reach = diagonal;
         for (start, direction) in [(origin - axis * reach, axis), (origin + axis * reach, -axis)] {
             if let Some(hit) = app.session.bvh.closest(start, direction, reach * 2.0)
                 && let point = start + direction * hit.t
-                && on_visible_surface(app, rect, point)
+                && on_visible_surface(app, rect, point, tolerance)
                 && let Some(at) = project(point)
             {
                 painter.circle_filled(at, INTERSECTION_POINT_RADIUS, line.color);
@@ -160,8 +164,8 @@ pub(crate) fn overlay(app: &TextureCraftApp, ui: &Ui, rect: Rect, cursor: Option
     {
         for map in symmetry.transforms().iter().skip(1) {
             let copy = origin + *map * (position - origin);
-            if on_visible_surface(app, rect, copy) {
-                crate::viewport::brush_cursor(app, ui, rect, copy, (*map * normal).normalize_or_zero());
+            if on_visible_surface(app, rect, copy, tolerance) {
+                crate::viewport::brush_cursor(app, ui, rect, copy, (*map * normal).normalize_or_zero(), brush_radius);
             }
         }
     }
@@ -290,6 +294,7 @@ pub(crate) fn manipulator_input(app: &mut TextureCraftApp, ui: &Ui, response: &R
         {
             ctx.set_cursor_icon(egui::CursorIcon::Move);
         }
+
         return false;
     };
 
@@ -297,8 +302,12 @@ pub(crate) fn manipulator_input(app: &mut TextureCraftApp, ui: &Ui, response: &R
         let (lo, hi) = app.session.mesh.bounds();
         let half_extent = (hi - lo) * 0.5;
         let moved = Vec3::from(drag.start_offset) + manipulator.world_delta(drag.axes, pointer - drag.from);
-        app.session.tool.brush.symmetry.offset = moved.clamp(-half_extent, half_extent).to_array();
+        let offset = moved.clamp(-half_extent, half_extent).to_array();
+        if offset != app.session.tool.brush.symmetry.offset {
+            app.run("tool.brush", serde_json::json!({"symmetryOffset": offset}));
+        }
     }
+
     ctx.data_mut(|data| data.insert_temp(drag_id(), drag));
     ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
     true

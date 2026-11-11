@@ -30,6 +30,31 @@ fn save(h: &mut Harness<'_, TextureCraftApp>, dir: &Path, name: &str) {
 
 #[test]
 #[ignore]
+fn symmetry_snapshots() {
+    let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else { return };
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let session = texturecraft_engine::sample_session(1024, 256).unwrap();
+    let mut harness =
+        Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    harness.state_mut().ui.prefs.language = "en".into();
+    harness.state_mut().run("tool.brush", serde_json::json!({"symmetryY": true, "symmetryOffset": [0, 0.1, 0]})).unwrap();
+    harness.state_mut().ui.symmetry.show_plane = true;
+    harness.state_mut().ui.symmetry.show_manipulator = true;
+    harness.run_steps(4);
+    harness.get_by_label("Symmetry settings").click();
+
+    for (brightness, name) in [(Brightness::MediumDark, "medium"), (Brightness::Dark, "dark"), (Brightness::Light, "light")] {
+        harness.state_mut().ui.prefs.brightness = brightness;
+        save(&mut harness, &output_dir, &format!("symmetry-mirror-{name}"));
+    }
+    harness.state_mut().run("tool.brush", serde_json::json!({"symmetryY": false, "symmetryRadial": 6, "symmetryAxis": "y", "symmetryAngleSpan": 240})).unwrap();
+    harness.state_mut().ui.symmetry.show_axis = true;
+    harness.state_mut().ui.prefs.brightness = Brightness::MediumDark;
+    save(&mut harness, &output_dir, "symmetry-radial");
+}
+
+#[test]
+#[ignore]
 fn window_snapshots() {
     let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else {
         eprintln!("set TC_UI_SNAPSHOTS=<dir> to write the pictures");
@@ -77,7 +102,7 @@ fn window_snapshots() {
     save(&mut harness, &output_dir, "bake-settings");
     harness.state_mut().session.add_high_poly_bytes("High Poly.obj", b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n".to_vec()).unwrap();
     save(&mut harness, &output_dir, "bake-settings-high-poly");
-    harness.get_by_label("Cage").scroll_to_me();
+    harness.get_by_role_and_label(egui::Role::ComboBox, "Cage Type").scroll_to_me();
     save(&mut harness, &output_dir, "bake-settings-cage-skew");
     harness.get_by_label("Edge Contrast").scroll_to_me();
     save(&mut harness, &output_dir, "bake-settings-skew");
@@ -129,7 +154,40 @@ fn window_snapshots() {
         texturecraft_engine::execute(session, id, &params).unwrap();
     }
     save(&mut harness, &output_dir, "properties-levels");
-
+    // Show the Layers panel thumbnails with a hidden content effect, a folder and a mask
+    let session = &mut harness.state_mut().session;
+    for (id, params) in [
+        ("effect.add.filter", serde_json::json!({"target": "content", "filter": "hsl"})),
+        ("effect.add.filter", serde_json::json!({"target": "content", "filter": "invert"})),
+        ("layer.add.paint", serde_json::Value::Null),
+        ("layer.group", serde_json::Value::Null),
+    ] {
+        texturecraft_engine::execute(session, id, &params).unwrap();
+    }
+    let hidden = harness
+        .state()
+        .session
+        .doc
+        .project
+        .layers
+        .values()
+        .flat_map(|layer| layer.content_effects.iter())
+        .find(|effect| effect.name == "Invert")
+        .map(|effect| effect.id.0);
+    if let Some(effect) = hidden {
+        texturecraft_engine::execute(&mut harness.state_mut().session, "effect.set", &serde_json::json!({"effect": effect, "visible": false})).unwrap();
+    }
+    harness.state_mut().ui.dock.focus(Panel::Layers);
+    harness.set_size(egui::vec2(1600.0, 1400.0));
+    for _ in 0..400 {
+        harness.run_steps(1);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        if !harness.state().layer_panel.service().busy() {
+            break;
+        }
+    }
+    save(&mut harness, &output_dir, "panel-layers");
+    harness.set_size(egui::vec2(1600.0, 960.0));
     // Show the second path selected in Properties
     let session = &mut harness.state_mut().session;
     for (id, params) in [
@@ -249,4 +307,93 @@ fn smart_mask_shelf_snapshot() {
     harness.run_steps(60);
     assert_eq!(harness.query_all_by_label(mask.label).count(), 2, "the popup shows the mask name");
     save(&mut harness, &output_dir, "smart-mask-hover");
+}
+
+#[test]
+#[ignore]
+fn smart_material_shelf_snapshot() {
+    use texturecraft_engine::materials::MATERIALS;
+    use texturecraft_ui_egui::shelf_preview::ShelfPreview;
+
+    let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else {
+        eprintln!("set TC_UI_SNAPSHOTS=<dir> to write the pictures");
+        return;
+    };
+
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let session =
+        texturecraft_engine::Session::new_project("Smart material previews", texturecraft_engine::geom::primitives::cube(2.0), "builtin:cube", None, 128)
+            .unwrap();
+    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|context| {
+        let render_state = context.wgpu_render_state.as_ref().expect("the snapshot uses wgpu");
+        eprintln!("snapshot adapter: {:?}", render_state.adapter.get_info());
+        TextureCraftApp::new(context, session)
+    });
+    harness.state_mut().ui.shelf_tab = 1;
+    let context = harness.ctx.clone();
+    let started = std::time::Instant::now();
+    loop {
+        harness.run_steps(1);
+        let thumbnails = &mut harness.state_mut().thumbs;
+        if MATERIALS.iter().filter(|material| material.smart).all(|material| thumbnails.material(&context, material.id).is_some()) {
+            break;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(120), "smart material thumbnails did not arrive");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    eprintln!("all smart material thumbnails ready after {:.3} s", started.elapsed().as_secs_f64());
+    save(&mut harness, &output_dir, "smart-material-shelf");
+
+    let material = MATERIALS.iter().find(|material| material.id == "steel_painted_worn").unwrap();
+    harness.get_by_role_and_label(egui::Role::Button, material.label).hover();
+    let preview = ShelfPreview::material(material.id);
+    let started = std::time::Instant::now();
+    loop {
+        harness.run_steps(1);
+        if harness.state_mut().thumbs.rendered_big(&context, &preview, 256).is_some() {
+            break;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(60), "smart material hover preview did not arrive");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    harness.run_steps(60);
+    assert_eq!(harness.query_all_by_label(material.label).count(), 2, "the popup shows the material name");
+    save(&mut harness, &output_dir, "smart-material-hover");
+}
+
+/// Compact nested rows must keep their content, mask and effect controls in the panel.
+#[test]
+#[ignore]
+fn nested_layers_snapshot() {
+    use craft_ui::docking::Node;
+    use craft_ui::layout::SplitSize;
+    use serde_json::{Value, json};
+    use texturecraft_engine::execute;
+    use texturecraft_ui_egui::docking::Dock;
+
+    let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else { return };
+    std::fs::create_dir_all(&output_dir).unwrap();
+    let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
+    execute(&mut session, "layer.add.fill", &json!({"color": "#336699"})).unwrap();
+    execute(&mut session, "mask.add.white", &Value::Null).unwrap();
+    execute(&mut session, "effect.add.filter", &json!({"target": "content", "filter": "invert"})).unwrap();
+    for _ in 0..6 {
+        execute(&mut session, "layer.group", &Value::Null).unwrap();
+    }
+    let mut harness =
+        Harness::builder().with_size(egui::vec2(1600.0, 1600.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+    harness.run_steps(4);
+    let mut workspace = harness.state().ui.dock.workspace().clone();
+    let Some(Node::Split { second, .. }) = workspace.layout.root.as_mut() else { panic!("default columns") };
+    let Node::Split { size, .. } = second.as_mut() else { panic!("viewport and right column") };
+    *size = SplitSize::Ratio(0.99);
+    harness.state_mut().ui.dock = Dock::from_value(serde_json::to_value(workspace).unwrap());
+    for _ in 0..100 {
+        harness.run_steps(1);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        if !harness.state().layer_panel.service().busy() {
+            break;
+        }
+    }
+    save(&mut harness, &output_dir, "panel-layers-narrow-nested");
 }

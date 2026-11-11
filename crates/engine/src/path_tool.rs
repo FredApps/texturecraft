@@ -452,69 +452,72 @@ impl Session {
         })
     }
 
-    /// Fill the inside of `poly` (viewport pixels over the visible surface, or texture coordinates); returns the touched tiles
-    fn lasso_fill(&mut self, poly: Vec<Vec2>, uv: bool, viewport: Vec2) -> Result<usize> {
-        let ts = self.ts();
-        let (gbuf, mut canvas) = self.fill_canvas(ts)?;
-        let w = gbuf.width.max(1);
+    /// Fill the inside of `polygon` (viewport pixels over the visible surface, or texture coordinates); returns the touched tiles
+    fn lasso_fill(&mut self, polygon: Vec<Vec2>, uv: bool, viewport: Vec2) -> Result<usize> {
+        let texture_set = self.ts();
+        let (gbuf, mut canvas) = self.fill_canvas(texture_set)?;
+        let width = gbuf.width.max(1);
 
         if uv {
-            let lasso = Lasso::new(poly.iter().map(|p| *p * Vec2::new(w as f32, gbuf.height as f32)).collect());
-            fill_coverage(&mut canvas, &gbuf, |i, _| lasso.coverage(Vec2::new((i as u32 % w) as f32 + 0.5, (i as u32 / w) as f32 + 0.5)));
+            let lasso = Lasso::new(polygon.iter().map(|point| *point * Vec2::new(width as f32, gbuf.height as f32)).collect());
+            fill_coverage(&mut canvas, &gbuf, |texel, _| lasso.coverage(Vec2::new((texel as u32 % width) as f32 + 0.5, (texel as u32 / width) as f32 + 0.5)));
         } else {
-            let lasso = Lasso::new(poly);
+            let lasso = Lasso::new(polygon);
             let view_proj = self.camera.view_proj(viewport.x.max(1.0) / viewport.y.max(1.0));
-            let inv = view_proj.inverse();
-            let (cull, mesh, bvh) = (self.tool.brush.backface_culling, &self.mesh, &self.bvh);
+            let inverse_view_proj = view_proj.inverse();
+            let (backface_culling, mesh, bvh) = (self.tool.brush.backface_culling, &self.mesh, &self.bvh);
 
             // A visible source inside the lasso can paint each symmetry copy
-            let (lo, hi) = mesh.bounds();
+            let (bounds_min, bounds_max) = mesh.bounds();
             let symmetry = self.tool.brush.sanitized().symmetry;
-            let symmetry_origin = symmetry.origin((lo + hi) * 0.5);
-            let inverses: Vec<_> = symmetry.transforms().iter().map(|m| m.inverse()).collect();
+            let symmetry_origin = symmetry.origin((bounds_min + bounds_max) * 0.5);
+            let inverses: Vec<_> = symmetry.transforms().iter().map(|transform| transform.inverse()).collect();
 
-            fill_coverage(&mut canvas, &gbuf, |i, _| {
-                let Some(s) = gbuf.surface(mesh, i) else { return 0.0 };
+            fill_coverage(&mut canvas, &gbuf, |texel, _| {
+                let Some(surface) = gbuf.surface(mesh, texel) else { return 0.0 };
                 let mut best = 0.0f32;
 
-                for m in &inverses {
-                    let pos = symmetry_origin + *m * (s.pos - symmetry_origin);
-                    let c = view_proj * pos.extend(1.0);
-                    if c.w <= MIN_PROJECTIVE_W {
+                for inverse in &inverses {
+                    let position = symmetry_origin + *inverse * (surface.pos - symmetry_origin);
+                    let clip = view_proj * position.extend(1.0);
+                    if clip.w <= MIN_PROJECTIVE_W {
                         continue;
                     }
-                    let ndc = Vec2::new(c.x, c.y) / c.w;
-                    let a = lasso.coverage(to_pixels(ndc, viewport));
-                    if a <= best {
+
+                    let ndc = Vec2::new(clip.x, clip.y) / clip.w;
+                    let coverage = lasso.coverage(to_pixels(ndc, viewport));
+                    if coverage <= best {
                         continue;
                     }
 
                     // Use the source surface normal; a copy may face away from the camera
-                    let o = inv * ndc.extend(0.0).extend(1.0);
-                    let origin = o.truncate() / o.w;
-                    let to = pos - origin;
-                    let d = to.length();
-                    let Some(dir) = to.try_normalize() else { continue };
-                    let Some(hit) =
-                        bvh.closest(origin, dir, d * (1.0 + RAY_HIT_RELATIVE_TOLERANCE)).filter(|hit| hit.t >= d * (1.0 - RAY_HIT_RELATIVE_TOLERANCE))
+                    let near_clip = inverse_view_proj * ndc.extend(0.0).extend(1.0);
+                    let origin = near_clip.truncate() / near_clip.w;
+                    let to_surface = position - origin;
+                    let distance = to_surface.length();
+                    let Some(direction) = to_surface.try_normalize() else { continue };
+                    let Some(hit) = bvh
+                        .closest(origin, direction, distance * (1.0 + RAY_HIT_RELATIVE_TOLERANCE))
+                        .filter(|hit| hit.t >= distance * (1.0 - RAY_HIT_RELATIVE_TOLERANCE))
                     else {
                         continue;
                     };
 
                     let Some(source) = surface_at(mesh, hit.tri, hit.u, hit.v) else { continue };
 
-                    if cull && source.nrm.dot(dir) >= 0.0 {
+                    if backface_culling && source.nrm.dot(direction) >= 0.0 {
                         continue;
                     }
 
-                    best = a;
+                    best = coverage;
                 }
 
                 best
             });
         }
+
         let tiles = canvas.dirty.len();
-        self.commit_fill("Path fill", ts, &canvas)?;
+        self.commit_fill("Path fill", texture_set, &canvas)?;
         Ok(tiles)
     }
 }

@@ -65,29 +65,31 @@ fn on_edge(verts: &[Vertex], (p, q): (u32, u32), k: u32, n: u32) -> Option<Verte
 
 /// Split the triangles of `indices` (index ranges `draws`: first, count, material) `level`
 /// times. Returns the vertices, indices and the draws over them.
-pub(crate) fn subdivide(verts: &[Vertex], indices: &[u32], draws: &[Draw], level: u32) -> (Vec<Vertex>, Vec<u32>, Vec<Draw>) {
-    let n = 1u32 << level.min(MAX_LEVEL);
-    let (mut out_v, mut out_i, mut out_d) = (Vec::new(), Vec::new(), Vec::new());
+pub(crate) fn subdivide(vertices: &[Vertex], indices: &[u32], draws: &[Draw], level: u32) -> (Vec<Vertex>, Vec<u32>, Vec<Draw>) {
+    let segments = 1u32 << level.min(MAX_LEVEL);
+    let (mut output_vertices, mut output_indices, mut output_draws) = (Vec::new(), Vec::new(), Vec::new());
+
     for &(start, count, material) in draws {
-        let first = out_i.len() as u32;
-        let tris = indices.get(start as usize..(start as usize).saturating_add(count as usize)).unwrap_or_default();
-        for t in tris.chunks_exact(3) {
-            let (Some(a), Some(b), Some(c)) = (verts.get(t[0] as usize), verts.get(t[1] as usize), verts.get(t[2] as usize)) else { continue };
-            let base = out_v.len() as u32;
-            // Grid point (i, j), i + j <= n, row by row: row j holds n + 1 - j points. Points on
-            // the edges are computed the same way from both triangles sharing the edge (no cracks).
-            for j in 0..=n {
-                for i in 0..=n - j {
+        let first = output_indices.len() as u32;
+        let triangles = indices.get(start as usize..(start as usize).saturating_add(count as usize)).unwrap_or_default();
+        for t in triangles.as_chunks::<3>().0 {
+            let (Some(a), Some(b), Some(c)) = (vertices.get(t[0] as usize), vertices.get(t[1] as usize), vertices.get(t[2] as usize)) else { continue };
+            let base = output_vertices.len() as u32;
+
+            // Row j holds segments + 1 - j points inside the triangle
+            // Shared edges use identical interpolation in both triangles to prevent cracks
+            for j in 0..=segments {
+                for i in 0..=segments - j {
                     let edge = match (i, j) {
                         (_, 0) => Some(((t[0], t[1]), i)),
                         (0, _) => Some(((t[0], t[2]), j)),
-                        _ if i + j == n => Some(((t[1], t[2]), j)),
+                        _ if i + j == segments => Some(((t[1], t[2]), j)),
                         _ => None,
                     };
-                    let p = match edge.and_then(|(ends, k)| on_edge(verts, ends, k, n)) {
+                    let p = match edge.and_then(|(ends, k)| on_edge(vertices, ends, k, segments)) {
                         Some(p) => p,
                         None => {
-                            let w = [1.0 - (i + j) as f32 / n as f32, i as f32 / n as f32, j as f32 / n as f32];
+                            let w = [1.0 - (i + j) as f32 / segments as f32, i as f32 / segments as f32, j as f32 / segments as f32];
                             Vertex {
                                 pos: mix(a.pos, b.pos, c.pos, w),
                                 nrm: mix(a.nrm, b.nrm, c.nrm, w),
@@ -96,39 +98,42 @@ pub(crate) fn subdivide(verts: &[Vertex], indices: &[u32], draws: &[Draw], level
                             }
                         }
                     };
-                    out_v.push(Vertex { tan: [p.tan[0], p.tan[1], p.tan[2], a.tan[3]], ..p });
+                    output_vertices.push(Vertex { tan: [p.tan[0], p.tan[1], p.tan[2], a.tan[3]], ..p });
                 }
             }
-            let at = |i: u32, j: u32| base + j * (n + 1) - j * j.saturating_sub(1) / 2 + i;
-            for j in 0..n {
-                for i in 0..n - j {
-                    out_i.extend_from_slice(&[at(i, j), at(i + 1, j), at(i, j + 1)]);
-                    if i + j + 1 < n {
-                        out_i.extend_from_slice(&[at(i + 1, j), at(i + 1, j + 1), at(i, j + 1)]);
+
+            let at = |i: u32, j: u32| base + j * (segments + 1) - j * j.saturating_sub(1) / 2 + i;
+            for j in 0..segments {
+                for i in 0..segments - j {
+                    output_indices.extend_from_slice(&[at(i, j), at(i + 1, j), at(i, j + 1)]);
+                    if i + j + 1 < segments {
+                        output_indices.extend_from_slice(&[at(i + 1, j), at(i + 1, j + 1), at(i, j + 1)]);
                     }
                 }
             }
         }
-        out_d.push((first, out_i.len() as u32 - first, material));
+        output_draws.push((first, output_indices.len() as u32 - first, material));
     }
-    (out_v, out_i, out_d)
+
+    (output_vertices, output_indices, output_draws)
 }
 
 /// World length per unit of UV over the whole mesh (the square root of their area ratio): how
 /// far a height change moves the surface for the slope height-to-normal shows.
-pub(crate) fn world_per_uv(verts: &[Vertex], indices: &[u32]) -> Option<f32> {
-    let (mut world, mut uv) = (0.0f64, 0.0f64);
-    for t in indices.chunks_exact(3) {
-        let (Some(a), Some(b), Some(c)) = (verts.get(t[0] as usize), verts.get(t[1] as usize), verts.get(t[2] as usize)) else { continue };
+pub(crate) fn world_per_uv(vertices: &[Vertex], indices: &[u32]) -> Option<f32> {
+    let (mut world_area, mut uv_area) = (0.0f64, 0.0f64);
+    for t in indices.as_chunks::<3>().0 {
+        let (Some(a), Some(b), Some(c)) = (vertices.get(t[0] as usize), vertices.get(t[1] as usize), vertices.get(t[2] as usize)) else { continue };
         let d = |p: [f32; 3], q: [f32; 3]| [f64::from(q[0] - p[0]), f64::from(q[1] - p[1]), f64::from(q[2] - p[2])];
         let (e1, e2) = (d(a.pos, b.pos), d(a.pos, c.pos));
         let cross = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
-        world += (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt() * 0.5;
+        world_area += (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt() * 0.5;
         let (u1, u2) = ([b.uv[0] - a.uv[0], b.uv[1] - a.uv[1]], [c.uv[0] - a.uv[0], c.uv[1] - a.uv[1]]);
-        uv += f64::from(u1[0] * u2[1] - u1[1] * u2[0]).abs() * 0.5;
+        uv_area += f64::from(u1[0] * u2[1] - u1[1] * u2[0]).abs() * 0.5;
     }
-    let r = (world / uv).sqrt() as f32;
-    (uv > 1e-12 && r.is_finite() && r > 0.0).then_some(r)
+
+    let scale = (world_area / uv_area).sqrt() as f32;
+    (uv_area > 1e-12 && scale.is_finite() && scale > 0.0).then_some(scale)
 }
 
 #[cfg(test)]

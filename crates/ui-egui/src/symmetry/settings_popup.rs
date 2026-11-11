@@ -26,13 +26,14 @@ const MANIPULATOR_SIZES: std::ops::RangeInclusive<f32> = 0.1..=1.0;
 /// Side of the radial copies preview beside the Count and Angle span sliders
 const PREVIEW_SIZE: f32 = 96.0;
 
-/// The popup's content, editing the brush's symmetry and the display settings in place
+/// The popup's content, applying brush changes through the engine and display preferences in place
 pub(super) fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
     ui.set_width(POPUP_WIDTH);
     let (lo, hi) = app.session.mesh.bounds();
     let half_extent = (hi - lo) * 0.5;
     let display = &mut app.ui.symmetry;
-    let symmetry = &mut app.session.tool.brush.symmetry;
+    let mut edited = app.session.tool.brush.symmetry;
+    let symmetry = &mut edited;
     let radial = symmetry.radial > 1;
     let axis = current_axis(symmetry);
 
@@ -100,6 +101,8 @@ pub(super) fn show(app: &mut TextureCraftApp, ui: &mut Ui) {
         ui.checkbox(&mut display.show_manipulator, tr("Show axis position manipulator"));
         ui.add_enabled_ui(display.show_manipulator, |ui| slider(ui, tr("Manipulator size"), &mut display.manipulator_size, MANIPULATOR_SIZES, 1));
     });
+
+    super::apply(app, edited);
 }
 
 /// A row with `label` in a fixed-width column and the control filling the rest

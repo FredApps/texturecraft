@@ -7,7 +7,9 @@ use texturecraft_geom::glam::Vec2;
 use texturecraft_paint::{Alignment, BrushAlpha, MAX_RADIAL_COPIES, alphas};
 
 use crate::commands::{CommandSpec, always, bad, boolp, channel_param, color_param, f32p, strp, vec3};
-use crate::session::{CloneFrom, CloneSource, FillMode, Tool};
+use crate::fill_hit_test::FillHitTest;
+use crate::fill_mode::FillMode;
+use crate::session::{CloneFrom, CloneSource, StackTarget, Tool};
 use crate::{Result, Session, cmd};
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -52,6 +54,15 @@ pub fn specs() -> Vec<CommandSpec> {
             material
         ),
         cmd!(
+            "tool.swapMaskValue",
+            "Invert mask value",
+            ["Tools"],
+            Some("X"),
+            "{} — mask value becomes 1 − value: switch the brush between adding to and removing from the mask",
+            paints_mask,
+            swap_mask_value
+        ),
+        cmd!(
             "tool.stencil",
             "Projection stencil",
             [],
@@ -69,7 +80,16 @@ pub fn specs() -> Vec<CommandSpec> {
             always,
             clone_source
         ),
-        cmd!("tool.fillMode", "Polygon fill mode", [], None, "{mode: triangle|uvIsland|mesh}", always, fill_mode),
+        cmd!("tool.fillMode", "Polygon fill mode", [], None, "{mode: triangle|polygon|uvIsland|mesh}", always, fill_mode),
+        cmd!(
+            "tool.fillSelection",
+            "Polygon fill selection",
+            [],
+            None,
+            "{hitTest?: intersection|containedCenter (a box selects polygons it touches, or whose center it holds), visibleOnly?: bool (3D view boxes select only what the camera sees)}",
+            always,
+            fill_selection
+        ),
         cmd!("tool.stroke", "Paint stroke", [], None, "{points: [[x,y],...] viewport pixels, viewport?: [w,h]} — paints with the current tool", always, stroke),
         cmd!(
             "tool.strokeUv",
@@ -80,16 +100,26 @@ pub fn specs() -> Vec<CommandSpec> {
             always,
             stroke_uv
         ),
-        cmd!("tool.click", "Tool click", [], None, "{x, y, viewport?: [w,h]} — polygon fill / color picker / single dab", always, click),
+        cmd!(
+            "tool.click",
+            "Tool click",
+            [],
+            None,
+            "{x, y, viewport?: [w,h]} — polygon fill / color picker / single dab; polygon fill also takes a box {x0, y0, x1, y1, viewport?}, a 2D view point {uv: [u,v]} or a 2D view box {uv0: [u,v], uv1: [u,v]}",
+            always,
+            click
+        ),
         cmd!("tool.state", "Tool state", [], None, "{}", always, |s, _| Ok(serde_json::to_value(&s.tool).unwrap_or(Value::Null))),
     ]
 }
 
-pub(crate) fn set_tool(s: &mut Session, t: Tool) -> Result<Value> {
-    s.cancel_stroke();
-    s.tool.tool = t;
-    s.revision = s.revision.wrapping_add(1);
-    Ok(json!({ "tool": t.id() }))
+pub(crate) fn set_tool(session: &mut Session, tool: Tool) -> Result<Value> {
+    session.cancel_stroke();
+    // A box fill under way keeps what it filled as one undo step
+    session.end_polygon_fill_box();
+    session.tool.tool = tool;
+    session.revision = session.revision.wrapping_add(1);
+    Ok(json!({ "tool": tool.id() }))
 }
 
 fn select(s: &mut Session, p: &Value) -> Result<Value> {
@@ -99,135 +129,158 @@ fn select(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// Brush values use the UI's 0–100 scales, so agents and the sliders speak the same numbers
-fn brush(s: &mut Session, p: &Value) -> Result<Value> {
-    let b = &mut s.tool.brush;
-    let pct = |k: &str| f32p(p, k).map(|v| v / 100.0);
-    if let Some(v) = pct("size") {
-        b.size = v * 0.25;
+fn brush(session: &mut Session, params: &Value) -> Result<Value> {
+    let mut settings = session.tool.brush.clone();
+    let percent = |key: &str| f32p(params, key).map(|value| value / 100.0);
+
+    if let Some(value) = percent("size") {
+        settings.size = value * 0.25;
     }
-    if let Some(v) = pct("minSize") {
-        b.min_size = v;
+    if let Some(value) = percent("minSize") {
+        settings.min_size = value;
     }
-    if let Some(v) = pct("flow") {
-        b.flow = v;
+
+    if let Some(value) = percent("flow") {
+        settings.flow = value;
     }
-    if let Some(v) = pct("opacity") {
-        b.opacity = v;
+    if let Some(value) = percent("opacity") {
+        settings.opacity = value;
     }
-    if let Some(v) = pct("spacing") {
-        b.spacing = v;
+    if let Some(value) = percent("spacing") {
+        settings.spacing = value;
     }
-    if let Some(v) = pct("hardness") {
-        b.hardness = v;
+    if let Some(value) = percent("hardness") {
+        settings.hardness = value;
     }
-    if let Some(v) = f32p(p, "angle") {
-        b.angle = v;
+
+    if let Some(value) = f32p(params, "angle") {
+        settings.angle = value;
     }
-    if let Some(v) = boolp(p, "followPath") {
-        b.follow_path = v;
+    if let Some(value) = boolp(params, "followPath") {
+        settings.follow_path = value;
     }
-    if let Some(a) = strp(p, "alignment") {
-        b.alignment = match a {
+    if let Some(alignment) = strp(params, "alignment") {
+        settings.alignment = match alignment {
             "camera" => Alignment::Camera,
             "tangent" | "uv" => Alignment::Tangent,
             other => return Err(bad("tool.brush", format!("unknown alignment `{other}`"))),
         };
     }
-    if let Some(v) = f32p(p, "lazy") {
-        b.lazy = v;
+
+    if let Some(value) = f32p(params, "lazy") {
+        settings.lazy = value;
     }
-    for (k, slot) in [("jitterSize", &mut b.jitter_size), ("jitterAngle", &mut b.jitter_angle), ("jitterFlow", &mut b.jitter_flow)] {
-        if let Some(v) = f32p(p, k) {
-            *slot = v / 100.0;
+
+    for (key, slot) in [("jitterSize", &mut settings.jitter_size), ("jitterAngle", &mut settings.jitter_angle), ("jitterFlow", &mut settings.jitter_flow)] {
+        if let Some(value) = f32p(params, key) {
+            *slot = value / 100.0;
         }
     }
-    if let Some(v) = f32p(p, "jitterPosition") {
-        b.jitter_position = v / 100.0;
+    if let Some(value) = f32p(params, "jitterPosition") {
+        settings.jitter_position = value / 100.0;
     }
-    let alpha = p.get("alpha");
-    if let Some(a) = strp(p, "alpha") {
-        b.alpha = BrushAlpha::parse(a).ok_or_else(|| bad("tool.brush", format!("unknown alpha `{a}`")))?;
-        (b.alpha_image, b.alpha_library) = (None, None);
-    } else if let Some(name) = alpha.and_then(|a| a.get("image")).and_then(Value::as_str) {
-        if !s.images.contains_key(name) {
+
+    let alpha = params.get("alpha");
+    if let Some(alpha_name) = strp(params, "alpha") {
+        settings.alpha = BrushAlpha::parse(alpha_name).ok_or_else(|| bad("tool.brush", format!("unknown alpha `{alpha_name}`")))?;
+        (settings.alpha_image, settings.alpha_library) = (None, None);
+    } else if let Some(name) = alpha.and_then(|alpha| alpha.get("image")).and_then(Value::as_str) {
+        if !session.images.contains_key(name) {
             return Err(bad("tool.brush", format!("no image resource `{name}` (import it first)")));
         }
-        (b.alpha_image, b.alpha_library) = (Some(name.to_string()), None);
-    } else if let Some(id) = alpha.and_then(|a| a.get("library")).and_then(Value::as_str) {
-        let a = alphas::find(id).ok_or_else(|| bad("tool.brush", format!("unknown library alpha `{id}` (see alpha.list)")))?;
+
+        (settings.alpha_image, settings.alpha_library) = (Some(name.to_string()), None);
+    } else if let Some(id) = alpha.and_then(|alpha| alpha.get("library")).and_then(Value::as_str) {
+        let alpha = alphas::find(id).ok_or_else(|| bad("tool.brush", format!("unknown library alpha `{id}` (see alpha.list)")))?;
+
         // Render it now rather than on the first stamp
-        a.image();
-        (b.alpha_image, b.alpha_library) = (None, Some(a.id.clone()));
+        alpha.image();
+        (settings.alpha_image, settings.alpha_library) = (None, Some(alpha.id.clone()));
     }
-    if let Some(v) = boolp(p, "backfaceCulling") {
-        b.backface_culling = v;
+
+    if let Some(value) = boolp(params, "backfaceCulling") {
+        settings.backface_culling = value;
     }
-    if let Some(v) = boolp(p, "symmetryOn") {
-        b.symmetry.enabled = v;
+
+    if let Some(value) = boolp(params, "symmetryOn") {
+        settings.symmetry.enabled = value;
     }
-    for (k, slot) in [("symmetryX", &mut b.symmetry.x), ("symmetryY", &mut b.symmetry.y), ("symmetryZ", &mut b.symmetry.z)] {
-        if let Some(v) = boolp(p, k) {
-            *slot = v;
+
+    for (key, slot) in [("symmetryX", &mut settings.symmetry.x), ("symmetryY", &mut settings.symmetry.y), ("symmetryZ", &mut settings.symmetry.z)] {
+        if let Some(value) = boolp(params, key) {
+            *slot = value;
         }
     }
-    if let Some(v) = f32p(p, "symmetryRadial") {
-        b.symmetry.radial = v.clamp(0.0, f32::from(MAX_RADIAL_COPIES)) as u8;
+
+    if let Some(value) = f32p(params, "symmetryRadial") {
+        settings.symmetry.radial = value.clamp(0.0, f32::from(MAX_RADIAL_COPIES)) as u8;
     }
-    if let Some(a) = strp(p, "symmetryAxis") {
-        b.symmetry.axis = match a.to_ascii_lowercase().as_str() {
+
+    if let Some(axis) = strp(params, "symmetryAxis") {
+        settings.symmetry.axis = match axis.to_ascii_lowercase().as_str() {
             "x" => 0,
             "y" => 1,
             "z" => 2,
-            _ => return Err(bad("tool.brush", format!("unknown symmetry axis `{a}` (x, y or z)"))),
+            _ => return Err(bad("tool.brush", format!("unknown symmetry axis `{axis}` (x, y or z)"))),
         };
     }
-    if let Some(v) = f32p(p, "symmetryAngleSpan") {
-        b.symmetry.angle_span = v;
+
+    if let Some(value) = f32p(params, "symmetryAngleSpan") {
+        settings.symmetry.angle_span = value;
     }
-    if p.get("symmetryOffset").is_some() {
-        b.symmetry.offset = vec3(p, "symmetryOffset").ok_or_else(|| bad("tool.brush", "`symmetryOffset` must be [x, y, z]"))?.to_array();
+
+    if params.get("symmetryOffset").is_some() {
+        settings.symmetry.offset = vec3(params, "symmetryOffset").ok_or_else(|| bad("tool.brush", "`symmetryOffset` must be [x, y, z]"))?.to_array();
     }
-    if let Some(v) = boolp(p, "screenSpace") {
-        b.screen_space = v;
+
+    if let Some(value) = boolp(params, "screenSpace") {
+        settings.screen_space = value;
     }
-    if let Some(q) = p.get("particles") {
-        let pt = &mut b.particles;
-        pt.enabled = boolp(q, "enabled").unwrap_or(pt.enabled);
-        pt.count = f32p(q, "count").map_or(pt.count, |v| v as u32);
-        pt.lifetime = f32p(q, "lifetime").map_or(pt.lifetime, |v| v as u32);
-        pt.gravity = f32p(q, "gravity").unwrap_or(pt.gravity);
+
+    if let Some(particle_params) = params.get("particles") {
+        let particles = &mut settings.particles;
+        particles.enabled = boolp(particle_params, "enabled").unwrap_or(particles.enabled);
+        particles.count = f32p(particle_params, "count").map_or(particles.count, |value| value as u32);
+        particles.lifetime = f32p(particle_params, "lifetime").map_or(particles.lifetime, |value| value as u32);
+        particles.gravity = f32p(particle_params, "gravity").unwrap_or(particles.gravity);
     }
-    *b = b.sanitized();
-    if let Some(v) = f32p(p, "smudgeStrength") {
-        s.tool.smudge_strength = (v / 100.0).clamp(0.0, 1.0);
-    }
-    if let Some(v) = strp(p, "cloneSource") {
-        s.tool.clone_from = match v {
+
+    let clone_from = if let Some(value) = strp(params, "cloneSource") {
+        match value {
             "composite" => CloneFrom::Composite,
             "layer" => CloneFrom::Layer,
             other => return Err(bad("tool.brush", format!("unknown clone source `{other}`: use composite or layer"))),
-        };
+        }
+    } else {
+        session.tool.clone_from
+    };
+
+    session.tool.brush = settings.sanitized();
+    session.tool.clone_from = clone_from;
+    if let Some(value) = f32p(params, "smudgeStrength") {
+        session.tool.smudge_strength = (value / 100.0).clamp(0.0, 1.0);
     }
-    s.revision = s.revision.wrapping_add(1);
-    Ok(brush_json(s))
+
+    session.revision = session.revision.wrapping_add(1);
+    Ok(brush_json(session))
 }
 
-pub(crate) fn brush_json(s: &Session) -> Value {
-    let b = &s.tool.brush;
+pub(crate) fn brush_json(session: &Session) -> Value {
+    let settings = &session.tool.brush;
     json!({
-        "size": b.size / 0.25 * 100.0, "minSize": b.min_size * 100.0, "flow": b.flow * 100.0, "opacity": b.opacity * 100.0,
-        "spacing": b.spacing * 100.0, "hardness": b.hardness * 100.0, "angle": b.angle, "followPath": b.follow_path,
-        "alignment": format!("{:?}", b.alignment).to_lowercase(), "lazy": b.lazy,
-        "alpha": match (&b.alpha_image, &b.alpha_library) {
+        "size": settings.size / 0.25 * 100.0, "minSize": settings.min_size * 100.0, "flow": settings.flow * 100.0, "opacity": settings.opacity * 100.0,
+        "spacing": settings.spacing * 100.0, "hardness": settings.hardness * 100.0, "angle": settings.angle, "followPath": settings.follow_path,
+        "alignment": format!("{:?}", settings.alignment).to_lowercase(), "lazy": settings.lazy,
+        "alpha": match (&settings.alpha_image, &settings.alpha_library) {
             (Some(name), _) => json!({ "image": name }),
             (None, Some(id)) => json!({ "library": id }),
-            (None, None) => json!(b.alpha.label()),
+            (None, None) => json!(settings.alpha.label()),
         },
-        "backfaceCulling": b.backface_culling, "symmetry": [b.symmetry.x, b.symmetry.y, b.symmetry.z],
-        "radialSymmetry": { "copies": b.symmetry.radial, "axis": (["x", "y", "z"].get(b.symmetry.axis as usize)) },
-        "symmetryOffset": b.symmetry.offset, "symmetryOn": b.symmetry.enabled, "symmetryAngleSpan": b.symmetry.angle_span,
-        "smudgeStrength": s.tool.smudge_strength * 100.0, "particles": b.particles,
-        "cloneSource": if s.tool.clone_from == CloneFrom::Layer { "layer" } else { "composite" },
+        "backfaceCulling": settings.backface_culling, "symmetry": [settings.symmetry.x, settings.symmetry.y, settings.symmetry.z],
+        "radialSymmetry": { "copies": settings.symmetry.radial, "axis": (["x", "y", "z"].get(settings.symmetry.axis as usize)) },
+        "symmetryOffset": settings.symmetry.offset, "symmetryOn": settings.symmetry.enabled, "symmetryAngleSpan": settings.symmetry.angle_span,
+        "smudgeStrength": session.tool.smudge_strength * 100.0, "particles": settings.particles,
+        "cloneSource": if session.tool.clone_from == CloneFrom::Layer { "layer" } else { "composite" },
     })
 }
 
@@ -260,6 +313,30 @@ fn material(s: &mut Session, p: &Value) -> Result<Value> {
         "enabled": s.tool.enabled.iter().map(|c| c.id()).collect::<Vec<_>>(),
         "maskValue": s.tool.mask_value,
     }))
+}
+
+/// Whether strokes paint the selected layer's mask: the mask itself or one of its effects
+fn paints_mask(session: &Session) -> std::result::Result<(), String> {
+    session.selected_layer().ok_or("no layer selected")?;
+
+    let project = &session.doc.project;
+    let targets_mask = match session.target {
+        StackTarget::Content => false,
+        StackTarget::Mask => true,
+        StackTarget::Effect(effect_id) => project
+            .effect(effect_id)
+            .and_then(|(owner, _)| project.layers.get(&owner))
+            .is_some_and(|owner_layer| !owner_layer.content_effects.iter().any(|effect| effect.id == effect_id)),
+    };
+
+    if targets_mask { Ok(()) } else { Err("select a mask to paint on".into()) }
+}
+
+fn swap_mask_value(session: &mut Session, _: &Value) -> Result<Value> {
+    session.tool.mask_value = 1.0 - session.tool.mask_value;
+    session.revision = session.revision.wrapping_add(1);
+
+    Ok(json!({ "maskValue": session.tool.mask_value }))
 }
 
 fn stencil(s: &mut Session, p: &Value) -> Result<Value> {
@@ -329,13 +406,29 @@ fn clone_source(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(serde_json::to_value(s.tool.clone_source).unwrap_or(Value::Null))
 }
 
-fn fill_mode(s: &mut Session, p: &Value) -> Result<Value> {
-    s.tool.fill_mode = match strp(p, "mode").unwrap_or("triangle") {
+fn fill_mode(session: &mut Session, params: &Value) -> Result<Value> {
+    session.tool.fill_mode = match strp(params, "mode").unwrap_or("triangle") {
         "triangle" => FillMode::Triangle,
+        "polygon" => FillMode::Polygon,
         "uvIsland" | "island" => FillMode::UvIsland,
         "mesh" => FillMode::Mesh,
         other => return Err(bad("tool.fillMode", format!("unknown fill mode `{other}`"))),
     };
+
+    Ok(Value::Null)
+}
+
+fn fill_selection(session: &mut Session, params: &Value) -> Result<Value> {
+    match strp(params, "hitTest") {
+        None => {}
+        Some("intersection") => session.tool.fill_hit_test = FillHitTest::Intersection,
+        Some("containedCenter") => session.tool.fill_hit_test = FillHitTest::ContainedCenter,
+        Some(other) => return Err(bad("tool.fillSelection", format!("unknown hit-test `{other}` (intersection or containedCenter)"))),
+    }
+    if let Some(visible_only) = boolp(params, "visibleOnly") {
+        session.tool.fill_visible_only = visible_only;
+    }
+
     Ok(Value::Null)
 }
 
@@ -379,20 +472,46 @@ fn stroke(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "stamps": stamps }))
 }
 
-fn click(s: &mut Session, p: &Value) -> Result<Value> {
-    let (Some(x), Some(y)) = (f32p(p, "x"), f32p(p, "y")) else { return Err(bad("tool.click", "`x` and `y` are required")) };
-    let vp = viewport_of(s, p);
-    let out = match s.tool.tool {
-        Tool::PolygonFill => json!({ "triangles": s.polygon_fill(Vec2::new(x, y), vp)? }),
+fn click(session: &mut Session, params: &Value) -> Result<Value> {
+    if session.tool.tool == Tool::PolygonFill
+        && let Some(triangles) = polygon_fill_click(session, params)?
+    {
+        session.update();
+        return Ok(json!({ "triangles": triangles }));
+    }
+
+    let (Some(x), Some(y)) = (f32p(params, "x"), f32p(params, "y")) else { return Err(bad("tool.click", "`x` and `y` are required")) };
+
+    let point = Vec2::new(x, y);
+    let viewport = viewport_of(session, params);
+    let out = match session.tool.tool {
+        Tool::PolygonFill => json!({ "triangles": session.polygon_fill(point, viewport)? }),
         Tool::ColorPicker => {
-            let v = s.color_pick(Vec2::new(x, y), vp)?;
-            json!(v.iter().map(|(c, v)| (c.id().to_string(), json!(v))).collect::<serde_json::Map<_, _>>())
+            let picked = session.color_pick(point, viewport)?;
+            json!(picked.iter().map(|(channel, value)| (channel.id().to_string(), json!(value))).collect::<serde_json::Map<_, _>>())
         }
-        Tool::GeometryMask => crate::instance_cmds::toggle_part_at(s, Vec2::new(x, y), vp)?,
-        _ => json!({ "stamps": s.stroke_points(&[Vec2::new(x, y)], vp)? }),
+        Tool::GeometryMask => crate::instance_cmds::toggle_part_at(session, point, viewport)?,
+        _ => json!({ "stamps": session.stroke_points(&[point], viewport)? }),
     };
-    s.update();
+    session.update();
     Ok(out)
+}
+
+/// The polygon fill forms of `tool.click` besides a plain `{x, y}` point: None for that point
+fn polygon_fill_click(session: &mut Session, params: &Value) -> Result<Option<usize>> {
+    let screen_box = (f32p(params, "x0"), f32p(params, "y0"), f32p(params, "x1"), f32p(params, "y1"));
+    let given = |keys: &[&str]| keys.iter().any(|key| params.get(*key).is_some());
+    let filled = match (pair(params, "uv0"), pair(params, "uv1"), pair(params, "uv"), screen_box) {
+        (Some(corner), Some(opposite), ..) => session.polygon_fill_box_uv(corner.into(), opposite.into())?,
+        _ if given(&["uv0", "uv1"]) => return Err(bad("tool.click", "a UV box needs `uv0` and `uv1` as [u, v]")),
+        (_, _, Some(uv), _) => session.polygon_fill_uv(uv.into())?,
+        _ if given(&["uv"]) => return Err(bad("tool.click", "a 2D view point needs `uv` as [u, v]")),
+        (.., (Some(x0), Some(y0), Some(x1), Some(y1))) => session.polygon_fill_box(Vec2::new(x0, y0), Vec2::new(x1, y1), viewport_of(session, params))?,
+        _ if given(&["x0", "y0", "x1", "y1"]) => return Err(bad("tool.click", "a screen box needs numbers `x0`, `y0`, `x1` and `y1`")),
+        _ => return Ok(None),
+    };
+
+    Ok(Some(filled))
 }
 
 fn stroke_uv(s: &mut Session, p: &Value) -> Result<Value> {

@@ -127,26 +127,31 @@ fn file_error(op: &str, path: &str, e: std::io::Error) -> AutomationError {
     AutomationError::Io(format!("{op} `{path}` failed: {e}"))
 }
 
-/// Engine commands that take host paths (`file.open`, `file.exportTextures`, `resource.import`,
-/// `material.save`, …) would bypass the workspace: automation clients use the workspace-scoped
-/// methods instead. Any command given a `path` or `dir` is refused, and every `file.*` command
-/// but `file.close` and `file.removeUnused` (`file.save` even without `path`: a headless session's path is
-/// workspace-relative, not a host path; `file.reimportMesh` without `path` re-reads the
-/// embedded mesh).
+/// Host keys a command reads or writes a file through, at the top level or in each `files` entry
+const HOST_PATH_KEYS: [&str; 2] = ["path", "dir"];
+
+/// Refuses engine commands that would reach host paths around the workspace roots, so clients use the workspace tools
 pub fn authorize_command(id: &str, params: &Value) -> Result<(), AutomationError> {
-    let has_path = ["path", "dir"].iter().any(|k| params.get(k).is_some_and(|v| !v.is_null()));
-    let ok = match id {
+    let has_path = names_host_path(params) || params.get("files").and_then(Value::as_array).is_some_and(|files| files.iter().any(names_host_path));
+
+    // `file.save` is refused even without a path: a headless session's path is workspace-relative, not a host path
+    let allowed = match id {
         "file.close" | "file.removeUnused" => true,
         "file.reimportMesh" => !has_path,
         _ => !id.starts_with("file.") && !has_path,
     };
-    if ok {
+    if allowed {
         Ok(())
     } else {
         Err(bad(format!(
             "`{id}` with host paths is disabled for automation; use project_open, project_save, mesh_import, resource_import, material_save, material_load or textures_export"
         )))
     }
+}
+
+/// Whether `params` names a host path or folder at its own top level
+fn names_host_path(params: &Value) -> bool {
+    HOST_PATH_KEYS.iter().any(|key| params.get(key).is_some_and(|value| !value.is_null()))
 }
 
 #[cfg(test)]
@@ -241,6 +246,18 @@ mod tests {
         assert!(authorize_command("file.reimportMesh", &json!({})).is_ok());
         assert!(authorize_command("file.close", &json!({})).is_ok());
         assert!(authorize_command("layer.add.fill", &json!({"color": "#ff0000", "path": null})).is_ok());
+    }
+
+    #[test]
+    fn nested_file_paths_are_denied() {
+        let outside_file = json!({"files": [{"path": "/etc/x_ao.png", "map": "ao"}]});
+        assert!(authorize_command("textureSet.meshMap.import", &outside_file).is_err());
+
+        let one_of_many = json!({"files": [{"map": "ao"}, {"path": "/etc/x_ao.png"}]});
+        assert!(authorize_command("textureSet.meshMap.import", &one_of_many).is_err());
+
+        let no_paths = json!({"files": [{"map": "ao"}, {"path": null}]});
+        assert!(authorize_command("textureSet.meshMap.import", &no_paths).is_ok());
     }
 
     /// Every registry command documenting a host path must be classified (fails when a new

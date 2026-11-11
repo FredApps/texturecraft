@@ -355,34 +355,35 @@ impl Default for BrushSettings {
 impl BrushSettings {
     /// Clamp every value into its valid range (input from UI, CLI or agents)
     pub fn sanitized(&self) -> BrushSettings {
-        let f = |v: f32, lo: f32, hi: f32, d: f32| if v.is_finite() { v.clamp(lo, hi) } else { d };
+        let clamp_finite = |value: f32, min: f32, max: f32, default: f32| if value.is_finite() { value.clamp(min, max) } else { default };
+
         BrushSettings {
-            size: f(self.size, 0.0005, 0.5, 0.02),
-            min_size: f(self.min_size, 0.0, 1.0, 0.05),
-            flow: f(self.flow, 0.0, 1.0, 1.0),
-            opacity: f(self.opacity, 0.0, 1.0, 1.0),
-            spacing: f(self.spacing, 0.01, 10.0, 0.1),
-            hardness: f(self.hardness, 0.0, 0.999, 0.5),
-            angle: f(self.angle, -360.0, 360.0, 0.0),
-            angle_fade: (f(self.angle_fade.0, 0.0, 90.0, 70.0), f(self.angle_fade.1, 0.0, 90.0, 85.0)),
-            lazy: f(self.lazy, 0.0, 500.0, 0.0),
-            jitter_size: f(self.jitter_size, 0.0, 1.0, 0.0),
-            jitter_angle: f(self.jitter_angle, 0.0, 1.0, 0.0),
-            jitter_flow: f(self.jitter_flow, 0.0, 1.0, 0.0),
-            jitter_position: f(self.jitter_position, 0.0, 4.0, 0.0),
-            depth: f(self.depth, 0.05, 4.0, 1.0),
+            size: clamp_finite(self.size, 0.0005, 0.5, 0.02),
+            min_size: clamp_finite(self.min_size, 0.0, 1.0, 0.05),
+            flow: clamp_finite(self.flow, 0.0, 1.0, 1.0),
+            opacity: clamp_finite(self.opacity, 0.0, 1.0, 1.0),
+            spacing: clamp_finite(self.spacing, 0.01, 10.0, 0.1),
+            hardness: clamp_finite(self.hardness, 0.0, 0.999, 0.5),
+            angle: clamp_finite(self.angle, -360.0, 360.0, 0.0),
+            angle_fade: (clamp_finite(self.angle_fade.0, 0.0, 90.0, 70.0), clamp_finite(self.angle_fade.1, 0.0, 90.0, 85.0)),
+            lazy: clamp_finite(self.lazy, 0.0, 500.0, 0.0),
+            jitter_size: clamp_finite(self.jitter_size, 0.0, 1.0, 0.0),
+            jitter_angle: clamp_finite(self.jitter_angle, 0.0, 1.0, 0.0),
+            jitter_flow: clamp_finite(self.jitter_flow, 0.0, 1.0, 0.0),
+            jitter_position: clamp_finite(self.jitter_position, 0.0, 4.0, 0.0),
+            depth: clamp_finite(self.depth, 0.05, 4.0, 1.0),
             symmetry: Symmetry {
                 radial: self.symmetry.radial.min(MAX_RADIAL_COPIES),
                 axis: self.symmetry.axis.min(LAST_AXIS),
-                offset: self.symmetry.offset.map(|v| f(v, -MAX_SYMMETRY_OFFSET, MAX_SYMMETRY_OFFSET, 0.0)),
-                angle_span: f(self.symmetry.angle_span, 0.0, FULL_TURN_DEGREES, FULL_TURN_DEGREES),
+                offset: self.symmetry.offset.map(|value| clamp_finite(value, -MAX_SYMMETRY_OFFSET, MAX_SYMMETRY_OFFSET, 0.0)),
+                angle_span: clamp_finite(self.symmetry.angle_span, 0.0, FULL_TURN_DEGREES, FULL_TURN_DEGREES),
                 ..self.symmetry
             },
             particles: Particles {
                 enabled: self.particles.enabled,
                 count: self.particles.count.clamp(1, 16),
                 lifetime: self.particles.lifetime.clamp(1, 128),
-                gravity: f(self.particles.gravity, 0.0, 2.0, 1.0),
+                gravity: clamp_finite(self.particles.gravity, 0.0, 2.0, 1.0),
             },
             ..self.clone()
         }
