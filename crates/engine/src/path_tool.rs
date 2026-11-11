@@ -532,6 +532,11 @@ impl Session {
             return None;
         }
 
+        // A click in the other view must not replace a committed path's coordinate space
+        if self.tool.path.editing.is_some() && self.path_draft.is_none() && self.tool.path.uv != uv {
+            return None;
+        }
+
         self.path_checkpoint();
         self.tool.path.push(point, uv);
         self.tool.path.selected = self.tool.path.points.len().checked_sub(1);
@@ -602,26 +607,46 @@ impl Session {
             return 0;
         }
 
-        let mut steps = document_steps;
-        let mut current = &self.tool.path;
-        if self.tool.tool == Tool::Path {
-            for state in self.path_steps.0.iter().rev() {
-                if state.same_curve(current) {
-                    continue;
-                }
+        let (point_steps, clears_path) = self.path_steps_before_document(true);
+        let cancel_draft = self.path_draft.is_some() && !clears_path;
+        document_steps.saturating_add(point_steps).saturating_add(usize::from(cancel_draft))
+    }
 
-                steps = steps.saturating_add(1);
-
-                // Restoring an empty curve cancels the draft and clears point history in the same undo
-                if state.points.is_empty() {
-                    return steps;
-                }
-
-                current = state;
-            }
+    /// Redo calls needed to move forward through document history, including pending point edits.
+    /// Unlike undo, document redo cancels any remaining draft in the same call.
+    pub fn history_redo_steps(&self, document_steps: usize) -> usize {
+        if document_steps == 0 {
+            return 0;
         }
 
-        steps.saturating_add(usize::from(self.path_draft.is_some()))
+        document_steps.saturating_add(self.path_steps_before_document(false).0)
+    }
+
+    /// Count pending point steps and whether their last step clears the path
+    fn path_steps_before_document(&self, back: bool) -> (usize, bool) {
+        if self.tool.tool != Tool::Path {
+            return (0, false);
+        }
+
+        let states = if back { &self.path_steps.0 } else { &self.path_steps.1 };
+        let mut steps = 0usize;
+        let mut current = &self.tool.path;
+        for state in states.iter().rev() {
+            if state.same_curve(current) {
+                continue;
+            }
+
+            steps = steps.saturating_add(1);
+
+            // Restoring an empty curve cancels the draft and clears point history in the same step
+            if state.points.is_empty() {
+                return (steps, true);
+            }
+
+            current = state;
+        }
+
+        (steps, false)
     }
 
     /// Undo (`back`) or redo a point change and repaint before returning; failure preserves the curve and history

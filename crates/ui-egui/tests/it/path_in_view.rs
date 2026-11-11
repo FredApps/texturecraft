@@ -145,6 +145,32 @@ fn clicking_an_applied_path_edits_it_and_dragging_a_point_changes_it() {
 }
 
 #[test]
+fn clicking_the_2d_view_preserves_a_stored_3d_path_being_edited() {
+    let mut session =
+        texturecraft_engine::Session::new_project("t", texturecraft_engine::geom::primitives::sphere(1.0, 24, 12), "builtin:test", None, 128).unwrap();
+    session.camera.yaw = 0.0;
+    session.camera.pitch = 0.0;
+    session.update();
+    let report = execute(&mut session, "tool.path", &json!({"points": [[140, 210], [260, 210]], "viewport": [400, 400], "commit": true})).unwrap();
+    execute(&mut session, "path.edit", &json!({"effect": report["committed"]["effect"], "index": 0})).unwrap();
+    let before = session.doc.clone();
+    let path = session.tool.path.clone();
+    let history = session.history_labels();
+    let mut harness = Harness::builder().with_size(egui::vec2(1600.0, 960.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+    harness.state_mut().ui.layout = ViewLayout::Split;
+    harness.run_steps(4);
+    let view_3d = harness.state().viewport_rect;
+    let view_2d_center = pos2(view_3d.right() + view_3d.width() * 0.5, view_3d.center().y);
+
+    click(&mut harness, view_2d_center);
+
+    assert_eq!(harness.state().session.tool.path, path);
+    assert_eq!(harness.state().session.doc.project, before.project);
+    assert_eq!(harness.state().session.doc.pixels.layers, before.pixels.layers);
+    assert_eq!(harness.state().session.history_labels(), history);
+}
+
+#[test]
 fn clicking_the_curve_inserts_a_point_and_backspace_removes_the_selected_one() {
     let mut h = harness();
     for at in [A, B, C] {

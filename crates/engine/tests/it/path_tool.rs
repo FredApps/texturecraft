@@ -517,6 +517,66 @@ fn preview_uses_the_commands_explicit_viewport() {
     assert_eq!(preview, path_pixels(&direct));
 }
 
+/// An opposite-view placement must preserve the stored curve, painted pixels and point redo
+#[test]
+fn stored_paths_ignore_point_placement_from_the_other_view() {
+    for uv in [false, true] {
+        let mut session = session(wall());
+        let params =
+            if uv { json!({"uvPoints": [[0.2, 0.5], [0.8, 0.5]], "commit": true}) } else { json!({"points": [[140, 210], [260, 210]], "commit": true}) };
+        let report = execute(&mut session, "tool.path", &params).unwrap();
+        execute(&mut session, "path.edit", &json!({"effect": report["committed"]["effect"], "index": 0})).unwrap();
+        let (effect, index) = session.tool.path.editing.unwrap();
+        let uv_point = Vec3::new(0.5, 0.6, 0.0);
+        let world_point = session.pick(Vec2::new(200.0, 240.0), session.viewport).unwrap().pos;
+        assert_eq!(session.append_path_point(if uv { uv_point } else { world_point }, uv), Some(2));
+        session.path_live().unwrap();
+        let extended = session.tool.path.points.clone();
+        session.undo().unwrap();
+        let before = session.doc.clone();
+        let path = session.tool.path.clone();
+        let history = session.history_labels();
+
+        let placed = session.append_path_point(if uv { world_point } else { uv_point }, !uv);
+        session.path_live().unwrap();
+
+        assert_eq!(session.paths(effect).unwrap()[index].uv, uv, "the stored path must keep its coordinate space");
+        assert_eq!(placed, None);
+        assert_eq!(session.tool.path, path);
+        assert_eq!(session.doc.project, before.project);
+        assert_eq!(session.doc.pixels.layers, before.pixels.layers);
+        assert_eq!(session.doc.pixels.masks, before.pixels.masks);
+        assert_eq!(session.history_labels(), history);
+        assert!(session.can_redo(), "ignored placement must preserve point redo");
+
+        session.redo().unwrap();
+        assert_eq!(session.tool.path.points, extended);
+    }
+}
+
+/// A new, uncommitted curve can still switch views and cancel without changing the document
+#[test]
+fn draft_paths_can_switch_to_the_other_view() {
+    for uv in [false, true] {
+        let mut session = session(wall());
+        let before = session.doc.clone();
+        let history = session.history_labels();
+        let params = if uv { json!({"uvPoints": [[0.2, 0.5], [0.8, 0.5]]}) } else { json!({"points": [[140, 210], [260, 210]]}) };
+        execute(&mut session, "tool.path", &params).unwrap();
+        let point = if uv { session.pick(Vec2::new(200.0, 240.0), session.viewport).unwrap().pos } else { Vec3::new(0.5, 0.6, 0.0) };
+
+        assert_eq!(session.append_path_point(point, !uv), Some(0));
+        session.path_live().unwrap();
+
+        assert_eq!(session.tool.path.points, vec![point]);
+        assert_eq!(session.tool.path.uv, !uv);
+        assert_eq!(session.history_labels(), history);
+        session.cancel_path();
+        assert_eq!(session.doc.project, before.project);
+        assert_eq!(session.doc.pixels.layers, before.pixels.layers);
+    }
+}
+
 /// Headless history commands must restore geometry and pixels before any frame or subsequent edit
 #[test]
 fn stored_point_edits_undo_and_redo_in_order_without_selection_steps() {

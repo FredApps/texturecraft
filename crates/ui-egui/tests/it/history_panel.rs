@@ -97,6 +97,50 @@ fn history_jump_accounts_for_stored_point_edits_without_changing_single_steps() 
     assert!(harness.state().session.tool.path.points.is_empty());
 }
 
+/// Incomplete filled curves keep point redo separate from the document redo rows
+#[test]
+fn history_redo_jump_accounts_for_point_steps_without_changing_single_steps() {
+    let mut session = texturecraft_engine::sample_session(256, 64).unwrap();
+    let layer = session.selected_layer().unwrap();
+    let report =
+        execute(&mut session, "tool.path", &json!({"uvPoints": [[0.2, 0.5], [0.5, 0.3], [0.8, 0.5]], "closed": true, "fill": true, "commit": true})).unwrap();
+    for name in ["Step A", "Step B", "Step C"] {
+        execute(&mut session, "layer.rename", &json!({"name": name})).unwrap();
+    }
+    let done = session.history_labels().len();
+    execute(&mut session, "edit.undo", &json!({"steps": 3})).unwrap();
+    execute(&mut session, "path.edit", &json!({"effect": report["committed"]["effect"], "index": 0})).unwrap();
+    let original = session.tool.path.points.clone();
+
+    // Partial filled shapes do not repaint; their undo/redo leaves document redo available
+    for points in [json!([[0.2, 0.5], [0.8, 0.5]]), json!([[0.2, 0.5]]), json!([[0.2, 0.5], [0.8, 0.5]])] {
+        session.path_checkpoint();
+        execute(&mut session, "tool.path", &json!({"uvPoints": points})).unwrap();
+    }
+    for _ in 0..3 {
+        session.undo().unwrap();
+    }
+    assert_eq!(session.redo_labels().len(), 3);
+    let mut harness = history_harness(session);
+
+    harness.get_by_label(&format!("{} Redo", egui_phosphor::regular::ARROW_CLOCKWISE)).click();
+    harness.run_steps(3);
+    assert_eq!(harness.state().session.tool.path.points.len(), 2);
+    assert_eq!(harness.state().session.history_labels().len(), done - 3);
+    harness.get_by_label(&format!("{} Undo", egui_phosphor::regular::ARROW_COUNTER_CLOCKWISE)).click();
+    harness.run_steps(3);
+    assert_eq!(harness.state().session.tool.path.points, original);
+    assert_eq!(harness.state().session.history_labels().len(), done - 3);
+
+    harness.get_all_by_label("Rename layer (undone)").last().unwrap().click();
+    harness.run_steps(3);
+
+    assert_eq!(harness.state().session.doc.project.layer(layer).unwrap().name, "Step C");
+    assert_eq!(harness.state().session.history_labels().len(), done);
+    assert!(harness.state().session.redo_labels().is_empty());
+    assert!(harness.state().session.tool.path.points.is_empty());
+}
+
 /// Returning to the current document row cancels a draft without undoing a document step
 #[test]
 fn clicking_the_current_history_row_cancels_a_draft() {
