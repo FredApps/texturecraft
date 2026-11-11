@@ -20,7 +20,7 @@ use crate::shelf::{Asset, ShelfDrag};
 use crate::state::PropsTab;
 use crate::theme::{Tokens, caption};
 use crate::toolbar::{MAX_BRUSH_SIZE, MIN_BRUSH_SIZE};
-use crate::widgets::{chip, color_swatch, combo, dnd_release, elided, histogram, icon_button, section, section_with_reset, slider, slider_edit};
+use crate::widgets::{chip, color_swatch, combo, dnd_release, elided, icon_button, section, section_with_reset, slider, slider_edit};
 
 /// The filter Add filter adds: at its defaults it changes nothing, and its slot opens the picker to swap it
 const NEW_FILTER: &str = "hsl";
@@ -2264,23 +2264,7 @@ fn effect_properties(app: &mut TextureCraftApp, ui: &mut Ui, layer: &Layer, eid:
 
     match &effect.kind {
         EffectKind::Generator(generator) => generator_properties(app, ui, id, generator),
-        EffectKind::Levels(levels) => {
-            ui.label(caption(tr("Levels")));
-            levels_histogram(app, ui, layer, eid, (levels.in_low, levels.in_high));
-            let mut values = [levels.in_low, levels.in_high, levels.gamma, levels.out_low, levels.out_high];
-            let labels = [tr("Input low"), tr("Input high"), tr("Gamma"), tr("Output low"), tr("Output high")];
-            let mut edit = None;
-            for (index, label) in labels.iter().enumerate() {
-                let range = if index == 2 { 0.1..=5.0 } else { 0.0..=1.0 };
-                edit = edit.or(slider_edit(ui, label, &mut values[index], range, 2));
-            }
-            if let Some(merge) = edit {
-                app.run(
-                    "effect.set",
-                    json!({"effect": id, "inLow": values[0], "inHigh": values[1], "gamma": values[2], "outLow": values[3], "outHigh": values[4], "merge": merge}),
-                );
-            }
-        }
+        EffectKind::Levels(levels) => crate::levels_properties::levels_properties(app, ui, layer, eid, levels),
         EffectKind::Fill { source, .. } => {
             ui.label(caption(tr("Fill")));
             let anchors = anchors_below(app, layer.id);
@@ -2445,38 +2429,6 @@ fn curvature_mode_label(mode: CurvatureMode) -> &'static str {
         CurvatureMode::Cavities => tr("Cavities"),
         CurvatureMode::Both => tr("Edges and cavities"),
         CurvatureMode::Raw => tr("Raw curvature"),
-    }
-}
-
-/// The histogram of what levels effect `eid` of `layer` remaps (its mask, or a content channel
-/// picked here), with the input range marked. Recomputed after a document change once no
-/// pointer button is held, so dragging a slider keeps the last one.
-fn levels_histogram(app: &TextureCraftApp, ui: &mut Ui, layer: &Layer, eid: LayerId, range: (f32, f32)) {
-    let mut channel = layer.channels.keys().next().copied().unwrap_or(Channel::BaseColor);
-    if layer.content_effects.iter().any(|e| e.id == eid) {
-        let pick = egui::Id::unique(("levels_channel", eid.0));
-        let chans: Vec<Channel> = layer.channels.keys().copied().filter(|c| c.kind() != texturecraft_engine::core::ChannelKind::NormalMap).collect();
-        channel = ui.data(|d| d.get_temp(pick)).filter(|c| chans.contains(c)).or(chans.first().copied()).unwrap_or(channel);
-        combo(ui, tr("Channel"), tr(channel.label()), |ui| {
-            for c in chans {
-                if ui.selectable_label(c == channel, tr(c.label())).clicked() {
-                    ui.data_mut(|d| d.insert_temp(pick, c));
-                }
-            }
-        });
-    }
-    let key = egui::Id::unique(("levels_histogram", eid.0, channel));
-    let rev = app.session.revision;
-    let counts = match ui.data(|d| d.get_temp::<(u64, std::sync::Arc<Vec<u32>>)>(key)) {
-        Some((r, h)) if r == rev || ui.input(|i| i.pointer.any_down()) => Some(h),
-        _ => app.session.effect_histogram(eid, channel, 64).map(|h| {
-            let h = std::sync::Arc::new(h);
-            ui.data_mut(|d| d.insert_temp(key, (rev, h.clone())));
-            h
-        }),
-    };
-    if let Some(counts) = counts {
-        histogram(ui, &counts, range);
     }
 }
 

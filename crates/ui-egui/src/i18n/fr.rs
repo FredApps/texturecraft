@@ -93,6 +93,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Apply", "Appliquer"),
     ("ArtCraft website...", "Site web d'ArtCraft..."),
     ("Assets", "Ressources"),
+    ("Auto", "Auto"),
     ("Automatic (from the mesh UVs)", "Automatique (d'après les UV du maillage)"),
     ("Autosave every", "Sauvegarde automatique toutes les"),
     (
@@ -349,6 +350,9 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Filters", "Filtres"),
     ("Fine noise", "Bruit fin"),
     ("Fingerprints", "Empreintes digitales"),
+    ("Enter a finite number", "Saisissez un nombre fini"),
+    ("Double-click or press Enter to edit", "Double-cliquez ou appuyez sur Entrée pour modifier"),
+    ("Fit the input range to the histogram", "Ajuster la plage d'entrée à l'histogramme"),
     ("Flatten layer", "Aplatir le calque"),
     (
         "Flips the image's green channel, for normal maps made with Y pointing down",
@@ -702,6 +706,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("Replacement color", "Couleur de remplacement"),
     ("Report a bug...", "Signaler un bug..."),
     ("Rescan the library folder", "Réanalyser le dossier de la bibliothèque"),
+    ("Reset", "Réinitialiser"),
     ("Reset UI", "Réinitialiser l'interface"),
     ("Reset all", "Tout réinitialiser"),
     ("Reset to defaults", "Rétablir les valeurs par défaut"),
