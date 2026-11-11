@@ -50,6 +50,7 @@ pub mod shelf;
 pub mod shelf_preview;
 mod soft_box;
 pub mod state;
+pub mod symmetry;
 pub mod theme;
 pub mod thumbs;
 pub mod titlebar;

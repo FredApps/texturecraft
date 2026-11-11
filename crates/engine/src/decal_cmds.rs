@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use texturecraft_core::{Channel, Decal, Effect, EffectKind, Fill, Layer, LayerId, LayerKind, Mask, MaskBackground, Projection, Source};
 use texturecraft_geom::glam::{Vec2, Vec3};
 
-use crate::commands::{CommandSpec, always, bad, channel_param, f32p, has_layer, layer_param, strp, u64p};
+use crate::commands::{CommandSpec, always, bad, channel_param, f32p, has_layer, layer_param, strp, u64p, vec3};
 use crate::tool_cmds::viewport_of;
 use crate::{Result, Session, StackTarget, cmd};
 
@@ -30,16 +30,6 @@ pub fn specs() -> Vec<CommandSpec> {
             set
         ),
     ]
-}
-
-/// A `[x, y, z]` param of finite numbers.
-fn vec3(p: &Value, key: &str) -> Option<Vec3> {
-    let a = p.get(key)?.as_array()?;
-    let v: Vec<f32> = a.iter().filter_map(Value::as_f64).map(|x| x as f32).filter(|x| x.is_finite()).collect();
-    match v.as_slice() {
-        [x, y, z] => Some(Vec3::new(*x, *y, *z)),
-        _ => None,
-    }
 }
 
 /// Resolve a viewport hit or explicit world position, using `texture_set` for explicit positions.

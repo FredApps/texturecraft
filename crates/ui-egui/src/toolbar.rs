@@ -253,14 +253,11 @@ fn tool_controls(app: &mut TextureCraftApp, ui: &mut egui::Ui, tokens: &Tokens) 
             }
 
             ui.separator();
-            if icon_button(ui, ic::FLIP_HORIZONTAL, tr("Symmetry (X)"), brush.symmetry.x, button_size).clicked() {
-                brush.symmetry.x = !brush.symmetry.x;
-            }
-            if icon_button(ui, ic::FLIP_VERTICAL, tr("Symmetry (Y)"), brush.symmetry.y, button_size).clicked() {
-                brush.symmetry.y = !brush.symmetry.y;
-            }
             if icon_button(ui, ic::CLOUD_RAIN, tr("Particle brush: particles slide down the surface"), brush.particles.enabled, button_size).clicked() {
                 brush.particles.enabled = !brush.particles.enabled;
+            }
+            if crate::symmetry::applies_to(tool) {
+                crate::symmetry::toolbar_controls(app, ui);
             }
 
             if tool == Tool::Smudge {

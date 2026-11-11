@@ -1576,30 +1576,10 @@ fn brush_section(app: &mut TextureCraftApp, ui: &mut Ui) {
         brush.particles = defaults.particles;
     }
 
-    let lazy_fields = |settings: &BrushSettings| (settings.lazy, settings.symmetry);
-    if section_with_reset(ui, "sec_lazy", tr("Lazy mouse and symmetry"), false, lazy_fields(brush) == lazy_fields(&defaults), |ui| {
+    if section_with_reset(ui, "sec_lazy", tr("Lazy mouse"), false, brush.lazy == defaults.lazy, |ui| {
         slider(ui, tr("Lazy mouse distance"), &mut brush.lazy, 0.0..=200.0, 0);
-        ui.horizontal(|ui| {
-            ui.checkbox(&mut brush.symmetry.x, tr("Mirror X"));
-            ui.checkbox(&mut brush.symmetry.y, tr("Mirror Y"));
-            ui.checkbox(&mut brush.symmetry.z, tr("Mirror Z"));
-        });
-
-        let mut copies = f32::from(brush.symmetry.radial);
-        if slider(ui, tr("Radial copies"), &mut copies, 0.0..=32.0, 0).changed() {
-            brush.symmetry.radial = copies as u8;
-        }
-
-        ui.add_enabled_ui(brush.symmetry.radial > 1, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(tr("Radial axis"));
-                for (axis_index, name) in ["X", "Y", "Z"].into_iter().enumerate() {
-                    ui.selectable_value(&mut brush.symmetry.axis, axis_index as u8, name);
-                }
-            });
-        });
     }) {
-        (brush.lazy, brush.symmetry) = lazy_fields(&defaults);
+        brush.lazy = defaults.lazy;
     }
 
     *brush = brush.sanitized();

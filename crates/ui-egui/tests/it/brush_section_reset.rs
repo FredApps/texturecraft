@@ -35,7 +35,7 @@ const SECTIONS: [(&str, &str, bool, SectionReset); 7] = [
             (defaults.alignment, defaults.backface_culling, defaults.angle_fade, defaults.depth)
     }),
     ("Particles", "Gravity", false, |brush, defaults| brush.particles = defaults.particles),
-    ("Lazy mouse and symmetry", "Lazy mouse distance", false, |brush, defaults| (brush.lazy, brush.symmetry) = (defaults.lazy, defaults.symmetry)),
+    ("Lazy mouse", "Lazy mouse distance", false, |brush, defaults| brush.lazy = defaults.lazy),
 ];
 
 /// A valid brush with every section field changed and a custom alpha that resets must preserve
@@ -60,7 +60,7 @@ fn changed_brush() -> BrushSettings {
         depth: 2.0,
         particles: Particles { enabled: true, count: 8, lifetime: 12, gravity: 0.5 },
         lazy: 50.0,
-        symmetry: Symmetry { x: true, y: true, z: true, radial: 4, axis: 2 },
+        symmetry: Symmetry { x: true, y: true, z: true, radial: 4, axis: 2, ..Symmetry::default() },
         alpha: BrushAlpha::Star,
         ..BrushSettings::default()
     }
@@ -193,7 +193,7 @@ fn narrow_headers_keep_title_clicks_separate_from_reset() {
 
     for right_to_left in [false, true] {
         for width in [120.0, 180.0, 300.0] {
-            let title = "Lazy mouse and symmetry";
+            let title = "Lazy mouse";
             let mut harness = Harness::builder().with_size(egui::vec2(width, 180.0)).with_context_setup(texturecraft_ui_egui::theme::install).build_ui_state(
                 |ui, resets| {
                     let alignment = if right_to_left { egui::Align::RIGHT } else { egui::Align::LEFT };
