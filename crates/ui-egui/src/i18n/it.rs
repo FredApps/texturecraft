@@ -1164,4 +1164,15 @@ pub const TABLE: &[(&str, &str)] = &[
         "The project changed while the dialog was open, so nothing was done",
         "Il progetto è cambiato mentre la finestra di dialogo era aperta, quindi non è stato fatto nulla",
     ),
+    ("Cores kept for the UI", "Core riservati all'interfaccia"),
+    ("Max RAM while saving", "RAM max durante il salvataggio"),
+    (
+        "Saving uses the other cores and at most this share of the free RAM. At least one core always works.",
+        "Il salvataggio usa gli altri core e al massimo questa quota della RAM libera. Almeno un core lavora sempre.",
+    ),
+    ("Max project size on open", "Dimensione massima all’apertura"),
+    (
+        "Maximum decompressed project data. Increase this limit to open larger projects.",
+        "Quantità massima di dati decompressi del progetto. Aumenta questo limite per aprire progetti più grandi.",
+    ),
 ];

@@ -1080,4 +1080,12 @@ pub const TABLE: &[(&str, &str)] = &[
     ("\"{layer}\" can't be filled: select a paint layer or a layer's mask", "“{layer}”无法填充：请选择绘画图层或图层遮罩"),
     ("The file dialog couldn't be shown: {error}", "无法显示文件对话框：{error}"),
     ("The project changed while the dialog was open, so nothing was done", "对话框打开期间项目已更改，因此未执行任何操作"),
+    ("Cores kept for the UI", "为界面保留的核心数"),
+    ("Max RAM while saving", "保存时的最大内存"),
+    (
+        "Saving uses the other cores and at most this share of the free RAM. At least one core always works.",
+        "保存使用其余核心,并最多占用这一比例的可用内存。至少始终有一个核心工作。",
+    ),
+    ("Max project size on open", "打开项目的大小上限"),
+    ("Maximum decompressed project data. Increase this limit to open larger projects.", "解压后项目数据的大小上限。提高此限制以打开更大的项目。"),
 ];

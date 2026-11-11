@@ -1152,4 +1152,15 @@ pub const TABLE: &[(&str, &str)] = &[
     ),
     ("The file dialog couldn't be shown: {error}", "Não foi possível mostrar a caixa de diálogo de arquivos: {error}"),
     ("The project changed while the dialog was open, so nothing was done", "O projeto mudou enquanto a caixa de diálogo estava aberta, então nada foi feito"),
+    ("Cores kept for the UI", "Núcleos reservados para a interface"),
+    ("Max RAM while saving", "RAM máx. ao salvar"),
+    (
+        "Saving uses the other cores and at most this share of the free RAM. At least one core always works.",
+        "Salvar usa os outros núcleos e no máximo esta parte da RAM livre. Pelo menos um núcleo sempre trabalha.",
+    ),
+    ("Max project size on open", "Tamanho máximo ao abrir"),
+    (
+        "Maximum decompressed project data. Increase this limit to open larger projects.",
+        "Limite de dados descompactados do projeto. Aumente este limite para abrir projetos maiores.",
+    ),
 ];

@@ -1134,4 +1134,15 @@ pub const TABLE: &[(&str, &str)] = &[
     ("\"{layer}\" can't be filled: select a paint layer or a layer's mask", "\"{layer}\"은(는) 채울 수 없습니다: 페인트 레이어나 레이어 마스크를 선택하세요"),
     ("The file dialog couldn't be shown: {error}", "파일 대화 상자를 표시할 수 없습니다: {error}"),
     ("The project changed while the dialog was open, so nothing was done", "대화 상자가 열려 있는 동안 프로젝트가 변경되어 아무 작업도 수행하지 않았습니다"),
+    ("Cores kept for the UI", "UI용으로 남겨 둘 코어"),
+    ("Max RAM while saving", "저장 시 최대 RAM"),
+    (
+        "Saving uses the other cores and at most this share of the free RAM. At least one core always works.",
+        "저장은 나머지 코어와 여유 RAM의 이 비율까지만 사용합니다. 최소 한 개의 코어는 항상 작동합니다.",
+    ),
+    ("Max project size on open", "열기 시 최대 프로젝트 크기"),
+    (
+        "Maximum decompressed project data. Increase this limit to open larger projects.",
+        "압축 해제된 프로젝트 데이터의 최대 크기입니다. 더 큰 프로젝트를 열려면 이 한도를 높이세요.",
+    ),
 ];
