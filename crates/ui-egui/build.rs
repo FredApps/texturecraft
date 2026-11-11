@@ -4,6 +4,8 @@
 //! recipe follows craft-fonts' `docs/integration.md`; no font file is committed here. The Latin
 //! faces are embedded without their Private Use Area ([`without_private_use`]).
 
+mod i18n_build;
+
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
@@ -23,6 +25,7 @@ const LATIN: Faces = &[("Inter", "Regular"), ("Inter", "SemiBold")];
 type Faces = &'static [(&'static str, &'static str)];
 
 fn main() {
+    i18n_build::embed();
     println!("cargo::rerun-if-env-changed=CRAFT_FONTS_DIR");
     println!("cargo::rerun-if-env-changed=CRAFT_FONTS_REQUIRED");
     let mut src = String::from("pub static CRAFT_FONTS: &[CraftFont] = &[\n");

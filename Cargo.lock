@@ -4443,6 +4443,7 @@ version = "0.3.1"
 dependencies = [
  "base64 0.22.1",
  "craft-dialogs",
+ "craft-i18n",
  "craft-keymap",
  "craft-quit",
  "craft-ui",

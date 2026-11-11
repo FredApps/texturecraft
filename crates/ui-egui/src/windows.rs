@@ -611,7 +611,7 @@ fn settings(app: &mut TextureCraftApp, ctx: &egui::Context) {
             ui.label(tr("Language"));
             let current = crate::i18n::current();
             egui::ComboBox::from_id_salt("language").width(180.0).height(320.0).selected_text(current.name).show_ui(ui, |ui| {
-                for (l, ok) in LANGUAGES.iter().zip(drawable) {
+                for (l, ok) in LANGUAGES.iter().zip(drawable).filter(|(l, _)| crate::i18n::available(l.code)) {
                     let item = egui::Button::selectable(l.code == current.code, if ok { l.name } else { l.english });
                     if ui.add_enabled(ok, item).on_disabled_hover_text(tr("No font on this system can show this language")).clicked() {
                         p.language = l.code.to_owned();
@@ -1303,6 +1303,8 @@ mod tests {
     fn harness() -> Harness<'static, TextureCraftApp> {
         let session = texturecraft_engine::sample_session(256, 64).unwrap();
         let mut h = Harness::builder().with_size(vec2(1600.0, 960.0)).build_eframe(|cc| TextureCraftApp::new(cc, session));
+        // These dialog tests query English labels, independently of the system locale.
+        h.state_mut().ui.prefs.language = "en".into();
         h.run_steps(2);
         h
     }

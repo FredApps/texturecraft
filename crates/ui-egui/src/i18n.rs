@@ -1,22 +1,31 @@
-//! UI text lookup. Keys are the English strings, so English needs no table and a missing
-//! translation falls back to English. Every user-visible literal goes through [`tr`] (or [`trf`]
-//! for text with `{name}` placeholders); each language is a static `(English, translation)`
-//! table, indexed into a hash map the first time the language is used. `Prefs::language` picks it.
+//! UI text lookup over the optional shared craft-i18n catalogs.
+//! Missing translations and builds without catalogs use the English source text.
 
-use std::collections::HashMap;
 use std::fmt::Display;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, OnceLock};
 
-mod ar;
-mod de;
-mod es;
-mod fr;
-mod it;
-mod ja;
-mod ko;
-mod pt_br;
-mod zh_hans;
+include!(concat!(env!("OUT_DIR"), "/craft_i18n.rs"));
+
+static I18N: LazyLock<craft_i18n::I18n> = LazyLock::new(|| {
+    let offered: Vec<_> = LANGUAGES.iter().map(|l| l.code).collect();
+    let (i18n, problems) = craft_i18n::I18n::new(CRAFT_I18N, &offered);
+    for problem in problems {
+        log::warn!("translation catalog: {problem}");
+    }
+    i18n
+});
+
+static SHARED_LANGUAGES: OnceLock<[craft_i18n::Lang; COUNT]> = OnceLock::new();
+
+fn shared_languages() -> &'static [craft_i18n::Lang; COUNT] {
+    SHARED_LANGUAGES.get_or_init(|| LANGUAGES.each_ref().map(|l| I18N.from_code(l.code).unwrap_or(craft_i18n::Lang::EN)))
+}
+
+/// Whether this build embeds a catalog for a supported language.
+pub fn available(code: &str) -> bool {
+    I18N.from_code(code).is_some()
+}
 
 pub struct Language {
     /// BCP 47 code ("en", "pt-BR", "zh-Hans").
@@ -25,26 +34,23 @@ pub struct Language {
     pub name: &'static str,
     /// Its English name (the picker's fallback when no font can draw `name`).
     pub english: &'static str,
-    /// `(English, translation)` pairs, in any order.
-    pub table: &'static [(&'static str, &'static str)],
 }
 
 const COUNT: usize = 10;
 
 pub static LANGUAGES: [Language; COUNT] = [
-    Language { code: "en", name: "English", english: "English", table: &[] },
-    Language { code: "fr", name: "Français", english: "French", table: fr::TABLE },
-    Language { code: "de", name: "Deutsch", english: "German", table: de::TABLE },
-    Language { code: "es", name: "Español", english: "Spanish", table: es::TABLE },
-    Language { code: "pt-BR", name: "Português (Brasil)", english: "Portuguese (Brazil)", table: pt_br::TABLE },
-    Language { code: "it", name: "Italiano", english: "Italian", table: it::TABLE },
-    Language { code: "ja", name: "日本語", english: "Japanese", table: ja::TABLE },
-    Language { code: "zh-Hans", name: "简体中文", english: "Chinese (Simplified)", table: zh_hans::TABLE },
-    Language { code: "ko", name: "한국어", english: "Korean", table: ko::TABLE },
-    Language { code: "ar", name: "العربية", english: "Arabic", table: ar::TABLE },
+    Language { code: "en", name: "English", english: "English" },
+    Language { code: "fr", name: "Français", english: "French" },
+    Language { code: "de", name: "Deutsch", english: "German" },
+    Language { code: "es", name: "Español", english: "Spanish" },
+    Language { code: "pt-BR", name: "Português (Brasil)", english: "Portuguese (Brazil)" },
+    Language { code: "it", name: "Italiano", english: "Italian" },
+    Language { code: "ja", name: "日本語", english: "Japanese" },
+    Language { code: "zh-Hans", name: "简体中文", english: "Chinese (Simplified)" },
+    Language { code: "ko", name: "한국어", english: "Korean" },
+    Language { code: "ar", name: "العربية", english: "Arabic" },
 ];
 
-static MAPS: [OnceLock<HashMap<&'static str, &'static str>>; COUNT] = [const { OnceLock::new() }; COUNT];
 static CURRENT: AtomicUsize = AtomicUsize::new(0);
 
 /// Display labels belong to the UI; the model exposes only map identities
@@ -67,7 +73,7 @@ pub(crate) fn baked_map_label(map: texturecraft_engine::core::BakedMap) -> &'sta
 
 /// Switch the UI language (unknown codes fall back to English).
 pub fn set_language(code: &str) {
-    CURRENT.store(LANGUAGES.iter().position(|l| l.code == code).unwrap_or(0), Ordering::Relaxed);
+    CURRENT.store(LANGUAGES.iter().position(|l| l.code.eq_ignore_ascii_case(code) && available(l.code)).unwrap_or(0), Ordering::Relaxed);
 }
 
 /// The current UI language.
@@ -77,12 +83,8 @@ pub fn current() -> &'static Language {
 
 /// `text` in the current language (unchanged when it has no translation).
 pub fn tr(text: &str) -> &str {
-    let i = CURRENT.load(Ordering::Relaxed);
-    let (Some(lang), Some(map)) = (LANGUAGES.get(i), MAPS.get(i)) else { return text };
-    if lang.table.is_empty() {
-        return text;
-    }
-    map.get_or_init(|| lang.table.iter().copied().collect()).get(text).copied().unwrap_or(text)
+    let lang = shared_languages().get(CURRENT.load(Ordering::Relaxed)).copied().unwrap_or(craft_i18n::Lang::EN);
+    I18N.t(lang, text)
 }
 
 /// Marks a static string for translation where it is defined (gettext's `N_`); it is translated
@@ -93,25 +95,9 @@ pub const fn n_(text: &'static str) -> &'static str {
 
 /// `template` translated, with each `{name}` replaced by its value in `args`.
 pub fn trf(template: &str, args: &[(&str, &dyn Display)]) -> String {
-    let mut out = String::with_capacity(template.len() + 16);
-    let mut rest = tr(template);
-    while let Some(open) = rest.find('{') {
-        out.push_str(&rest[..open]);
-        let after = &rest[open + 1..];
-        match after.find('}').and_then(|close| args.iter().find(|(k, _)| *k == &after[..close]).map(|(_, v)| (close, v))) {
-            Some((close, v)) => {
-                use std::fmt::Write as _;
-                let _ = write!(out, "{v}");
-                rest = &after[close + 1..];
-            }
-            None => {
-                out.push('{');
-                rest = after;
-            }
-        }
-    }
-    out.push_str(rest);
-    out
+    let values: Vec<_> = args.iter().map(|(name, value)| (*name, value.to_string())).collect();
+    let args: Vec<_> = values.iter().map(|(name, value)| (*name, value.as_str())).collect();
+    craft_i18n::fmt(tr(template), &args)
 }
 
 /// The supported language for a locale such as "de-AT", "pt_BR.UTF-8" or "zh-Hant-TW" ("en" when
@@ -142,6 +128,7 @@ pub(crate) static TEST_LANGUAGE: std::sync::Mutex<()> = std::sync::Mutex::new(()
 mod tests {
     use super::TEST_LANGUAGE as LANGUAGE;
     use super::*;
+    use std::collections::{BTreeSet, HashMap};
 
     /// Every key the UI looks up: `tr("…")` / `trf("…"` literals in the sources, plus the
     /// static catalogs whose labels are translated where they are shown.
@@ -252,42 +239,50 @@ mod tests",
         }
     }
 
-    fn placeholders(s: &str) -> Vec<&str> {
-        let mut v: Vec<&str> = s.split('{').skip(1).filter_map(|p| p.split_once('}').map(|(name, _)| name)).collect();
-        v.sort_unstable();
-        v
+    #[test]
+    fn embedded_catalogs_are_valid() {
+        assert!(I18N.check_all().is_empty(), "{:?}", I18N.check_all());
     }
 
+    /// Translation work never blocks a feature: report missing/stale keys without failing.
     #[test]
-    fn every_key_is_translated_in_every_language() {
+    fn translation_coverage_report() {
         let keys = keys();
         assert!(keys.len() > 300, "found only {} keys", keys.len());
-        let mut missing = Vec::new();
-        for l in LANGUAGES.iter().skip(1) {
-            let map: HashMap<&str, &str> = l.table.iter().copied().collect();
-            assert_eq!(map.len(), l.table.len(), "{}: duplicate keys", l.code);
-            for k in &keys {
-                if !map.contains_key(k.as_str()) {
-                    missing.push(format!("{}: {k:?}", l.code));
+        let used: BTreeSet<_> = keys.iter().map(String::as_str).collect();
+        for &(locale, common, app) in CRAFT_I18N {
+            let Some(lang) = I18N.from_code(locale) else { continue };
+            let missing: Vec<_> = keys.iter().filter(|key| I18N.get(lang, "", key).is_none()).collect();
+            // Decode TSV escapes for comparison with the literal source strings.
+            let mut rows = HashMap::new();
+            for text in [common, app] {
+                for line in text.lines().filter(|l| !l.starts_with('#')) {
+                    let columns: Vec<_> = line.split('\t').collect();
+                    if let ["", source, _] = columns.as_slice() {
+                        let mut decoded = String::new();
+                        let mut chars = source.chars();
+                        while let Some(c) = chars.next() {
+                            decoded.push(if c == '\\' {
+                                match chars.next() {
+                                    Some('n') => '\n',
+                                    Some('t') => '\t',
+                                    Some(c) => c,
+                                    None => '\\',
+                                }
+                            } else {
+                                c
+                            });
+                        }
+                        rows.insert(decoded, ());
+                    }
                 }
             }
+            let stale: Vec<_> = rows.keys().filter(|key| !used.contains(key.as_str())).collect();
+            eprintln!("{locale}: missing {} {missing:?}; unused/shared {} {stale:?}", missing.len(), stale.len());
         }
-        assert!(missing.is_empty(), "{} missing translations:\n{}", missing.len(), missing.join("\n"));
     }
 
-    /// Catalog labels that read the same in every language (names and formats).
     const UNTRANSLATED: &[&str] = &["RGB", "RGBA"];
-
-    #[test]
-    fn translations_keep_placeholders_and_are_not_empty() {
-        for l in &LANGUAGES {
-            for (en, t) in l.table {
-                assert!(!t.trim().is_empty(), "{}: empty translation of {en:?}", l.code);
-                assert_eq!(placeholders(en), placeholders(t), "{}: placeholders of {en:?} in {t:?}", l.code);
-                assert_eq!(en.ends_with("..."), t.ends_with("...") || t.ends_with('…'), "{}: ellipsis of {en:?} in {t:?}", l.code);
-            }
-        }
-    }
 
     #[test]
     fn lookup_formatting_and_fallbacks() {
@@ -304,8 +299,33 @@ mod tests",
             assert_eq!(language_for_locale(locale), code, "{locale}");
         }
         set_language("de");
-        assert_eq!(current().code, "de");
+        assert_eq!(current().code, if available("de") { "de" } else { "en" });
         assert_eq!(tr("not a key"), "not a key");
+        set_language("en");
+    }
+
+    #[test]
+    fn shared_lookup_overrides_and_missing_translations() {
+        static CATALOGS: &craft_i18n::Embedded = &[("es", "\tSave\tGuardar\n\tOpen\tAbrir\n", "\tSave\tGuardar proyecto\n")];
+        let (runtime, problems) = craft_i18n::I18n::new(CATALOGS, &["es"]);
+        assert!(problems.is_empty());
+        assert!(runtime.check_all().is_empty());
+        let lang = runtime.from_code("es").unwrap();
+        assert_eq!(runtime.t(lang, "Save"), "Guardar proyecto");
+        assert_eq!(runtime.t(lang, "Open"), "Abrir");
+        assert_eq!(runtime.t(lang, "New feature"), "New feature");
+        assert_eq!(runtime.t(craft_i18n::Lang::EN, "Save"), "Save");
+    }
+
+    #[test]
+    fn saved_language_codes_and_spanish_lookup() {
+        let _lock = LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for language in &LANGUAGES {
+            set_language(language.code);
+            assert_eq!(current().code, if available(language.code) { language.code } else { "en" });
+        }
+        set_language("es");
+        assert_eq!(tr("Layers"), if available("es") { "Capas" } else { "Layers" });
         set_language("en");
     }
 

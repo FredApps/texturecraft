@@ -65,6 +65,8 @@ getrandom = "0.3"
 rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
 # Shared Craft egui components (widget palette, icon buttons, panel docking): storytold/craft-libs,
 # MIT OR Apache-2.0, pinned to one rev.
+# Shared catalog lookup, pinned with the other Craft libraries.
+craft-i18n = { git = "https://github.com/storytold/craft-libs", rev = "1b34eba41e62138fc2438d2734523b302840b45d" }
 craft-ui = { git = "https://github.com/storytold/craft-libs", rev = "1b34eba41e62138fc2438d2734523b302840b45d", features = ["serde"] }
 # Who draws the window frame, and the app-drawn strip as the title bar (crates/ui-egui/src/titlebar.rs).
 craft-window = { git = "https://github.com/storytold/craft-libs", rev = "1b34eba41e62138fc2438d2734523b302840b45d", features = ["egui"] }
