@@ -141,7 +141,7 @@ fn add_mask(s: &mut Session, p: &Value, bg: MaskBackground) -> Result<Value> {
 }
 
 fn add_color_mask(s: &mut Session, p: &Value) -> Result<Value> {
-    let color = color_param(p, "color").unwrap_or([1.0, 0.0, 0.0]);
+    let color = color_param("mask.add.colorSelection", p, "color")?.unwrap_or([1.0, 0.0, 0.0]);
     let tolerance = f32p(p, "tolerance").unwrap_or(0.1).clamp(0.0, 1.0);
     with_mask(s, p, "mask.add.colorSelection", "Add mask with color selection", |s, id| {
         let eid = s.doc.project.alloc_id();
@@ -285,7 +285,7 @@ fn add_fill(s: &mut Session, p: &Value) -> Result<Value> {
     let blend = blend_param("effect.add.fill", p, "blend")?.unwrap_or(BlendMode::Normal);
     let id = layer_param(s, "effect.add.fill", p)?;
     if content_target(p, "effect.add.fill")? {
-        let mut fill = crate::layer_cmds::fill_from(p);
+        let mut fill = crate::layer_cmds::fill_from("effect.add.fill", p)?;
         if fill.sources.is_empty() {
             fill.sources = s.doc.project.layer(id)?.channels.keys().map(|c| (*c, Source::uniform_of(*c))).collect();
         }
@@ -337,7 +337,7 @@ fn generator_from(command: &str, params: &Value, generator: &mut Generator) -> R
     if let Some(invert) = boolp(params, "invert") {
         generator.invert = invert;
     }
-    if let Some(direction) = color_param(params, "direction") {
+    if let Some(direction) = color_param(command, params, "direction")? {
         generator.direction = direction;
     }
 

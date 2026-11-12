@@ -71,9 +71,9 @@ fn add_paint(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// A uniform fill from the `color`, `roughness`, `metallic`, `height` and `opacity` params.
-pub(crate) fn fill_from(p: &Value) -> Fill {
+pub(crate) fn fill_from(cmd: &str, p: &Value) -> Result<Fill> {
     let mut fill = Fill::default();
-    if let Some(c) = color_param(p, "color") {
+    if let Some(c) = color_param(cmd, p, "color")? {
         fill.sources.insert(Channel::BaseColor, Source::Uniform(c));
     }
     for (key, ch) in [("roughness", Channel::Roughness), ("metallic", Channel::Metallic), ("height", Channel::Height), ("opacity", Channel::Opacity)] {
@@ -81,13 +81,13 @@ pub(crate) fn fill_from(p: &Value) -> Fill {
             fill.sources.insert(ch, Source::Uniform([v; 3]));
         }
     }
-    fill
+    Ok(fill)
 }
 
 fn add_fill(s: &mut Session, p: &Value) -> Result<Value> {
     let ts = s.ts();
     let name = strp(p, "name").map(str::to_string).unwrap_or_else(|| s.doc.project.next_layer_name(ts, "Fill layer"));
-    let fill = fill_from(p);
+    let fill = fill_from("layer.add.fill", p)?;
     let id = s.edit("Add fill layer", |s| {
         let id = s.doc.project.alloc_id();
         insert_selected(s, Layer::new(id, name, LayerKind::Fill(fill), &channels_of(s)))
@@ -316,6 +316,10 @@ fn fill_set(s: &mut Session, p: &Value) -> Result<Value> {
     let solo = boolp(p, "solo") == Some(true);
     let enabled = if solo { Some(true) } else { boolp(p, "enabled") };
     let normal_format = normal_format_param("layer.fill.set", p)?;
+    let low = color_param("layer.fill.set", p, "low")?.unwrap_or([0.0; 3]);
+    let high = color_param("layer.fill.set", p, "high")?.unwrap_or([1.0; 3]);
+    let color = color_param("layer.fill.set", p, "color")?;
+    let value = color_param("layer.fill.set", p, "value")?;
     let source = if let Some(kind) = strp(p, "procedural") {
         let kind = ProceduralKind::parse(kind).ok_or_else(|| bad("layer.fill.set", format!("unknown procedural `{kind}`")))?;
         let mut pr = Procedural::new(kind);
@@ -332,8 +336,8 @@ fn fill_set(s: &mut Session, p: &Value) -> Result<Value> {
             pr.balance = v.clamp(-1.0, 1.0);
         }
         pr.invert = boolp(p, "invert").unwrap_or(false);
-        Some(Source::Procedural { pattern: pr, low: color_param(p, "low").unwrap_or([0.0; 3]), high: color_param(p, "high").unwrap_or([1.0; 3]) })
-    } else if let Some(c) = color_param(p, "color").or_else(|| color_param(p, "value")) {
+        Some(Source::Procedural { pattern: pr, low, high })
+    } else if let Some(c) = color.or(value) {
         Some(Source::Uniform(c))
     } else if let Some(name) = strp(p, "image") {
         Some(Source::Image { name: name.to_string(), normal_format: normal_format.unwrap_or_default() })

@@ -195,16 +195,26 @@ pub(crate) fn blend_param(cmd: &str, p: &Value, key: &str) -> Result<Option<Blen
 }
 
 /// A color: `[r, g, b]` (linear 0..1) or `"#rrggbb"` (sRGB hex, converted to linear).
-pub(crate) fn color_param(p: &Value, key: &str) -> Option<[f32; 3]> {
-    color_of(p.get(key)?)
+pub(crate) fn color_param(cmd: &str, p: &Value, key: &str) -> Result<Option<[f32; 3]>> {
+    match p.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => color_of(v).map(Some).ok_or_else(|| bad(cmd, format!("`{key}` must be a color ([r, g, b] linear or \"#rrggbb\")"))),
+    }
 }
 
 /// A color value (see [`color_param`]).
 pub(crate) fn color_of(v: &Value) -> Option<[f32; 3]> {
     match v {
         Value::Array(a) if a.len() >= 3 => {
-            let v: Vec<f32> = a.iter().take(3).map(|x| x.as_f64().unwrap_or(0.0) as f32).collect();
-            if v.iter().all(|x| x.is_finite()) { Some([v[0], v[1], v[2]]) } else { None }
+            let mut out = [0.0f32; 3];
+            for (i, x) in a.iter().take(3).enumerate() {
+                let f = x.as_f64()? as f32;
+                if !f.is_finite() {
+                    return None;
+                }
+                out[i] = f;
+            }
+            Some(out)
         }
         Value::Number(n) => n.as_f64().map(|v| [v as f32; 3]).filter(|v| v[0].is_finite()),
         Value::String(s) => {
@@ -216,5 +226,53 @@ pub(crate) fn color_of(v: &Value) -> Option<[f32; 3]> {
             Some([c(0)?, c(2)?, c(4)?])
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn color_param_accepts_valid_forms() {
+        let p = json!({
+            "hex": "#336699",
+            "hex_plain": "336699",
+            "rgb": [0.2, 0.4, 0.6],
+            "grey": 0.5,
+        });
+        assert!(color_param("cmd", &p, "hex").unwrap().is_some());
+        assert!(color_param("cmd", &p, "hex_plain").unwrap().is_some());
+        assert_eq!(color_param("cmd", &p, "rgb").unwrap(), Some([0.2, 0.4, 0.6]));
+        assert_eq!(color_param("cmd", &p, "grey").unwrap(), Some([0.5, 0.5, 0.5]));
+        assert_eq!(color_param("cmd", &p, "missing").unwrap(), None);
+        assert_eq!(color_param("cmd", &json!({"c": null}), "c").unwrap(), None);
+    }
+
+    #[test]
+    fn color_param_rejects_invalid_forms() {
+        let bad_cases = [
+            ("#fff", "`color` must be a color ([r, g, b] linear or \"#rrggbb\")"),
+            ("red", "`color` must be a color ([r, g, b] linear or \"#rrggbb\")"),
+            ("#12345", "`color` must be a color ([r, g, b] linear or \"#rrggbb\")"),
+            ("#gggggg", "`color` must be a color ([r, g, b] linear or \"#rrggbb\")"),
+        ];
+        for (input, expected_err) in bad_cases {
+            let p = json!({ "color": input });
+            let err = color_param("test.cmd", &p, "color").unwrap_err();
+            assert_eq!(err.to_string(), format!("`test.cmd`: {expected_err}"));
+        }
+
+        let bad_array = json!({ "color": ["a", "b", "c"] });
+        assert!(color_param("test.cmd", &bad_array, "color").is_err());
+
+        let short_array = json!({ "color": [0.5, 0.5] });
+        assert!(color_param("test.cmd", &short_array, "color").is_err());
+
+        let overflow_array = json!({ "color": [1e40, 0.0, 0.0] });
+        assert!(color_param("test.cmd", &overflow_array, "color").is_err());
+
+        let overflow_scalar = json!({ "color": 1e40 });
+        assert!(color_param("test.cmd", &overflow_scalar, "color").is_err());
     }
 }

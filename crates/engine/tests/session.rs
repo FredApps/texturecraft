@@ -524,3 +524,52 @@ fn curvature_generators_take_a_mode_and_detail_sizes() {
     assert!(dirt.is_err(), "only curvature generators have a mode");
     assert_eq!(execute(&mut state, "project.inspect", &Value::Null).unwrap().to_string(), inspect, "failed commands leave the project unchanged");
 }
+
+#[test]
+fn unparseable_color_param_returns_error() {
+    let mut s = session();
+    let err = execute(&mut s, "layer.add.fill", &json!({"color": "#fff"})).unwrap_err();
+    assert_eq!(err.to_string(), "`layer.add.fill`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+
+    let err = execute(&mut s, "layer.fill.set", &json!({"channel": "baseColor", "color": "#123"})).unwrap_err();
+    assert_eq!(err.to_string(), "`layer.fill.set`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+
+    let err = execute(&mut s, "tool.material", &json!({"channel": "baseColor", "color": "invalid"})).unwrap_err();
+    assert_eq!(err.to_string(), "`tool.material`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+
+    let err = execute(&mut s, "mask.add.colorSelection", &json!({"color": "#xyz"})).unwrap_err();
+    assert_eq!(err.to_string(), "`mask.add.colorSelection`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+
+    let err = execute(&mut s, "display.set", &json!({"scatterColor": "#12345"})).unwrap_err();
+    assert_eq!(err.to_string(), "`display.set`: `scatterColor` must be a color ([r, g, b] linear or \"#rrggbb\")");
+
+    let rev_before = s.revision;
+    let exposure_before = s.doc.project.display.env_exposure;
+    let err = execute(&mut s, "display.set", &json!({"exposure": 2.0, "scatterColor": "invalid"})).unwrap_err();
+    assert_eq!(err.to_string(), "`display.set`: `scatterColor` must be a color ([r, g, b] linear or \"#rrggbb\")");
+    assert_eq!(s.doc.project.display.env_exposure, exposure_before);
+    assert_eq!(s.revision, rev_before);
+
+    let mask_before = s.tool.mask_value;
+    let err = execute(&mut s, "tool.material", &json!({"maskValue": 0.25, "channel": "baseColor", "color": "invalid"})).unwrap_err();
+    assert_eq!(err.to_string(), "`tool.material`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+    assert_eq!(s.tool.mask_value, mask_before);
+    assert_eq!(s.revision, rev_before);
+
+    let err = execute(&mut s, "tool.material", &json!({"color": "invalid"})).unwrap_err();
+    assert_eq!(err.to_string(), "`tool.material`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+    assert_eq!(s.revision, rev_before);
+
+    let err = execute(&mut s, "layer.add.fill", &json!({"color": [1e40, 0.0, 0.0]})).unwrap_err();
+    assert_eq!(err.to_string(), "`layer.add.fill`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+    assert_eq!(s.revision, rev_before);
+
+    let err = execute(&mut s, "layer.fill.set", &json!({"channel": "baseColor", "procedural": "noise", "color": "red"})).unwrap_err();
+    assert_eq!(err.to_string(), "`layer.fill.set`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+    assert_eq!(s.revision, rev_before);
+
+    assert!(execute(&mut s, "tool.cloneSource", &json!({"uv": [0.2, 0.8, 0.4]})).is_err());
+    execute(&mut s, "tool.polygonFill", &Value::Null).unwrap();
+    let err = execute(&mut s, "tool.click", &json!({"uv": [0.2, 0.8, 0.4]})).unwrap_err();
+    assert_eq!(err.to_string(), "`tool.click`: a 2D view point needs `uv` as [u, v]");
+}

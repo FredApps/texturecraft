@@ -100,7 +100,7 @@ fn add_text(s: &mut Session, p: &Value) -> Result<Value> {
     let (font, index) = font_bytes(strp(p, "font"), strp(p, "style"))?;
     let size = f32p(p, "size").unwrap_or(256.0).clamp(8.0, 1024.0);
     let img = render_text(&font, index, text, size).map_err(|e| bad(cmd, e))?;
-    let rgb = color_param(p, "color").unwrap_or([1.0; 3]).map(|c| (texturecraft_texel::linear_to_srgb(c.clamp(0.0, 1.0)) * 255.0).round() as u8);
+    let rgb = color_param(cmd, p, "color")?.unwrap_or([1.0; 3]).map(|c| (texturecraft_texel::linear_to_srgb(c.clamp(0.0, 1.0)) * 255.0).round() as u8);
     let png = texturecraft_formats::coverage_png(img.width, img.height, &img.coverage, rgb).map_err(|e| bad(cmd, e.to_string()))?;
     // The resource is named after the text (its first line, shortened) unless a name is given.
     let label: String = strp(p, "name").unwrap_or_else(|| text.lines().next().unwrap_or_default()).chars().take(32).collect();

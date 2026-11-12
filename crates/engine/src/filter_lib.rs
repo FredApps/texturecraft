@@ -253,8 +253,8 @@ pub(crate) fn apply(p: &Value, f: &mut Filter, cmd: &str) -> Result<()> {
         }
         Filter::ColorBalance { shadows, midtones, highlights } => {
             for (key, slot) in [("shadows", shadows), ("midtones", midtones), ("highlights", highlights)] {
-                if p.get(key).is_some() {
-                    let v = color_param(p, key).ok_or_else(|| bad(cmd, format!("`{key}` must be [r, g, b] offsets in -1..1")))?;
+                if let Some(val) = p.get(key).filter(|v| !v.is_null()) {
+                    let v = color_of(val).ok_or_else(|| bad(cmd, format!("`{key}` must be [r, g, b] offsets in -1..1")))?;
                     *slot = v.map(|x| x.clamp(-1.0, 1.0));
                 }
             }
@@ -305,8 +305,7 @@ pub(crate) fn apply(p: &Value, f: &mut Filter, cmd: &str) -> Result<()> {
         }
         Filter::ReplaceColor { from, to, tolerance, softness } => {
             for (key, slot) in [("from", from), ("to", to)] {
-                if p.get(key).is_some() {
-                    let v = color_param(p, key).ok_or_else(|| bad(cmd, format!("`{key}` must be a color ([r, g, b] linear or \"#rrggbb\")")))?;
+                if let Some(v) = color_param(cmd, p, key)? {
                     *slot = v.map(|x| x.clamp(0.0, 1.0));
                 }
             }

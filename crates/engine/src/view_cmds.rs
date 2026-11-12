@@ -211,6 +211,7 @@ fn display(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(e) = env.as_deref().filter(|e| !e.starts_with(texturecraft_core::project::ENV_RESOURCE_PREFIX) && !ENVIRONMENTS.contains(e)) {
         return Err(bad("display.set", format!("unknown environment `{e}`: one of {}, or resource:<image>", ENVIRONMENTS.join(", "))));
     }
+    let scatter_color = color_param("display.set", p, "scatterColor")?;
     let d = &mut s.doc.project.display;
     if let Some(e) = env {
         d.environment = e;
@@ -236,7 +237,7 @@ fn display(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(t) = tm {
         d.tone_mapping = t;
     }
-    if let Some(c) = color_param(p, "scatterColor") {
+    if let Some(c) = scatter_color {
         d.scatter_color = c.map(|v| v.clamp(0.0, 1.0));
     }
     if let Some(b) = boolp(p, "shadows") {
