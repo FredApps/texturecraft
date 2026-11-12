@@ -2,20 +2,23 @@
 
 TextureCraft's interface text goes through one lookup, `tr("English text")` in
 `crates/ui-egui/src/i18n.rs`: the English string is the key, so English needs no table and a
-missing translation falls back to English. Each language is a static `(English, translation)`
-table in `crates/ui-egui/src/i18n/<code>.rs`, indexed into a hash map the first time the
-language is used. Text with values uses `trf("Saved {path}", &[("path", &p)])`; static labels
-that are translated where they are shown are marked with `n_("…")`.
+missing translation falls back to English. Translations are embedded from the optional shared
+craft-i18n catalogs; see [integration and contribution instructions](internationalization.md).
+Text with values uses `trf("Saved {path}", &[("path", &p)])`; static labels translated where
+they are shown are marked with `n_("…")`.
 
 Pick the language in **Edit ▸ Settings ▸ Language** (it switches live). The first run follows
 the operating system's language (the browser's in the web build).
 
 ## Status
 
+The table records coverage before the initial catalog migration. Actual coverage depends on
+the craft-i18n catalogs embedded in a build. Without catalogs, only English is offered.
+
 UI strings: every `tr`/`trf`/`n_` literal in `crates/ui-egui/src` plus the menu catalog, panel
 names, shortcut editor rows and the engine's channel, blend mode, mesh map, tool, procedural,
 generator, filter and brush alpha names (**KEYS** strings, counted by the
-`every_key_is_translated_in_every_language` test, which fails when one is missing).
+`translation_coverage_report` test, which reports missing and unused keys without failing).
 
 | Language | Code | UI strings | Dialogs, tooltips, help | Script support | Native review | Status | To `full` |
 |---|---|---|---|---|---|---|---|

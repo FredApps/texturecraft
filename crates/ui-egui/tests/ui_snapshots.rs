@@ -497,3 +497,21 @@ fn rail_window_snapshots() {
     texturecraft_ui_egui::menus::invoke(harness.state_mut(), &context, "ui.view.history");
     save(&mut harness, &output_dir, "rail-history-short");
 }
+
+/// Visual check of the migrated catalogs and the live language selector.
+#[test]
+#[ignore]
+fn i18n_snapshots() {
+    let Some(output_dir) = std::env::var_os("TC_UI_SNAPSHOTS").map(PathBuf::from) else { return };
+    std::fs::create_dir_all(&output_dir).unwrap();
+    for code in ["en", "es", "ar"] {
+        assert!(texturecraft_ui_egui::i18n::available(code), "build with migrated catalogs for {code}");
+        let session = texturecraft_engine::sample_session(128, 32).unwrap();
+        let mut harness =
+            Harness::builder().with_size(egui::vec2(1600.0, 960.0)).with_pixels_per_point(1.0).wgpu().build_eframe(|cc| TextureCraftApp::new(cc, session));
+        harness.state_mut().ui.prefs.language = code.into();
+        harness.state_mut().ui.windows.settings = true;
+        save(&mut harness, &output_dir, &format!("i18n-{code}"));
+    }
+    texturecraft_ui_egui::i18n::set_language("en");
+}
