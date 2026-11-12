@@ -1,0 +1,67 @@
+name: Malformed scene archive comparison
+'on':
+  push:
+    branches:
+    - validation/malformed-scene-archive
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - name: baseline
+          ref: 6270aeca05d92527c6e09461efc9b0a35d415137
+        - name: split
+          ref: 666c73fa5edc8fdc69e9497d9cc53fea1bc6ea94
+    steps:
+    - name: Harden runner
+      uses: step-security/harden-runner@1d88384fd173af6ecb012dfd0264a306b711241a
+      with:
+        egress-policy: block
+        allowed-endpoints: '*.amazontrust.com:80 motd.ubuntu.com:443 *.amazonaws.com:443 *.crates.io:443 *.s3.amazonaws.com:443
+          *.s3.eu-central-1.amazonaws.com:443 *.github.com:443 *.githubusercontent.com:443 *.microsoft.com:443 *.openpgp.org:443
+          *.pythonhosted.org:443 *.sonarcloud.io:443 *.sonarsource.com:443 api.github.com:443 archive.ubuntu.com:80 archive.ubuntu.com:443
+          azure.archive.ubuntu.com:80 azure.archive.ubuntu.com:443 binaries.sonarsource.com:443 crates.io:443 esm.ubuntu.com:443
+          files.pythonhosted.org:443 github.com:443 index.crates.io:443 keys.openpgp.org:443 keyserver.ubuntu.com:443 *.dotsrc.org:443
+          *.kernel.org:443 mirrors.dotsrc.org:443 mirrors.edge.kernel.org:443 objects.githubusercontent.com:443 packages.microsoft.com:443
+          pypi.org:443 release-assets.githubusercontent.com:443 scanner.sonarcloud.io:443 security.ubuntu.com:80 security.ubuntu.com:443
+          sonarcloud.io:443 static.crates.io:443 static.rust-lang.org:443
+
+          '
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        ref: ${{ matrix.ref }}
+        persist-credentials: false
+    - name: Install Linux build dependencies
+      uses: storytold/craft-common-actions/actions/install-apt-packages@main
+      with:
+        packages: pkg-config libxkbcommon-dev libwayland-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libgtk-3-dev
+          libfontconfig1-dev libfreetype-dev libasound2-dev libsoup-3.0-dev libwebkit2gtk-4.1-dev libgl1-mesa-dev mesa-vulkan-drivers
+    - name: Install instrumentation tools
+      run: 'rustup toolchain install stable --profile minimal --component llvm-tools-preview
+
+        rustup default stable'
+    - uses: step-security/taiki-e-install-action@76747d22a7567cc4438546a84f11bdf18e670ab8
+      with:
+        tool: cargo-llvm-cov,cargo-nextest@0.9.150
+    - name: Build formats-only instrumented archive
+      env:
+        CARGO_PROFILE_DEV_DEBUG: '0'
+      run: 'source <(cargo llvm-cov show-env --sh)
+
+        cargo nextest archive -p texturecraft-formats --lib --archive-file nextest-archive.tar.zst'
+    - name: Exercise archived malformed-scene tests
+      env:
+        LLVM_PROFILE_FILE: ${{ runner.temp }}/profiles/%p-%m.profraw
+      run: 'mkdir -p "$RUNNER_TEMP/profiles"
+
+        start=$SECONDS
+
+        cargo nextest run --archive-file nextest-archive.tar.zst -E "test(malformed_fbx_and_dae_never_panic)" --test-threads
+        4 --no-fail-fast
+
+        echo "${{ matrix.name }} archived test wall seconds: $((SECONDS-start))" | tee -a "$GITHUB_STEP_SUMMARY"'
