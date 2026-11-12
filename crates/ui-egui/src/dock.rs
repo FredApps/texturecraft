@@ -2354,17 +2354,18 @@ fn generator_properties(app: &mut TextureCraftApp, ui: &mut Ui, id: u64, generat
         }
     });
 
-    let (mut level, mut softness, mut noise, mut noise_scale, mut invert) =
-        (generator.level, generator.softness, generator.noise_amount, generator.noise_scale, generator.invert);
+    let (mut level, mut softness, mut noise, mut noise_scale, mut offset, mut invert) =
+        (generator.level, generator.softness, generator.noise_amount, generator.noise_scale, generator.offset, generator.invert);
     let level_edit = slider_edit(ui, tr("Level"), &mut level, 0.0..=1.0, 2);
     let softness_edit = slider_edit(ui, tr("Softness"), &mut softness, 0.0..=1.0, 2);
     let noise_edit = slider_edit(ui, tr("Noise amount"), &mut noise, 0.0..=2.0, 2);
     let noise_scale_edit = slider_edit(ui, tr("Noise scale"), &mut noise_scale, 0.1..=64.0, 1);
+    let offset_edit = slider_edit(ui, tr("Offset"), &mut offset, -1.0..=1.0, 2);
     let invert_edit = ui.checkbox(&mut invert, tr("Invert")).changed().then_some(false);
-    if let Some(merge) = level_edit.or(softness_edit).or(noise_edit).or(noise_scale_edit).or(invert_edit) {
+    if let Some(merge) = level_edit.or(softness_edit).or(noise_edit).or(noise_scale_edit).or(offset_edit).or(invert_edit) {
         app.run(
             "effect.set",
-            json!({"effect": id, "level": level, "softness": softness, "noise": noise, "noiseScale": noise_scale, "invert": invert, "merge": merge}),
+            json!({"effect": id, "level": level, "softness": softness, "noise": noise, "noiseScale": noise_scale, "offset": offset, "invert": invert, "merge": merge}),
         );
     }
 

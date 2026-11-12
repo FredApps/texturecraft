@@ -55,6 +55,84 @@ fn layers_masks_materials_and_bake() {
 }
 
 #[test]
+fn generator_offset_is_settable_and_clamped() {
+    let mut s = session();
+    execute(&mut s, "layer.add.fill", &json!({})).unwrap();
+    execute(&mut s, "mask.add.black", &Value::Null).unwrap();
+    let r = execute(&mut s, "effect.add.generator", &json!({"generator": "position", "offset": 0.25})).unwrap();
+    let eff = r["effect"].as_u64().unwrap();
+    let offset = |s: &Session| {
+        let layer = s.doc.project.layers.values().find(|l| l.mask.is_some()).unwrap();
+        layer
+            .mask
+            .as_ref()
+            .unwrap()
+            .effects
+            .iter()
+            .find_map(|e| match &e.kind {
+                texturecraft_engine::core::EffectKind::Generator(g) => Some(g.offset),
+                _ => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(offset(&s), 0.25);
+    execute(&mut s, "effect.set", &json!({"effect": eff, "offset": 5.0})).unwrap();
+    assert_eq!(offset(&s), 1.0, "clamped to 1");
+}
+
+fn generator_offset_of(s: &Session) -> f32 {
+    let layer = s.doc.project.layers.values().find(|l| l.mask.is_some()).unwrap();
+    layer
+        .mask
+        .as_ref()
+        .unwrap()
+        .effects
+        .iter()
+        .find_map(|e| match &e.kind {
+            texturecraft_engine::core::EffectKind::Generator(g) => Some(g.offset),
+            _ => None,
+        })
+        .unwrap()
+}
+
+#[test]
+fn generator_offset_survives_save_and_reopen_and_undo_restores_it() {
+    let mut s = session();
+    execute(&mut s, "layer.add.fill", &json!({})).unwrap();
+    execute(&mut s, "mask.add.black", &Value::Null).unwrap();
+    let r = execute(&mut s, "effect.add.generator", &json!({"generator": "position", "offset": 0.25})).unwrap();
+    let eff = r["effect"].as_u64().unwrap();
+    execute(&mut s, "effect.set", &json!({"effect": eff, "offset": -0.6})).unwrap();
+    assert_eq!(generator_offset_of(&s), -0.6);
+
+    let path = std::env::temp_dir().join(format!("tc-generator-offset-{}.tcraft", std::process::id()));
+    let path = path.to_str().unwrap();
+    execute(&mut s, "file.saveCopy", &json!({"path": path})).unwrap();
+    let reopened = texturecraft_engine::file_cmds::open_path(path);
+    let _ = std::fs::remove_file(path);
+    assert_eq!(generator_offset_of(&reopened.unwrap()), -0.6, "the offset is saved and read back");
+
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    assert_eq!(generator_offset_of(&s), 0.25, "undo restores the previous offset");
+}
+
+#[test]
+fn generator_offset_works_alongside_curvature_mode_and_sizes() {
+    let mut s = session();
+    execute(&mut s, "layer.add.fill", &json!({})).unwrap();
+    execute(&mut s, "mask.add.black", &Value::Null).unwrap();
+    let r = execute(&mut s, "effect.add.generator", &json!({"generator": "curvature", "mode": "cavities", "offset": 0.5})).unwrap();
+    let eff = r["effect"].as_u64().unwrap();
+    assert_eq!(generator_offset_of(&s), 0.5);
+
+    execute(&mut s, "effect.set", &json!({"effect": eff, "offset": -0.5, "sizes": [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.5]})).unwrap();
+    assert_eq!(generator_offset_of(&s), -0.5);
+    let inspect = execute(&mut s, "project.inspect", &Value::Null).unwrap().to_string();
+    assert!(inspect.contains(r#""offset":-0.5"#) && inspect.contains(r#""mode":"Cavities""#), "{inspect}");
+    assert!(inspect.contains(r#""sizes":[0.0,0.0,0.0,1.0,0.0,0.0,0.5]"#), "{inspect}");
+}
+
+#[test]
 fn layer_rename_and_undo() {
     let mut s = session();
     let layer_id = s.selected_layer().unwrap();

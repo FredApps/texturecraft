@@ -49,7 +49,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Add generator",
             ["Layers", "Effects"],
             None,
-            "{layer?, name?, generator?: edgeWear|dirt|thinAreas|curvature|ambientOcclusion|position|direction, level?, softness?, noise?, invert?, mode?: edges|cavities|both|raw, sizes?: [7 weights 0..1, finest first] (curvature and edgeWear)}",
+            "{layer?, name?, generator?: edgeWear|dirt|thinAreas|curvature|ambientOcclusion|position|direction, level?, softness?, noise?, offset?: -1..1 added to the result, invert?, mode?: edges|cavities|both|raw, sizes?: [7 weights 0..1, finest first] (curvature and edgeWear)}",
             has_layer,
             add_generator
         ),
@@ -94,7 +94,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit effect",
             [],
             None,
-            "{effect, visible?, blend?, opacity?, name?, filter?: id from filter.list (a filter effect only: swaps its type, keeping position, blend and opacity; its current id edits it in place), level?, softness?, noise?, noiseScale?, invert?, mode?, sizes?, value?, anchor?, anchorChannel?, inLow?, inHigh?, gamma?, outLow?, outHigh?, tolerance?, colors?: [[r,g,b], ...] (a color selection's ID colors), filter parameters (see effect.add.filter)}",
+            "{effect, visible?, blend?, opacity?, name?, filter?: id from filter.list (a filter effect only: swaps its type, keeping position, blend and opacity; its current id edits it in place), level?, softness?, noise?, noiseScale?, offset?, invert?, mode?, sizes?, value?, anchor?, anchorChannel?, inLow?, inHigh?, gamma?, outLow?, outHigh?, tolerance?, colors?: [[r,g,b], ...] (a color selection's ID colors), filter parameters (see effect.add.filter)}",
             has_layer,
             set
         ),
@@ -324,6 +324,9 @@ fn generator_from(command: &str, params: &Value, generator: &mut Generator) -> R
     }
     if let Some(noise) = f32p(params, "noise") {
         generator.noise_amount = noise.clamp(0.0, 2.0);
+    }
+    if let Some(offset) = f32p(params, "offset") {
+        generator.offset = offset.clamp(-1.0, 1.0);
     }
     if let Some(noise_scale) = f32p(params, "noiseScale") {
         generator.noise_scale = noise_scale.clamp(0.01, 1000.0);

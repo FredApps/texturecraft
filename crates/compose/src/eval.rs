@@ -1241,12 +1241,8 @@ impl<'a, 'b> Texel<'a, 'b> {
             signal
         };
 
-        // A smooth step from black to white over 2 × softness around 1 − level
-        let threshold = 1.0 - generator.level.clamp(0.0, 1.0);
-        let softness = generator.softness.max(1e-3);
-        let ramp = ((signal - (threshold - softness)) / (2.0 * softness)).clamp(0.0, 1.0);
-        let value = ramp * ramp * (3.0 - 2.0 * ramp);
-        if generator.invert { 1.0 - value } else { value }
+        // A smooth step from black to white over 2 × softness around 1 − level, then the offset
+        generator.shape(signal)
     }
 
     /// The curvature of `detail`'s mode at this texel: each detail size's edges and cavities, weighted and combined like a screen blend.

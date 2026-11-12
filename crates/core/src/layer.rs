@@ -543,6 +543,9 @@ pub struct Generator {
     pub noise_amount: f32,
     pub noise_scale: f32,
     pub seed: u32,
+    /// Added to the finished mask value and clamped to 0..1 (−1..1; 0 = unchanged).
+    #[serde(default)]
+    pub offset: f32,
     /// Direction for `Position` / `Direction` generators (world space).
     pub direction: [f32; 3],
     pub invert: bool,
@@ -565,7 +568,19 @@ impl Generator {
             GeneratorKind::EdgeWear => Some(CurvatureDetail { mode: CurvatureMode::Edges, weights: CurvatureDetail::EDGE_WEIGHTS }),
             _ => None,
         };
-        Generator { kind, level, softness, noise_amount, noise_scale: 8.0, seed: 7, direction: [0.0, 1.0, 0.0], invert: false, detail }
+        Generator { kind, level, softness, noise_amount, noise_scale: 8.0, seed: 7, offset: 0.0, direction: [0.0, 1.0, 0.0], invert: false, detail }
+    }
+
+    /// The mask value for a (noise-broken) signal `s`: the smooth threshold at `level` over
+    /// `softness`, inverted if asked, then shifted by `offset` (a non-finite offset counts as 0).
+    pub fn shape(&self, s: f32) -> f32 {
+        let th = 1.0 - self.level.clamp(0.0, 1.0);
+        let soft = self.softness.max(1e-3);
+        let t = ((s - (th - soft)) / (2.0 * soft)).clamp(0.0, 1.0);
+        let v = t * t * (3.0 - 2.0 * t);
+        let v = if self.invert { 1.0 - v } else { v };
+        let offset = if self.offset.is_finite() { self.offset } else { 0.0 };
+        (v + offset).clamp(0.0, 1.0)
     }
 }
 
@@ -1064,6 +1079,30 @@ impl Effect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generator_offset_shifts_the_mask_value() {
+        let mut g = Generator::new(GeneratorKind::Position);
+        let base = g.shape(0.2);
+        assert!(base < 0.5);
+        g.offset = 0.3;
+        assert!((g.shape(0.2) - (base + 0.3)).abs() < 1e-6, "the offset is added");
+        g.offset = 1.0;
+        assert_eq!(g.shape(0.2), 1.0, "and the result is clamped");
+        g.offset = -1.0;
+        assert_eq!(g.shape(0.9), 0.0);
+    }
+
+    #[test]
+    fn generator_non_finite_offset_counts_as_zero() {
+        let mut g = Generator::new(GeneratorKind::Position);
+        let base: Vec<f32> = [0.0, 0.2, 0.5, 0.9].iter().map(|&s| g.shape(s)).collect();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            g.offset = bad;
+            let got: Vec<f32> = [0.0, 0.2, 0.5, 0.9].iter().map(|&s| g.shape(s)).collect();
+            assert_eq!(got, base, "offset {bad} behaves like 0");
+        }
+    }
 
     #[test]
     fn curvature_generators_saved_before_detail_sizes_load_without_them() {
