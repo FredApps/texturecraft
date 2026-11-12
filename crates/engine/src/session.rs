@@ -740,6 +740,10 @@ impl Session {
             let content = p.effect(e).and_then(|(owner, _)| p.layers.get(&owner)).is_some_and(|l| l.content_effects.iter().any(|x| x.id == e));
             self.target = if content { StackTarget::Content } else { StackTarget::Mask };
         }
+        let has_mask = self.selected_layer().and_then(|lid| self.doc.project.layer(self.doc.project.mask_owner(lid)).ok()).is_some_and(|l| l.mask.is_some());
+        if self.target == StackTarget::Mask && !has_mask {
+            self.target = StackTarget::Content;
+        }
     }
 
     // -----------------------------------------------------------------------------------------

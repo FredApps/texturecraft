@@ -244,3 +244,54 @@ fn swap_mask_value_inverts_only_while_a_mask_is_the_target() {
 
     assert_eq!(session.tool.mask_value, 0.0, "a mask effect paints the mask too");
 }
+
+#[test]
+fn stroke_after_undoing_mask_is_paint_stroke() {
+    let mut s = Session::new_project("t", primitives::sphere(1.0, 48, 24), "builtin:random", None, 256).unwrap();
+    s.viewport = Vec2::new(400.0, 400.0);
+    execute(&mut s, "layer.add.fill", &json!({"color": [0.2, 0.5, 0.3], "roughness": 0.7})).unwrap();
+    execute(&mut s, "layer.add.paint", &Value::Null).unwrap();
+    s.update();
+    execute(&mut s, "tool.brush", &json!({"size": 20, "hardness": 50, "opacity": 0.8})).unwrap();
+    execute(&mut s, "tool.paint", &Value::Null).unwrap();
+    execute(&mut s, "tool.material", &json!({"channel": "baseColor", "color": [0.9, 0.3, 0.9]})).unwrap();
+
+    execute(&mut s, "tool.stroke", &json!({"points": [[130, 130], [170, 150]]})).unwrap();
+    s.update();
+    execute(&mut s, "mask.add.white", &Value::Null).unwrap();
+    s.update();
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    s.update();
+    execute(&mut s, "tool.stroke", &json!({"points": [[167, 183], [207, 203]]})).unwrap();
+    s.update();
+
+    let undone = execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    assert_eq!(undone["undone"], "Paint stroke", "the stroke after undoing the mask was recorded as {}", undone["undone"]);
+    execute(&mut s, "edit.redo", &Value::Null).unwrap();
+    s.update();
+
+    let settled = s.caches[0].composite.clone();
+    s.caches[0].below.clear();
+    s.caches[0].invalidate_all();
+    s.update();
+    assert_eq!(settled, s.caches[0].composite, "the composite after the stroke matches a full recomposite");
+}
+
+#[test]
+fn undoing_after_painting_on_instance_source_mask_keeps_mask_target() {
+    let mut s = Session::new_project("t", primitives::sphere(1.0, 48, 24), "builtin:random", None, 256).unwrap();
+    s.viewport = Vec2::new(400.0, 400.0);
+    execute(&mut s, "layer.add.paint", &Value::Null).unwrap();
+    execute(&mut s, "mask.add.white", &Value::Null).unwrap();
+    execute(&mut s, "layer.instance", &Value::Null).unwrap();
+    s.update();
+    s.target = StackTarget::Mask;
+    execute(&mut s, "tool.brush", &json!({"size": 20, "hardness": 50, "opacity": 0.8})).unwrap();
+    execute(&mut s, "tool.stroke", &json!({"points": [[170, 180], [210, 200]]})).unwrap();
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    assert_eq!(s.target, StackTarget::Mask);
+
+    execute(&mut s, "tool.stroke", &json!({"points": [[180, 180], [210, 200]]})).unwrap();
+    let undone = execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    assert_eq!(undone["undone"], "Mask stroke");
+}
