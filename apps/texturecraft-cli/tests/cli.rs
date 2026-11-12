@@ -1,12 +1,34 @@
 //! Drives the `texturecraft-cli` binary.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use serde_json::Value;
 
+// Nextest 0.9.130+ remaps this variable when an archive is extracted on another
+// runner. Cargo's compile-time path still supports ordinary `cargo test`.
+fn cli_binary() -> OsString {
+    cli_binary_path(std::env::var_os("CARGO_BIN_EXE_texturecraft-cli"))
+}
+
+fn cli_binary_path(runner_path: Option<OsString>) -> OsString {
+    runner_path.unwrap_or_else(|| env!("CARGO_BIN_EXE_texturecraft-cli").into())
+}
+
+#[test]
+fn cli_binary_prefers_relocated_runner_path() {
+    let relocated = OsString::from("relocated archive/texturecraft-cli");
+    assert_eq!(cli_binary_path(Some(relocated.clone())), relocated);
+}
+
+#[test]
+fn cli_binary_defaults_to_cargo_path() {
+    assert_eq!(cli_binary_path(None), OsString::from(env!("CARGO_BIN_EXE_texturecraft-cli")));
+}
+
 fn cli(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_texturecraft-cli")).args(args).output().unwrap()
+    Command::new(cli_binary()).args(args).output().unwrap()
 }
 
 fn ok(args: &[&str]) -> String {
@@ -101,7 +123,7 @@ fn info_on_a_mesh_reports_uvs() {
 fn serve_takes_the_automation_root_spelling_too() {
     use std::io::Write as _;
     let d = tmp("automation-root");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_texturecraft-cli"))
+    let mut child = Command::new(cli_binary())
         .args(["serve", "--automation-write-root", p(&d)])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
