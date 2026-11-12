@@ -589,25 +589,64 @@ fn fbx_old_versions_and_garbage_are_errors() {
     assert!(import_mesh_bytes("h.fbx", &huge).is_err());
 }
 
+// Keep these fixtures independently schedulable: one serial test took 24 minutes in
+// instrumented coverage. Splitting cases keeps every mutation and assertion intact.
 #[test]
-fn malformed_fbx_and_dae_never_panic() {
+fn malformed_fbx_and_dae_never_panic_binary_7400() {
     hammer("x.fbx", &binary_fbx(&scene(false), 7400, false));
+}
+
+#[test]
+fn malformed_fbx_and_dae_never_panic_binary_7500() {
     hammer("x.fbx", &binary_fbx(&scene(true), 7500, true));
+}
+
+#[test]
+fn malformed_fbx_and_dae_never_panic_ascii() {
     hammer("x.fbx", ascii_fbx(&scene(false)).as_bytes());
+}
+
+#[test]
+fn malformed_fbx_and_dae_never_panic_collada() {
     hammer("x.dae", DAE.as_bytes());
+}
+
+#[test]
+fn malformed_fbx_and_dae_never_panic_random_binary() {
+    random_scene_corruptions(0);
+}
+
+#[test]
+fn malformed_fbx_and_dae_never_panic_random_ascii() {
+    random_scene_corruptions(1);
+}
+
+#[test]
+fn malformed_fbx_and_dae_never_panic_random_collada() {
+    random_scene_corruptions(2);
+}
+
+fn random_scene_corruptions(selected_fixture: usize) {
     // Random multi-byte corruptions (a fixed LCG keeps failures reproducible).
     let mut seed = 0x2545_f491_4f6c_dd1du64;
     let mut next = move || {
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         (seed >> 33) as usize
     };
-    for good in [binary_fbx(&scene(false), 7500, true), ascii_fbx(&scene(true)).into_bytes(), DAE.as_bytes().to_vec()] {
+    // Replay earlier mutations without parsing them so each fixture receives exactly
+    // its original LCG stream, not a fresh seed. Fixture sizes and all 1,500 cases
+    // per fixture stay unchanged; generating these bytes is cheap next to parsing.
+    let fixtures = [binary_fbx(&scene(false), 7500, true), ascii_fbx(&scene(true)).into_bytes(), DAE.as_bytes().to_vec()];
+    for (fixture, good) in fixtures.into_iter().enumerate().take(selected_fixture + 1) {
         let name = if good.starts_with(b"<?xml") { "r.dae" } else { "r.fbx" };
         for _ in 0..1500 {
             let mut b = good.clone();
             for _ in 0..1 + next() % 4 {
                 let i = next() % b.len();
                 b[i] = next() as u8;
+            }
+            if fixture != selected_fixture {
+                continue;
             }
             if let Err(e) = import_mesh_bytes(name, &b) {
                 assert!(!e.to_string().contains("parser failed"), "{name}: a parser panicked");
