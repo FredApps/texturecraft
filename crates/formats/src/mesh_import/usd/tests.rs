@@ -517,3 +517,15 @@ fn shared_integer_writer_preserves_tie_wire_and_rejects_oversized_budget() {
     assert!(craft_usd::integers::encode(&[1], craft_usd::integers::Width::I32, 16).is_err());
     assert!(craft_usd::integers::encode(&[], craft_usd::integers::Width::I64, 0).unwrap().is_empty());
 }
+
+/// Keep the final mesh contract of the binary fixture used before the shared USD cutover.
+#[test]
+fn crafted_usdc_references_time_samples_and_inlined_values_reach_mesh() {
+    let bytes = include_bytes!("fixtures/crafted-references.usdc");
+    let m = import_mesh_bytes("crafted.usdc", bytes).unwrap().mesh;
+    assert_eq!(m.triangle_count(), 1, "the class prim itself is not drawn");
+    let (lo, hi) = m.bounds();
+    // Scaled 2× by the inlined matrix, then moved by the first time sample.
+    assert!((lo - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-5, "{lo}");
+    assert!((hi - Vec3::new(3.0, 2.0, 0.0)).length() < 1e-5, "{hi}");
+}

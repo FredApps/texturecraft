@@ -24,6 +24,7 @@ licensed and keep their license file next to them.
 | `docs/images/texturecraft-lantern.png` | README render: a storm lantern (original procedural mesh of lathes and swept wires, eight texture sets) in chipped red enamel, rust, soot, tarnished brass and glass with an emissive flame (`texturecraft-cli render --camera Hero --samples 2048`, 1200×900) | TextureCraft contributors | original model and render by TextureCraft | MIT OR Apache-2.0 |
 | `docs/images/texturecraft-camera.png` | README render: a rangefinder camera (original procedural mesh) in black enamel worn to brass, leatherette, chrome and coated glass; the lens distance scale is an original image drawn in code (`texturecraft-cli render --camera Hero --samples 2048`, 1200×900) | TextureCraft contributors | original model and render by TextureCraft | MIT OR Apache-2.0 |
 | `docs/brand/artcraft-*.svg`, `docs/brand/artcraft-*.png` | ArtCraft logo and mark | ArtCraft Team | storytold/craftrules `assets/brand/` | ArtCraft brand terms, not open source ([`docs/brand/LICENSE-brand.txt`](docs/brand/LICENSE-brand.txt)) |
+| `crates/formats/src/mesh_import/usd/fixtures/crafted-references.usdc` | Synthetic USDC class/reference/time-sample acceptance fixture | ArtCraft Team and craft-libs contributors | [Pinned generator and provenance](crates/formats/src/mesh_import/usd/fixtures/README.md) | MIT (`crates/formats/src/mesh_import/usd/fixtures/LICENSE-MIT`) |
 
 ## Third-party assets compiled into the binary
 
