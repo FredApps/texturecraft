@@ -1,0 +1,21 @@
+name: TextureCraft COLLADA material release acceptance
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  release-formats:
+    uses: storytold/craft-common-actions/.github/workflows/gate.yml@45f840aee1c2992065480ecdb546b051c555c73f
+    with:
+      os: '["ubuntu-24.04"]'
+      tools: ""
+      timeout-minutes: 25
+      gate-timeout-minutes: 22
+      command: |
+        set -euo pipefail
+        git fetch --no-tags origin f1c4ed1c2a28f2c8510251d26b708e9328e466d6
+        test "$(git rev-parse f1c4ed1c2a28f2c8510251d26b708e9328e466d6^{tree})" = 4feb9f2f5c6f27a6e5db58579d3a2f2f6f2a2f93
+        git diff --exit-code f1c4ed1c2a28f2c8510251d26b708e9328e466d6 HEAD -- . ':!.github/workflows/validate-pr270.yml'
+        cargo fmt --all --check
+        cargo test --locked --release -p texturecraft-formats
+        git diff --exit-code HEAD -- .
