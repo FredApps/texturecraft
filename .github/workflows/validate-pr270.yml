@@ -17,9 +17,9 @@ jobs:
       gate-timeout-minutes: 85
       command: |
         set -euo pipefail
-        git fetch origin 890bba747e90f9d21b190479a7ea4c9affd5c2e5
-        test "$(git rev-parse 890bba747e90f9d21b190479a7ea4c9affd5c2e5^{tree})" = c231dbcb2e1d676b8548aeac322780fe262039f0
-        git diff --exit-code 890bba747e90f9d21b190479a7ea4c9affd5c2e5 HEAD -- . ':!.github/workflows/validate-pr270.yml'
+        git fetch origin af39837cb871ba9806e3bb37b55c5afbcbbfd18d
+        test "$(git rev-parse af39837cb871ba9806e3bb37b55c5afbcbbfd18d^{tree})" = 646c56f35d9fd272988bf2c226c1f6c30ff66fff
+        git diff --exit-code af39837cb871ba9806e3bb37b55c5afbcbbfd18d HEAD -- . ':!.github/workflows/validate-pr270.yml'
         cargo fmt --all --check
         cargo test --locked --release -p texturecraft-formats -p texturecraft-engine -p texturecraft-ui-egui
         trap 'git checkout HEAD -- crates/formats/src/mesh_export.rs' EXIT
