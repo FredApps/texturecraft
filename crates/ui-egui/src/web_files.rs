@@ -334,7 +334,7 @@ mod web {
         let bytes = match ext {
             "glb" => app.session.mesh_glb_bytes(),
             "usdz" => app.session.mesh_usd(texturecraft_engine::formats::UsdFormat::Usdz).map(|u| u.bytes),
-            _ => Ok(app.session.mesh_obj_bytes()),
+            _ => app.session.mesh_obj_bytes(),
         };
         match bytes.map_err(|e| e.to_string()).and_then(|b| download(&name, &b)) {
             Ok(()) => app.toast(trf("Downloaded {name}", &[("name", &name)]), false),
@@ -496,7 +496,7 @@ mod tests {
         let mut harness = Harness::builder().build_eframe(|context| TextureCraftApp::new(context, session));
         let old_project_id = harness.state().session.project_id;
         assert!(harness.state_mut().run("file.close", serde_json::Value::Null).is_some());
-        let cage = harness.state().session.mesh_obj_bytes();
+        let cage = harness.state().session.mesh_obj_bytes().unwrap();
 
         apply_picked(
             harness.state_mut(),
@@ -510,7 +510,7 @@ mod tests {
 
         assert!(harness.state_mut().run("project.new", serde_json::json!({"mesh": "cube", "resolution": 128})).is_some());
         let project_id = harness.state().session.project_id;
-        let mesh = harness.state().session.mesh_obj_bytes();
+        let mesh = harness.state().session.mesh_obj_bytes().unwrap();
 
         apply_picked(
             harness.state_mut(),

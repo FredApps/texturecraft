@@ -106,8 +106,8 @@ fn read_stored_mesh(project: &Project, ext: &str, bytes: &[u8]) -> Result<textur
 
 impl Session {
     /// The working mesh as Wavefront OBJ (with its own UVs, UDIM tiles included).
-    pub fn mesh_obj_bytes(&self) -> Vec<u8> {
-        texturecraft_formats::obj_bytes(&self.source_mesh(), &self.doc.project.name)
+    pub fn mesh_obj_bytes(&self) -> Result<Vec<u8>> {
+        texturecraft_formats::obj_bytes(&self.source_mesh(), &self.doc.project.name).map_err(fe)
     }
 
     /// [`Session::mesh_obj_bytes`] with an MTL material library and each material's maps (like
@@ -121,7 +121,7 @@ impl Session {
             mesh.materials.push("default".into());
         }
         let files = self.material_files(texturecraft_formats::usd_export_options(), false, mesh.materials.len())?;
-        Ok(texturecraft_formats::obj_with_mtl(&mesh, &self.doc.project.name, stem, &files))
+        texturecraft_formats::obj_with_mtl(&mesh, &self.doc.project.name, stem, &files).map_err(fe)
     }
 
     /// The working mesh as binary glTF with each material's textures (from its texture set's
@@ -895,6 +895,39 @@ f 1/1 2/2 3/3
         crate::execute(&mut saved, "file.reimportMesh", &Value::Null).unwrap();
         assert!(saved.modified, "reimport must trigger the unsaved-changes prompt");
         assert_eq!(saved.project_id, project, "a reimport stays the same project");
+    }
+
+    #[test]
+    fn rejected_obj_export_preserves_existing_files_and_publishes_nothing() {
+        let mut s = Session::new_project("t", primitives::cube(1.0), "builtin:cube", None, 128).unwrap();
+        let dir = std::env::temp_dir().join(format!("tc_rejected_obj_export_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cube.obj");
+        // The same command first writes a valid mesh and all its companions.
+        crate::execute(&mut s, "file.exportMesh", &json!({ "path": path })).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("\nf "));
+        let snapshot = || {
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|entry| {
+                    let path = entry.unwrap().path();
+                    let bytes = std::fs::read(&path).unwrap();
+                    (path, bytes)
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let before = snapshot();
+        assert!(before.len() > 2, "the valid export includes its MTL and maps");
+        // Keep the working/render mesh valid; corrupt only the source exported by both APIs.
+        Arc::make_mut(&mut s.source).indices[0] = u32::MAX;
+        assert!(s.mesh_obj_bytes().unwrap_err().to_string().contains("corner index is out of range"));
+        assert!(s.mesh_obj_with_mtl("cube").unwrap_err().to_string().contains("corner index is out of range"));
+        for destination in [path, dir.join("new.obj")] {
+            let error = crate::execute(&mut s, "file.exportMesh", &json!({ "path": destination })).unwrap_err();
+            assert!(error.to_string().contains("corner index is out of range"), "{error}");
+            assert_eq!(snapshot(), before, "a rejected mesh must neither overwrite nor publish any file");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

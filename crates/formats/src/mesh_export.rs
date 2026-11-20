@@ -17,17 +17,18 @@ use crate::{ExportOptions, ExportPreset, ExportedFile, FileFormat, FormatError, 
 pub use usd::{NamedFiles, UsdExport, UsdFormat, usd_bytes, usd_export_options};
 
 /// The mesh as OBJ text (UV v flipped back to OBJ's bottom-up convention).
-pub fn obj_bytes(mesh: &Mesh, name: &str) -> Vec<u8> {
+/// Invalid mesh data or shared writer limits return an error, never an empty successful export.
+pub fn obj_bytes(mesh: &Mesh, name: &str) -> Result<Vec<u8>> {
     let scene = to_craft_scene(mesh, &token(name), mesh.materials.iter().map(|m| craft_mesh::Material::plain(token(m), [1.0; 4])).collect(), Vec::new());
-    craft_mesh::obj::write(&scene, None, &craft_mesh::Limits::default()).unwrap_or_default().into_bytes()
+    craft_mesh::obj::write(&scene, None, &craft_mesh::Limits::default()).map(String::into_bytes).map_err(|e| FormatError::Invalid(e.to_string()))
 }
 
 /// The mesh as OBJ with a material library: the OBJ (naming `<stem>.mtl`, `stem` being the
 /// OBJ file's own, so exports beside each other keep their files apart) and the files to write
 /// next to it, the MTL first, then each material's maps (`textures[m]`, rendered with
 /// [`usd_export_options`], named like USD's). Roughness, metallic, normal and coat maps use the
-/// MTL PBR extension's keys.
-pub fn obj_with_mtl(mesh: &Mesh, name: &str, stem: &str, textures: &[Vec<ExportedFile>]) -> (Vec<u8>, NamedFiles) {
+/// MTL PBR extension's keys. Writer failures return an error without companion files.
+pub fn obj_with_mtl(mesh: &Mesh, name: &str, stem: &str, textures: &[Vec<ExportedFile>]) -> Result<(Vec<u8>, NamedFiles)> {
     let clean = sanitize_file_stem(stem);
     // OBJ names that sanitize alike (`ball 1`, `ball_1`) must not overwrite each other's files:
     // a changed name gets a hash of the original (FNV-1a).
@@ -62,8 +63,9 @@ pub fn obj_with_mtl(mesh: &Mesh, name: &str, stem: &str, textures: &[Vec<Exporte
         }
     }
     files.insert(0, (format!("{stem}.mtl"), mtl.into_bytes()));
-    let obj = craft_mesh::obj::write(&scene, Some(&format!("{stem}.mtl")), &craft_mesh::Limits::default()).unwrap_or_default();
-    (obj.into_bytes(), files)
+    let obj =
+        craft_mesh::obj::write(&scene, Some(&format!("{stem}.mtl")), &craft_mesh::Limits::default()).map_err(|e| FormatError::Invalid(e.to_string()))?;
+    Ok((obj.into_bytes(), files))
 }
 
 fn to_craft_scene(mesh: &Mesh, name: &str, materials: Vec<craft_mesh::Material>, images: Vec<craft_mesh::Image>) -> craft_mesh::Scene {
@@ -265,12 +267,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn obj_writers_report_invalid_corner_indices() {
+        let mut mesh = texturecraft_geom::primitives::cube(1.0);
+        mesh.indices[0] = u32::MAX;
+        for error in [obj_bytes(&mesh, "invalid").unwrap_err(), obj_with_mtl(&mesh, "invalid", "m", &[]).unwrap_err()] {
+            assert!(matches!(error, FormatError::Invalid(_)));
+            assert!(error.to_string().contains("corner index is out of range"), "{error}");
+        }
+    }
+
+    #[test]
     fn name_with_newline_stays_in_the_header_comment() {
         let mesh = texturecraft_geom::primitives::cube(1.0);
         let name = "a\nv 9 9 9\r\nmtllib x";
-        let obj = String::from_utf8(obj_bytes(&mesh, name)).unwrap();
+        let obj = String::from_utf8(obj_bytes(&mesh, name).unwrap()).unwrap();
         assert!(obj.lines().all(|l| !l.starts_with("v 9 9 9") && !l.starts_with("mtllib x")));
-        let (obj, files) = obj_with_mtl(&mesh, name, "m", &[]);
+        let (obj, files) = obj_with_mtl(&mesh, name, "m", &[]).unwrap();
         let obj = String::from_utf8(obj).unwrap();
         assert!(obj.lines().all(|l| !l.starts_with("v 9 9 9") && !l.starts_with("mtllib x")));
         let mtl = String::from_utf8(files[0].1.clone()).unwrap();
@@ -286,7 +298,7 @@ mod tests {
             SubMesh { name: "b".into(), material: 1, start: 18, count: mesh.indices.len() as u32 - 18 },
         ];
         let png = |name: &str| ExportedFile { name: name.into(), bytes: vec![1, 2, 3], width: 1, height: 1, warnings: Vec::new() };
-        let (obj, files) = obj_with_mtl(&mesh, "project", "m", &[vec![png("BaseColor.png")], vec![png("BaseColor.png")]]);
+        let (obj, files) = obj_with_mtl(&mesh, "project", "m", &[vec![png("BaseColor.png")], vec![png("BaseColor.png")]]).unwrap();
         let obj = String::from_utf8(obj).unwrap();
         assert!(obj.contains("mtllib m.mtl\n") && obj.contains("usemtl Mat_A\n") && obj.contains("usemtl mat_a_2\n"));
         let names: Vec<_> = files.iter().map(|f| f.0.as_str()).collect();
@@ -307,7 +319,7 @@ mod tests {
             SubMesh { name: "b".into(), material: 1, start: 18, count: mesh.indices.len() as u32 - 18 },
         ];
         let png = || ExportedFile { name: "BaseColor.png".into(), bytes: vec![1], width: 1, height: 1, warnings: Vec::new() };
-        let (obj, files) = obj_with_mtl(&mesh, "project", "m", &[vec![png()], vec![png()]]);
+        let (obj, files) = obj_with_mtl(&mesh, "project", "m", &[vec![png()], vec![png()]]).unwrap();
         let obj = String::from_utf8(obj).unwrap();
         let mtl = String::from_utf8(files[0].1.clone()).unwrap();
         let used: Vec<_> = obj.lines().filter_map(|line| line.strip_prefix("usemtl ")).collect();
@@ -322,7 +334,7 @@ mod tests {
     fn obj_names_that_sanitize_alike_keep_their_companions_apart() {
         let mesh = texturecraft_geom::primitives::cube(1.0);
         let png = || vec![ExportedFile { name: "BaseColor.png".into(), bytes: vec![1], width: 1, height: 1, warnings: Vec::new() }];
-        let names = |stem: &str| obj_with_mtl(&mesh, "p", stem, &[png()]).1.into_iter().map(|f| f.0).collect::<Vec<_>>();
+        let names = |stem: &str| obj_with_mtl(&mesh, "p", stem, &[png()]).unwrap().1.into_iter().map(|f| f.0).collect::<Vec<_>>();
         let (spaced, plain) = (names("ball 1"), names("ball_1"));
         assert_eq!(plain, ["ball_1.mtl", "ball_1_Cube_BaseColor.png"], "a clean name is kept");
         assert!(spaced.iter().all(|n| n.starts_with("ball_1_") && !plain.contains(n)), "{spaced:?}");
@@ -332,7 +344,7 @@ mod tests {
     #[test]
     fn obj_round_trips_through_the_importer() {
         let mesh = texturecraft_geom::primitives::rounded_box(texturecraft_geom::glam::Vec3::splat(1.0), 0.1);
-        let bytes = obj_bytes(&mesh, "My box");
+        let bytes = obj_bytes(&mesh, "My box").unwrap();
         let back = crate::import_mesh_bytes("box.obj", &bytes).unwrap().mesh;
         assert_eq!(back.triangle_count(), mesh.triangle_count());
         let (a, b) = (mesh.bounds(), back.bounds());

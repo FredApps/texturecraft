@@ -114,7 +114,7 @@ fn projects_round_trip_and_meshes_export_their_own_uvs() {
     assert_eq!(red_per_tile(&back), red);
     // OBJ export keeps the mesh's UDIM UVs; the working mesh is in atlas space.
     assert!(s.mesh.uvs.iter().all(|uv| (0.0..=1.0).contains(&uv.x)));
-    let obj = String::from_utf8(s.mesh_obj_bytes()).unwrap();
+    let obj = String::from_utf8(s.mesh_obj_bytes().unwrap()).unwrap();
     let max_u = obj.lines().filter_map(|l| l.strip_prefix("vt ")).filter_map(|l| l.split_whitespace().next()?.parse::<f32>().ok()).fold(0.0f32, f32::max);
     assert!((max_u - 2.0).abs() < 1e-4, "{max_u}");
     // With its MTL: the same UVs, and no maps for the UV-tiled set (one image cannot hold them).

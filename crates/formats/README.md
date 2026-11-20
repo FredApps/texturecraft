@@ -43,7 +43,8 @@ degenerate are refused (MikkTSpace crashes on them).
 ### Mesh export (`mesh_export`)
 
 ```rust
-pub fn obj_bytes(mesh: &Mesh, name: &str) -> Vec<u8>;
+pub fn obj_bytes(mesh: &Mesh, name: &str) -> Result<Vec<u8>>;
+pub fn obj_with_mtl(mesh: &Mesh, name: &str, stem: &str, textures: &[Vec<ExportedFile>]) -> Result<(Vec<u8>, NamedFiles)>;
 pub fn glb_bytes(mesh: &Mesh, name: &str, textures: &[GlbTextures]) -> Result<Vec<u8>>;
 pub fn glb_export_options() -> ExportOptions;                     // render GlbTextures with these
 pub struct GlbTextures { pub base_color, pub orm, pub normal, pub emissive: Option<Vec<u8>> }  // PNG
@@ -52,6 +53,9 @@ pub fn usd_export_options() -> ExportOptions;                     // render each
 pub enum UsdFormat { Usda, Usdc, Usdz }
 pub struct UsdExport { pub bytes: Vec<u8>, pub textures: Vec<(String, Vec<u8>)> }  // textures: usda/usdc only
 ```
+
+OBJ export propagates shared writer validation and limit errors rather than returning empty bytes.
+An unsuccessful OBJ export returns no material library or texture files.
 
 USD: one `Mesh` prim (vertex normals and `primvars:st`, `subdivisionScheme = "none"`), one
 `materialBind` GeomSubset per material when there are several, and a UsdPreviewSurface material
