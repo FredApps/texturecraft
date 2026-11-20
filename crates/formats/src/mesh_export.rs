@@ -63,8 +63,7 @@ pub fn obj_with_mtl(mesh: &Mesh, name: &str, stem: &str, textures: &[Vec<Exporte
         }
     }
     files.insert(0, (format!("{stem}.mtl"), mtl.into_bytes()));
-    let obj =
-        craft_mesh::obj::write(&scene, Some(&format!("{stem}.mtl")), &craft_mesh::Limits::default()).map_err(|e| FormatError::Invalid(e.to_string()))?;
+    let obj = craft_mesh::obj::write(&scene, Some(&format!("{stem}.mtl")), &craft_mesh::Limits::default()).map_err(|e| FormatError::Invalid(e.to_string()))?;
     Ok((obj.into_bytes(), files))
 }
 
