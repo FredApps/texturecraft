@@ -37,9 +37,10 @@ pub fn obj_with_mtl(mesh: &Mesh, name: &str, stem: &str, textures: &[Vec<Exporte
         let hash = stem.bytes().fold(0x811c_9dc5u32, |h, b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193));
         format!("{clean}_{hash:08x}")
     };
+    let scene = to_craft_scene(mesh, &token(name), mesh.materials.iter().map(|m| craft_mesh::Material::plain(token(m), [1.0; 4])).collect(), Vec::new());
     let (maps, mut files) = usd::material_maps(mesh, &stem, textures);
     let mut mtl = format!("# {}, exported by TextureCraft\n", token(name));
-    for (material, maps) in unique_ids(&mesh.materials, token).iter().zip(&maps) {
+    for (material, maps) in craft_mesh::obj::material_names(&scene).iter().zip(&maps) {
         let _ = writeln!(mtl, "\nnewmtl {material}\nKd 1 1 1");
         for (slot, file) in maps {
             let keys: &[&str] = match usd::SLOTS.get(*slot).map_or("", |s| s.0) {
@@ -61,7 +62,6 @@ pub fn obj_with_mtl(mesh: &Mesh, name: &str, stem: &str, textures: &[Vec<Exporte
         }
     }
     files.insert(0, (format!("{stem}.mtl"), mtl.into_bytes()));
-    let scene = to_craft_scene(mesh, &token(name), mesh.materials.iter().map(|m| craft_mesh::Material::plain(token(m), [1.0; 4])).collect(), Vec::new());
     let obj = craft_mesh::obj::write(&scene, Some(&format!("{stem}.mtl")), &craft_mesh::Limits::default()).unwrap_or_default();
     (obj.into_bytes(), files)
 }
@@ -296,6 +296,26 @@ mod tests {
             mtl.contains("newmtl Mat_A\nKd 1 1 1\nmap_Kd m_Mat_A_BaseColor.png") && mtl.contains("newmtl mat_a_2\nKd 1 1 1\nmap_Kd m_mat_a_2_BaseColor.png"),
             "{mtl}"
         );
+    }
+
+    #[test]
+    fn obj_and_mtl_share_material_ids_after_control_character_normalization() {
+        let mut mesh = texturecraft_geom::primitives::cube(1.0);
+        mesh.materials = vec!["Mat\u{7}A".into(), "Mat_A".into()];
+        mesh.submeshes = vec![
+            SubMesh { name: "a".into(), material: 0, start: 0, count: 18 },
+            SubMesh { name: "b".into(), material: 1, start: 18, count: mesh.indices.len() as u32 - 18 },
+        ];
+        let png = || ExportedFile { name: "BaseColor.png".into(), bytes: vec![1], width: 1, height: 1, warnings: Vec::new() };
+        let (obj, files) = obj_with_mtl(&mesh, "project", "m", &[vec![png()], vec![png()]]);
+        let obj = String::from_utf8(obj).unwrap();
+        let mtl = String::from_utf8(files[0].1.clone()).unwrap();
+        let used: Vec<_> = obj.lines().filter_map(|line| line.strip_prefix("usemtl ")).collect();
+        let declared: Vec<_> = mtl.lines().filter_map(|line| line.strip_prefix("newmtl ")).collect();
+        assert_eq!(used, ["Mat_A", "Mat_A_2"]);
+        assert_eq!(declared, used, "each OBJ part must resolve to its own MTL material");
+        let maps: Vec<_> = mtl.lines().filter_map(|line| line.strip_prefix("map_Kd ")).collect();
+        assert_eq!(maps, [files[1].0.as_str(), files[2].0.as_str()], "material index and texture mapping stay aligned");
     }
 
     #[test]
