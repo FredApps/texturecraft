@@ -1,0 +1,21 @@
+name: TextureCraft USDC release acceptance
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux-release:
+    uses: storytold/craft-common-actions/.github/workflows/gate.yml@45f840aee1c2992065480ecdb546b051c555c73f
+    with:
+      os: '["ubuntu-24.04"]'
+      tools: ""
+      timeout-minutes: 60
+      gate-timeout-minutes: 55
+      command: |
+        set -euo pipefail
+        git fetch origin 17aec48755355044843f4ff325fa5bf047a6cc3d
+        test "$(git rev-parse 17aec48755355044843f4ff325fa5bf047a6cc3d^{tree})" = aa7510b73cc579e0dec434d3e0a5b9111413ac18
+        git diff --exit-code 17aec48755355044843f4ff325fa5bf047a6cc3d HEAD -- . ':!.github/workflows/validate-pr270.yml'
+        cargo fmt --all --check
+        cargo test --locked --release -p texturecraft-formats
+        git diff --exit-code HEAD -- Cargo.lock crates/
