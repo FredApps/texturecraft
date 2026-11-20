@@ -1,0 +1,47 @@
+name: TextureCraft USDC acceptance fixture generation
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fixture:
+    uses: storytold/craft-common-actions/.github/workflows/gate.yml@45f840aee1c2992065480ecdb546b051c555c73f
+    with:
+      os: '["ubuntu-24.04"]'
+      tools: ""
+      timeout-minutes: 20
+      gate-timeout-minutes: 15
+      command: |
+        set -euo pipefail
+        work="$(mktemp -d)"
+        git -C "$work" init
+        git -C "$work" remote add origin https://github.com/storytold/craft-libs.git
+        git -C "$work" fetch --depth=1 origin 3dff4793f1a5bd1f99a4fe3280d48f515158dff3
+        git -C "$work" checkout --detach FETCH_HEAD
+        test "$(git -C "$work" rev-parse HEAD)" = 3dff4793f1a5bd1f99a4fe3280d48f515158dff3
+        export FIXTURE_WORK="$work"
+        python3 - <<'PY'
+        import os
+        from pathlib import Path
+        p = Path(os.environ["FIXTURE_WORK"]) / "crates/usd/src/scene/write.rs"
+        s = p.read_text()
+        start = s.index("fn crafted_crate_with_references_time_samples_and_inlined_values()")
+        before, body = s[:start], s[start:]
+        needle = "let bytes = w.finish().unwrap();"
+        assert body.count(needle) == 1
+        body = body.replace(needle, needle + '\n        std::fs::write(std::env::var("FIXTURE_OUTPUT").unwrap(), &bytes).unwrap();', 1)
+        p.write_text(before + body)
+        PY
+        export FIXTURE_OUTPUT="$work/crafted.usdc"
+        export CARGO_TARGET_DIR="$work/target"
+        cargo test --locked --manifest-path "$work/Cargo.toml" -p craft-usd --lib crafted_crate_with_references_time_samples_and_inlined_values -- --nocapture
+        python3 - <<'PY'
+        import base64, hashlib, os
+        from pathlib import Path
+        b = Path(os.environ["FIXTURE_OUTPUT"]).read_bytes()
+        assert 0 < len(b) < 65536
+        assert b.startswith(b"PXR-USDC")
+        print("USDC_FIXTURE_SIZE=" + str(len(b)))
+        print("USDC_FIXTURE_SHA256=" + hashlib.sha256(b).hexdigest())
+        print("USDC_FIXTURE_BASE64=" + base64.b64encode(b).decode())
+        PY
