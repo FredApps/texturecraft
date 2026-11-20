@@ -1,0 +1,52 @@
+name: OBJ material binding diagnostic
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  formats:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: FredApps/texturecraft
+          ref: 42e7c515645a6ecbbe4a756f7b47826f43fe2d82
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - run: cargo fmt --all -- --check
+      - run: cargo xtask layers
+      - run: cargo test --locked -p texturecraft-formats
+      - run: cargo clippy --locked -p texturecraft-formats --all-targets -- -D warnings
+      - run: cargo check --locked -p texturecraft-formats --target wasm32-unknown-unknown
+      - name: Regression must fail with old MTL naming
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("crates/formats/src/mesh_export.rs")
+          s = p.read_text()
+          old = "craft_mesh::obj::material_names(&scene).iter().zip(&maps)"
+          assert s.count(old) == 1
+          p.write_text(s.replace(old, "unique_ids(&mesh.materials, token).iter().zip(&maps)"))
+          PY
+          set +e
+          cargo test --locked -p texturecraft-formats obj_and_mtl_share_material_ids_after_control_character_normalization > regression-old.log 2>&1
+          result=$?
+          set -e
+          cat regression-old.log
+          test "$result" -ne 0
+          grep -q "each OBJ part must resolve to its own MTL material" regression-old.log
