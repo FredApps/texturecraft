@@ -1,0 +1,47 @@
+name: TextureCraft mesh pin lockfile and formats release
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  lock-and-test:
+    uses: storytold/craft-common-actions/.github/workflows/gate.yml@45f840aee1c2992065480ecdb546b051c555c73f
+    with:
+      os: '["ubuntu-24.04"]'
+      tools: ""
+      timeout-minutes: 40
+      gate-timeout-minutes: 35
+      command: |
+        set -euo pipefail
+        git fetch --no-tags origin 2971e3d8e64ff548b3df49b9e82e88db95e17678
+        test "$(git rev-parse 2971e3d8e64ff548b3df49b9e82e88db95e17678^{tree})" = 84d4c5b0937b89606f3d23abbe25095fbd5e1cee
+        git diff --exit-code 2971e3d8e64ff548b3df49b9e82e88db95e17678 HEAD -- . ':!.github/workflows/validate-pr270.yml'
+        python3 - <<'PY'
+        from pathlib import Path
+
+        manifest = Path("Cargo.toml")
+        old = 'craft-mesh = { git = "https://github.com/storytold/craft-libs", rev = "3dff4793f1a5bd1f99a4fe3280d48f515158dff3",'
+        new = 'craft-mesh = { git = "https://github.com/storytold/craft-libs", rev = "86d6df9c45cea9f6a942e20acc30a9940ac29198",'
+        contents = manifest.read_text()
+        assert contents.count(old) == 1
+        manifest.write_text(contents.replace(old, new))
+        PY
+        cargo update --workspace
+        git diff --exit-code HEAD -- . ':!Cargo.toml' ':!Cargo.lock'
+        python3 - <<'PY'
+        from pathlib import Path
+        import base64
+        import gzip
+        import hashlib
+        import textwrap
+
+        lock = Path("Cargo.lock").read_bytes()
+        print("DAE778_LOCK_BYTES", len(lock), hashlib.sha256(lock).hexdigest())
+        for line in textwrap.wrap(base64.b64encode(gzip.compress(lock, mtime=0)).decode("ascii"), 360):
+            print("DAE778_LOCK", line)
+        PY
+        lock_before="$(sha256sum Cargo.lock)"
+        cargo test --locked --release -p texturecraft-formats
+        git diff --exit-code HEAD -- . ':!Cargo.toml' ':!Cargo.lock'
+        test "$(sha256sum Cargo.lock)" = "$lock_before"
+        printf 'Final lock: %s\n' "$lock_before"
