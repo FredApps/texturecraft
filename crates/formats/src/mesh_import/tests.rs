@@ -173,6 +173,23 @@ fn gltf_embedded_buffers_and_missing_attributes() {
 }
 
 #[test]
+fn gltf_mixed_primitive_uvs_warn_and_unwrap_the_whole_mesh() {
+    let mut json: serde_json::Value = serde_json::from_slice(&embedded_gltf()).unwrap();
+    let primitives = json["meshes"][0]["primitives"].as_array_mut().unwrap();
+    assert_eq!(primitives.len(), 2);
+    assert_eq!(primitives[0]["attributes"]["TEXCOORD_0"], 2);
+    let second_attributes = primitives[1]["attributes"].as_object_mut().unwrap();
+    assert_eq!(second_attributes.remove("TEXCOORD_0"), Some(serde_json::json!(2)));
+
+    let imported = import_mesh_bytes("mixed-uvs.gltf", &serde_json::to_vec(&json).unwrap()).unwrap();
+    assert!(imported.report.uvs_generated);
+    let warning = "some primitives have no UVs; the whole mesh was unwrapped automatically";
+    assert!(imported.report.warnings.iter().any(|w| w == warning));
+    assert_eq!(imported.report.triangles, 2);
+    assert_eq!(imported.mesh.materials, ["Red", "Material_1"]);
+}
+
+#[test]
 fn gltf_external_buffer_needs_a_path() {
     let mut json: serde_json::Value = serde_json::from_slice(&embedded_gltf()).unwrap();
     json["buffers"][0]["uri"] = "scene.bin".into();
