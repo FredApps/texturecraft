@@ -614,7 +614,8 @@ fn usda_and_usdc_parity_for_transforms_cameras_visibility_and_warnings() {
     root.children = vec![parent, cam, ortho, materials];
 
     let mut layer = UsdLayer::new(root);
-    layer.meters_per_unit = 0.01;
+    // The authored unit scale must differ from the importer's fallback.
+    layer.meters_per_unit = 0.02;
     layer.up_axis = "Z".into();
 
     let usda = write_usda(&layer).into_bytes();
@@ -625,6 +626,12 @@ fn usda_and_usdc_parity_for_transforms_cameras_visibility_and_warnings() {
     assert_eq!(a.mesh.triangle_count(), b.mesh.triangle_count());
     assert_eq!(a.mesh.materials, b.mesh.materials);
     assert_eq!(a.mesh.positions, b.mesh.positions);
+    // +100 in stage Z becomes +2 m in Y, and the original Y edge points toward -Z.
+    let expected_bounds = (Vec3::new(0.0, 2.0, -2.0), Vec3::new(2.0, 2.0, 0.0));
+    for (encoding, imported) in [("USDA", &a), ("USDC", &b)] {
+        let (lo, hi) = imported.mesh.bounds();
+        assert!(close(lo, expected_bounds.0) && close(hi, expected_bounds.1), "{encoding} world bounds: {lo}..{hi}");
+    }
     assert_eq!(a.mesh.normals, b.mesh.normals);
     assert_eq!(a.mesh.uvs, b.mesh.uvs);
     assert_eq!(a.mesh.indices, b.mesh.indices);
